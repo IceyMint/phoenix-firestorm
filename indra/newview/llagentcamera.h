@@ -138,11 +138,12 @@ public:
 	LLVector3 getCurrentCameraOffset();
 	LLVector3d getCurrentFocusOffset();
 	LLQuaternion getCurrentAvatarRotation();
-	bool isJoystickCameraUsed();
+    bool         isJoystickCameraUsed();
+    LLVector3    getViewOffset();
 	void setInitSitRot(LLQuaternion sit_rot) { mInitSitRot = sit_rot; };
 	void rotateToInitSitRot();
 
-private:
+  private:
 	/** Determines maximum camera distance from target for mouselook, opposite to LAND_MIN_ZOOM */
 	// <FS:Ansariel> FIRE-23470: Fix camera controls zoom glitch
 	//F32 getCameraMaxZoomDistance();
@@ -179,7 +180,9 @@ public:
 	BOOL			calcCameraMinDistance(F32 &obj_min_distance);
 	F32				getCurrentCameraBuildOffset() 	{ return (F32)mCameraFocusOffset.length(); }
 	void			clearCameraLag() { mCameraLag.clearVec(); }
-private:
+    void			setEyeOffset(F32 X,F32 Y,F32 Z);
+
+  private:
 	LLVector3		getAvatarRootPosition();
 
 	F32				mCurrentCameraDistance;	 		// Current camera offset from avatar
@@ -195,6 +198,7 @@ private:
 	bool            mCameraSmoothingStop;
 	LLVector3		mCameraLag;						// Third person camera lag
 	LLVector3		mCameraUpVector;				// Camera's up direction in world coordinates (determines the 'roll' of the view)
+    LLVector3       desiredEyeOffset;
 
 	//--------------------------------------------------------------------
 	// Follow

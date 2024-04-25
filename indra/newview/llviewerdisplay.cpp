@@ -714,7 +714,7 @@ void display(BOOL rebuild, F32 zoom_factor, int subfield, BOOL for_snapshot)
     if (LLViewerCamera::instanceExists())
     {
         LLViewerCamera::getInstance()->setZoomParameters(zoom_factor, subfield);
-        LLViewerCamera::getInstance()->setNear(MIN_NEAR_PLANE);
+        //LLViewerCamera::getInstance()->setNear(MIN_NEAR_PLANE);
     }
 
 	//////////////////////////

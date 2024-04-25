@@ -630,7 +630,7 @@ std::string LLPanel::getString(const std::string& name) const
 	std::string err_str("Failed to find string " + name + " in panel " + getName() + " loaded from file " + mXMLFilename); //*TODO: Translate
 	if(LLUI::getInstance()->mSettingGroups["config"]->getBOOL("QAMode"))
 	{
-		LL_ERRS() << err_str << LL_ENDL;
+        LL_WARNS() << err_str << LL_ENDL;
 	}
 	else
 	{

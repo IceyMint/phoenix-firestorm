@@ -6521,6 +6521,7 @@ void display_cube_face();
 
 BOOL LLViewerWindow::cubeSnapshot(const LLVector3& origin, LLCubeMapArray* cubearray, S32 cubeIndex, S32 face, F32 near_clip, bool dynamic_render)
 {
+    near_clip = 125.00f;
     // NOTE: implementation derived from LLFloater360Capture::capture360Images() and simpleSnapshot
     LL_PROFILE_ZONE_SCOPED_CATEGORY_APP;
     LL_PROFILE_GPU_ZONE("cubeSnapshot");

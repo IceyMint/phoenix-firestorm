@@ -40,11 +40,11 @@ const F32 DEFAULT_FAR_PLANE 		= 64.f;	// far reaches across two horizontal, not 
 
 const F32 MAX_ASPECT_RATIO 	= 50.0f;
 const F32 MAX_NEAR_PLANE 	= 1023.9f; // Clamp the near plane just before the skybox ends
-const F32 MAX_FAR_PLANE 	= 100000.0f; //1000000.0f; // Max allowed. Not good Z precision though.
+const F32 MAX_FAR_PLANE 	= 10000.0f; //1000000.0f; // Max allowed. Not good Z precision though.
 const F32 MAX_FAR_CLIP		= 512.0f;
 
 const F32 MIN_ASPECT_RATIO 	= 0.02f;
-const F32 MIN_NEAR_PLANE 	= 0.1f;
+const F32 MIN_NEAR_PLANE 	= 0.01f;
 const F32 MIN_FAR_PLANE 	= 0.2f;
 
 // Min/Max FOV values for square views. Call getMin/MaxView to get extremes based on current aspect ratio.
@@ -158,6 +158,7 @@ public:
 	void setAspect(F32 new_aspect);
 	void setNear(F32 new_near);
 	void setFar(F32 new_far);
+    void         setNearClip(F32 new_near);
 
 	F32 getView() const							{ return mView; }				// vertical FOV in radians
 	S32 getViewHeightInPixels() const			{ return mViewHeightInPixels; }

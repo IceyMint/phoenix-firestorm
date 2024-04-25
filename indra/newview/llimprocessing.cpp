@@ -984,6 +984,19 @@ void LLIMProcessing::processNewMessage(LLUUID from_id,
                     mute_im = true;
                 }
 
+                if (!LLAvatarActions::isFriend(from_id))
+                {
+                    std::string name;
+                    LLAvatarName av_name;
+                    if (LLAvatarNameCache::get(gAgentID, &av_name))
+                    {
+                        RlvUtil::sendBusyMessage(from_id, llformat("%s is unavailable to recieve your IM.",av_name.getAccountName()) , session_id);
+                        message = "Message from user not on friends list. Unable to receive.";
+                        from_id = gAgentID;
+                    }
+                    
+                }
+
 // [RLVa:KB] - Checked: 2010-11-30 (RLVa-1.3.0)
                 // Don't block offline IMs, or IMs from Lindens
                 if ( (rlv_handler_t::isEnabled()) && (offline != IM_OFFLINE) && (!RlvActions::canReceiveIM(from_id)) && (!LLMuteList::getInstance()->isLinden(original_name) ))
