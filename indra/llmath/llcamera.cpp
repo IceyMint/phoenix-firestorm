@@ -36,7 +36,7 @@ LLCamera::LLCamera() :
 	mView(DEFAULT_FIELD_OF_VIEW),
 	mAspect(DEFAULT_ASPECT_RATIO),
 	mViewHeightInPixels( -1 ),			// invalid height
-	mNearPlane(DEFAULT_NEAR_PLANE),
+	mNearPlane(0.01f),
 	mFarPlane(DEFAULT_FAR_PLANE),
 	mFixedDistance(-1.f),
 	mPlaneCount(6),
@@ -63,7 +63,7 @@ LLCamera::LLCamera(F32 vertical_fov_rads, F32 aspect_ratio, S32 view_height_in_p
 	}
 
 	mAspect = llclamp(aspect_ratio, MIN_ASPECT_RATIO, MAX_ASPECT_RATIO);
-	mNearPlane = llclamp(near_plane, MIN_NEAR_PLANE, MAX_NEAR_PLANE);
+	//mNearPlane = llclamp(near_plane, MIN_NEAR_PLANE, MAX_NEAR_PLANE);
 	if(far_plane < 0) far_plane = DEFAULT_FAR_PLANE;
 	mFarPlane = llclamp(far_plane, MIN_FAR_PLANE, MAX_FAR_PLANE);
 
@@ -84,6 +84,8 @@ F32 LLCamera::getMinView() const
 		? MIN_FIELD_OF_VIEW // wide views
 		: MIN_FIELD_OF_VIEW * 1/mAspect; // clamps minimum width in narrow views
 }
+
+void LLCamera::setNearClip(F32 new_near) { mNearPlane = new_near; }
 
 F32 LLCamera::getMaxView() const 
 {
@@ -135,7 +137,7 @@ void LLCamera::setAspect(F32 aspect_ratio)
 
 void LLCamera::setNear(F32 near_plane) 
 {
-	mNearPlane = llclamp(near_plane, MIN_NEAR_PLANE, MAX_NEAR_PLANE);
+	//mNearPlane = llclamp(near_plane, MIN_NEAR_PLANE, MAX_NEAR_PLANE);
 	calculateFrustumPlanes();
 }
 

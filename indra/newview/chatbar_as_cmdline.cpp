@@ -32,7 +32,7 @@
 #include "llviewerprecompiledheaders.h"
 
 #include "chatbar_as_cmdline.h"
-
+#include "fsfloatercontacts.h"
 #include "aoengine.h"
 #include "fscommon.h"
 #include "fsradar.h"
@@ -570,7 +570,37 @@ bool cmd_line_chat(std::string_view revised_text, EChatType type, bool from_gest
 		i >> command;
 		if (!command.empty())
 		{
-			if (command == sFSCmdLinePos())
+            if (command == "setnearclip") {
+                F32 nearclip;
+                i >> nearclip;
+                LLViewerCamera::getInstance()->setNearClip(nearclip);
+                report_to_nearby_chat(llformat("Near is: %.3f", nearclip));
+                return (false);
+			}
+            else if (command == "moveview") {
+                std::string direction;
+                F32         X=0, Y=0, Z=0;
+                if (i >> direction){
+                    if (direction == "foward")
+                        X = -0.001;
+                    else if (direction == "back")
+                        X = 0.001;
+                    else if (direction == "up")
+                        Z = -0.001;
+                    else if (direction == "down")
+                        Z = 0.001;
+                    else if (direction == "left")
+                        Y = -0.001;
+                    else if (direction == "right")
+                        Y = 0.001;
+				}
+                gAgentCamera.setEyeOffset(X,Y,Z);
+                LLVector3 offset; 
+				offset = gAgentCamera.getViewOffset();
+                report_to_nearby_chat(llformat("Current offset: %.3f, %.3f, %.3f", offset[VX], offset[VY], offset[VZ]));
+                return (false);
+			}
+			else if (command == sFSCmdLinePos())
 			{
 				F32 x, y, z;
 				if (i >> x && i >> y)

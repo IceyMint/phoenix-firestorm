@@ -516,7 +516,7 @@ void FSFloaterIM::sendMsg(const std::string& msg)
 	//std::string utf8_text = utf8str_truncate(msg, MAX_MSG_BUF_SIZE - 1);
 	std::string utf8_text = msg;
 	// </FS:CR>
-
+    
 	if ( (RlvActions::hasBehaviour(RLV_BHVR_SENDIM)) || (RlvActions::hasBehaviour(RLV_BHVR_SENDIMTO)) )
 	{
 		const LLIMModel::LLIMSession* pIMSession = LLIMModel::instance().findIMSession(mSessionID);
@@ -565,6 +565,12 @@ void FSFloaterIM::sendMsg(const std::string& msg)
 		}
 	}
 	// [/RLVa:KB]
+
+	if (!LLAvatarActions::isFriend(mOtherParticipantUUID))
+    {
+        report_to_nearby_chat("User is not on your friends list!");
+        return;
+    }
 
 	if (mSessionInitialized)
 	{
@@ -619,6 +625,11 @@ void FSFloaterIM::onVoiceChannelStateChanged(const LLVoiceChannel::EState& old_s
 void FSFloaterIM::doToSelected(const LLSD& userdata)
 {
 	const std::string command = userdata.asString();
+    if (!LLAvatarActions::isFriend(mOtherParticipantUUID))
+    {
+        report_to_nearby_chat("User is not on your friends list!");
+        return;
+    }
 
 	if (command == "offer_tp")
 	{
@@ -854,36 +865,39 @@ BOOL FSFloaterIM::postBuild()
 		{
 			case LLIMModel::LLIMSession::P2P_SESSION:	// One-on-one IM
 			{
-				LL_DEBUGS("FSFloaterIM") << "LLIMModel::LLIMSession::P2P_SESSION" << LL_ENDL;
-				getChild<LLLayoutPanel>("slide_panel")->setVisible(FALSE);
-				getChild<LLLayoutPanel>("gprofile_panel")->setVisible(FALSE);
-				getChild<LLLayoutPanel>("end_call_btn_panel")->setVisible(FALSE);
-				getChild<LLLayoutPanel>("voice_ctrls_btn_panel")->setVisible(FALSE);
-				
-				LL_DEBUGS("FSFloaterIM") << "adding FSFloaterIM removing/adding particularfriendobserver" << LL_ENDL;
-				LLAvatarTracker::instance().removeParticularFriendObserver(mOtherParticipantUUID, this);
-				LLAvatarTracker::instance().addParticularFriendObserver(mOtherParticipantUUID, this);
+                if (LLAvatarActions::isFriend(mOtherParticipantUUID))
+                {
+                    LL_DEBUGS("FSFloaterIM") << "LLIMModel::LLIMSession::P2P_SESSION" << LL_ENDL;
+                    getChild<LLLayoutPanel>("slide_panel")->setVisible(FALSE);
+                    getChild<LLLayoutPanel>("gprofile_panel")->setVisible(FALSE);
+                    getChild<LLLayoutPanel>("end_call_btn_panel")->setVisible(FALSE);
+                    getChild<LLLayoutPanel>("voice_ctrls_btn_panel")->setVisible(FALSE);
 
-				// Disable "Add friend" button for friends.
-				LL_DEBUGS("FSFloaterIM") << "add_friend_btn check start" << LL_ENDL;
-				getChild<LLButton>("add_friend_btn")->setEnabled(!LLAvatarActions::isFriend(mOtherParticipantUUID));
+                    LL_DEBUGS("FSFloaterIM") << "adding FSFloaterIM removing/adding particularfriendobserver" << LL_ENDL;
+                    LLAvatarTracker::instance().removeParticularFriendObserver(mOtherParticipantUUID, this);
+                    LLAvatarTracker::instance().addParticularFriendObserver(mOtherParticipantUUID, this);
 
-				// Disable "Teleport" button if friend is offline
-				if(LLAvatarActions::isFriend(mOtherParticipantUUID))
-				{
-					LL_DEBUGS("FSFloaterIM") << "LLAvatarActions::isFriend - tp button" << LL_ENDL;
-					getChild<LLButton>("teleport_btn")->setEnabled(LLAvatarTracker::instance().isBuddyOnline(mOtherParticipantUUID));
-				}
+                    // Disable "Add friend" button for friends.
+                    LL_DEBUGS("FSFloaterIM") << "add_friend_btn check start" << LL_ENDL;
+                    getChild<LLButton>("add_friend_btn")->setEnabled(!LLAvatarActions::isFriend(mOtherParticipantUUID));
 
-				// support sysinfo button -Zi
-				mSysinfoButton->setClickedCallback(boost::bind(&FSFloaterIM::onSysinfoButtonClicked, this));
-				// this needs to be extended to fsdata awareness, once we have it. -Zi
-				// mIsSupportIM=fsdata(partnerUUID).isSupport(); // pseudocode something like this
-				onSysinfoButtonVisibilityChanged(gSavedSettings.getBOOL("SysinfoButtonInIM"));
+                    // Disable "Teleport" button if friend is offline
+                    if(LLAvatarActions::isFriend(mOtherParticipantUUID))
+                    {
+                        LL_DEBUGS("FSFloaterIM") << "LLAvatarActions::isFriend - tp button" << LL_ENDL;
+                        getChild<LLButton>("teleport_btn")->setEnabled(LLAvatarTracker::instance().isBuddyOnline(mOtherParticipantUUID));
+                    }
+
+                    // support sysinfo button -Zi
+                    mSysinfoButton->setClickedCallback(boost::bind(&FSFloaterIM::onSysinfoButtonClicked, this));
+                    // this needs to be extended to fsdata awareness, once we have it. -Zi
+                    // mIsSupportIM=fsdata(partnerUUID).isSupport(); // pseudocode something like this
+                    onSysinfoButtonVisibilityChanged(gSavedSettings.getBOOL("SysinfoButtonInIM"));
 				gSavedSettings.getControl("SysinfoButtonInIM")->getCommitSignal()->connect(boost::bind(&FSFloaterIM::onSysinfoButtonVisibilityChanged, this, _2));
-				// support sysinfo button -Zi
+                    // support sysinfo button -Zi
 
-				break;
+                    break;
+                }
 			}
 			case LLIMModel::LLIMSession::GROUP_SESSION:	// Group chat
 			{
@@ -1491,7 +1505,14 @@ void FSFloaterIM::updateMessages()
 	// we shouldn't reset unread message counters if IM floater doesn't have focus
 	LLIMModel::instance().getMessages(mSessionID, messages, mLastMessageIndex + 1, hasFocus());
 
-	if (messages.size())
+	if(!LLAvatarActions::isFriend(mOtherParticipantUUID)){
+        FSFloaterIM::fetchAvatarName(mOtherParticipantUUID);
+        const LLAvatarName av_name;
+        FSFloaterIM::onAvatarNameCache(mOtherParticipantUUID, av_name);
+
+        //report_to_nearby_chat(llformat("Message recieved from %s, however they are not on your friends list. Message dropped!", av_name.getUserNameForDisplay()));
+	}
+    if (messages.size() && LLAvatarActions::isFriend(mOtherParticipantUUID))
 	{
 		LLSD chat_args;
 		chat_args["use_plain_text_chat_history"] = gSavedSettings.getBOOL("PlainTextChatHistory");

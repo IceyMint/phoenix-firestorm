@@ -974,11 +974,11 @@
             <key>archive</key>
             <map>
               <key>hash</key>
-              <string>8672d21ae8382a5526f0e17358de8575</string>
+              <string>ca43b30d232266a62a2a4879124f2615</string>
               <key>hash_algorithm</key>
               <string>md5</string>
               <key>url</key>
-              <string>file:///c:/cygwin/opt/firestorm/fmodstudio-2.02.20-windows64-240381643.tar.bz2</string>
+              <string>file:///F:\firestorm\3p-fmodstudio\fmodstudio-2.02.17-windows64-232770529.tar.bz2</string>
             </map>
             <key>name</key>
             <string>windows64</string>
