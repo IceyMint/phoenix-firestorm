@@ -116,6 +116,8 @@ public:
 private:
 	ECameraMode		mCameraMode;					// Target mode after transition animation is done
 	ECameraMode		mLastCameraMode;
+    bool            captureMouse;
+    bool            toggleCompleted;
 
 	//--------------------------------------------------------------------
 	// Preset
