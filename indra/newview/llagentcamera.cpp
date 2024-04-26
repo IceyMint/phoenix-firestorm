@@ -134,7 +134,7 @@ LLAgentCamera gAgentCamera;
 //-----------------------------------------------------------------------------
 LLAgentCamera::LLAgentCamera() :
     mInitialized(false),
-
+    captureMouse(true),
     mDrawDistance(DEFAULT_FAR_PLANE),
 
     mLookAt(NULL),
@@ -1243,7 +1243,7 @@ void LLAgentCamera::updateLookAt(const S32 mouse_x, const S32 mouse_y)
 		{
 			lookAtType = LOOKAT_TARGET_MOUSELOOK;
 		}
-		else if (cameraThirdPerson())
+		else if (cameraThirdPerson() && captureMouse)
 		{
 			// range from -.5 to .5
 			F32 x_from_center = 
@@ -1251,8 +1251,8 @@ void LLAgentCamera::updateLookAt(const S32 mouse_x, const S32 mouse_y)
 			F32 y_from_center = 
 				((F32) mouse_y / (F32) gViewerWindow->getWorldViewHeightScaled() ) - 0.5f;
 
-			frameCamera.yaw( - x_from_center * gSavedSettings.getF32("YawFromMousePosition") * DEG_TO_RAD);
-			frameCamera.pitch( - y_from_center * gSavedSettings.getF32("PitchFromMousePosition") * DEG_TO_RAD);
+			frameCamera.yaw(( - x_from_center * gSavedSettings.getF32("YawFromMousePosition") * DEG_TO_RAD)*8);
+            frameCamera.pitch(( - y_from_center * gSavedSettings.getF32("PitchFromMousePosition") * DEG_TO_RAD)*4);
 			lookAtType = LOOKAT_TARGET_FREELOOK;
 		}
 
@@ -1272,6 +1272,28 @@ extern BOOL gCubeSnapshot;
 //-----------------------------------------------------------------------------
 void LLAgentCamera::updateCamera()
 {
+    if ((int) gKeyboard->currentMask(false) == 1)
+    {
+        if (!toggleCompleted)
+        {
+            captureMouse    = !captureMouse;
+            toggleCompleted = true;
+        }
+    }
+    else if ((int) gKeyboard->currentMask(false) == 0)
+    {
+        toggleCompleted = false;
+    }
+
+    if (captureMouse == 1)
+    {
+        gViewerWindow->hideCursor();
+        gViewerWindow->moveCursorToCenter();
+    }
+    else
+    {
+        gViewerWindow->showCursor();
+    }
 	LL_RECORD_BLOCK_TIME(FTM_UPDATE_CAMERA);
     if (gCubeSnapshot)
     {
@@ -2583,50 +2605,50 @@ void LLAgentCamera::changeCameraToFollow(BOOL animate)
 		return;
 	}
 
-	if(mCameraMode != CAMERA_MODE_FOLLOW)
-	{
-		if (mCameraMode == CAMERA_MODE_MOUSELOOK)
-		{
-			animate = FALSE;
-		}
-		startCameraAnimation();
+	//if(mCameraMode != CAMERA_MODE_FOLLOW)
+	//{
+	//	if (mCameraMode == CAMERA_MODE_MOUSELOOK)
+	//	{
+	//		animate = FALSE;
+	//	}
+	//	startCameraAnimation();
 
-		updateLastCamera();
-		mCameraMode = CAMERA_MODE_FOLLOW;
-		// <FS:Zi> Animation Overrider
-		AOEngine::getInstance()->inMouselook(FALSE);
+	//	updateLastCamera();
+	//	mCameraMode = CAMERA_MODE_FOLLOW;
+	//	// <FS:Zi> Animation Overrider
+	//	AOEngine::getInstance()->inMouselook(FALSE);
 
-		// bang-in the current focus, position, and up vector of the follow cam
-		mFollowCam.reset(mCameraPositionAgent, LLViewerCamera::getInstance()->getPointOfInterest(), LLVector3::z_axis);
-		
-		if (gBasicToolset)
-		{
-			LLToolMgr::getInstance()->setCurrentToolset(gBasicToolset);
-		}
+	//	// bang-in the current focus, position, and up vector of the follow cam
+	//	mFollowCam.reset(mCameraPositionAgent, LLViewerCamera::getInstance()->getPointOfInterest(), LLVector3::z_axis);
+	//	
+	//	if (gBasicToolset)
+	//	{
+	//		LLToolMgr::getInstance()->setCurrentToolset(gBasicToolset);
+	//	}
 
-		if (isAgentAvatarValid())
-		{
-			// SL-315
-			gAgentAvatarp->mPelvisp->setPosition(LLVector3::zero);
-			gAgentAvatarp->startMotion( ANIM_AGENT_BODY_NOISE );
-			gAgentAvatarp->startMotion( ANIM_AGENT_BREATHE_ROT );
-		}
+	//	if (isAgentAvatarValid())
+	//	{
+	//		// SL-315
+	//		gAgentAvatarp->mPelvisp->setPosition(LLVector3::zero);
+	//		gAgentAvatarp->startMotion( ANIM_AGENT_BODY_NOISE );
+	//		gAgentAvatarp->startMotion( ANIM_AGENT_BREATHE_ROT );
+	//	}
 
-		// unpause avatar animation
-		gAgent.unpauseAnimation();
+	//	// unpause avatar animation
+	//	gAgent.unpauseAnimation();
 
-		gAgent.clearControlFlags(AGENT_CONTROL_MOUSELOOK);
+	//	gAgent.clearControlFlags(AGENT_CONTROL_MOUSELOOK);
 
-		if (animate)
-		{
-			startCameraAnimation();
-		}
-		else
-		{
-			mCameraAnimating = FALSE;
-			gAgent.endAnimationUpdateUI();
-		}
-	}
+	//	if (animate)
+	//	{
+	//		startCameraAnimation();
+	//	}
+	//	else
+	//	{
+	//		mCameraAnimating = FALSE;
+	//		gAgent.endAnimationUpdateUI();
+	//	}
+	//}
 }
 
 //-----------------------------------------------------------------------------
@@ -3125,14 +3147,14 @@ BOOL LLAgentCamera::setLookAt(ELookAtType target_type, LLViewerObject *object, L
 	static LLCachedControl<bool> isLocalPrivate(gSavedSettings, "PrivateLocalLookAtTarget", false);
 	
 	// AO, set to absolutely nothing if local lookats are disabled.
-	if(isLocalPrivate)
+	/*if(isLocalPrivate)
 	{
 			position.clearVec();
 			target_type = LOOKAT_TARGET_NONE;
 			object = gAgentAvatarp;
-	}
+	}*/
 	
-	else if(object && object->isAttachment())
+	if(object && object->isAttachment())
 	{
 		LLViewerObject* parent = object;
 		while(parent)
@@ -3162,10 +3184,10 @@ BOOL LLAgentCamera::setLookAt(ELookAtType target_type, LLViewerObject *object, L
 void LLAgentCamera::lookAtLastChat()
 {
 	// Block if camera is animating or not in normal third person camera mode
-	if (mCameraAnimating || !cameraThirdPerson())
-	{
-		return;
-	}
+	//if (mCameraAnimating || !cameraThirdPerson())
+	//{
+	//	return;
+	//}
 
 	LLViewerObject *chatter = gObjectList.findObject(gAgent.getLastChatter());
 	if (!chatter)
