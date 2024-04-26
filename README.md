@@ -1,6 +1,6 @@
 ![Firestorm Viewer Logo](doc/firestorm_256.png)
 
-**[Firestorm](https://www.firestormviewer.org/) is a free client for 3D virtual worlds such as Second Life and various OpenSim worlds where users can create, connect and chat with others from around the world.** This repository contains the official source code for the Firestorm viewer.
+**[Firestorm](https://www.firestormviewer.org/) is a free client for 3D virtual worlds such as Second Life and various OpenSim worlds where users can create, connect and chat with others from around the world.** This repository contains the source code for the IceyMint's Firestorm viewer.
 
 ## Open Source
 
