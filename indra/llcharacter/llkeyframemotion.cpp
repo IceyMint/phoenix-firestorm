@@ -42,6 +42,7 @@
 #include "m3math.h"
 #include "message.h"
 #include "llfilesystem.h"
+#include "../newview/llviewercontrol.h"
 
 #include "nd/ndexceptions.h" // <FS:ND/> For nd::exceptions::xran
 
@@ -737,9 +738,29 @@ bool LLKeyframeMotion::onUpdate(F32 time, U8* joint_mask)
 //-----------------------------------------------------------------------------
 void LLKeyframeMotion::applyKeyframes(F32 time)
 {
+    // <FS:Ansariel> [FS AOM] Option to disable head/neck/torso animations locally
+    static LLCachedControl<bool> enable_head_anims(gSavedSettings, "AOMLocalHeadAnims");
+    // </FS:Ansariel>
+
     llassert_always (mJointMotionList->getNumJointMotions() <= mJointStates.size());
     for (U32 i=0; i<mJointMotionList->getNumJointMotions(); i++)
     {
+        // <FS:Miku> [FS AOM] Option to disable head/neck/torso animations locally
+        if (!enable_head_anims)
+        {
+            LLJoint* joint = mJointStates[i]->getJoint();
+            if (joint)
+            {
+                std::string joint_name = joint->getName();
+                if (joint_name == "mHead" || joint_name == "mNeck" || joint_name == "mSkull" ||
+                    joint_name == "mTorso" || joint_name == "mChest")
+                {
+                    continue;
+                }
+            }
+        }
+        // </FS:Ansariel>
+
         mJointMotionList->getJointMotion(i)->update(mJointStates[i],
                                                       time,
                                                       mJointMotionList->mDuration );

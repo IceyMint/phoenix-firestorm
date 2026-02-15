@@ -90,6 +90,12 @@ void FSChatOptionsMenu::onMenuItemClick(const LLSD& userdata, LLUICtrl* source)
             gSavedSettings.setBOOL("FSNotifyUnreadIMMessages", !gSavedSettings.getBOOL("FSNotifyUnreadIMMessages"));
         }
     }
+    else if (option == "toggle_python_ai")
+    {
+        // Toggle the Python Roleplay AI enable flag
+        const bool current = gSavedSettings.getBOOL("EnablePythonAI");
+        gSavedSettings.setBOOL("EnablePythonAI", !current);
+    }
 }
 
 bool FSChatOptionsMenu::onMenuItemEnable(const LLSD& userdata, LLUICtrl* source)
@@ -108,6 +114,11 @@ bool FSChatOptionsMenu::onMenuItemEnable(const LLSD& userdata, LLUICtrl* source)
     else if (option == "show_send_button")
     {
         return gSavedSettings.getBOOL("FSNearbyChatbar");
+    }
+    else if (option == "toggle_python_ai")
+    {
+        // Always enable the menu item; no conditional gating beyond presence
+        return true;
     }
 
     return false;
@@ -182,6 +193,11 @@ bool FSChatOptionsMenu::onMenuItemCheck(const LLSD& userdata, LLUICtrl* source)
         {
             return gSavedSettings.getBOOL("FSNotifyUnreadIMMessages");
         }
+    }
+    else if (option == "toggle_python_ai")
+    {
+        // Menu checkbox reflects current setting state
+        return gSavedSettings.getBOOL("EnablePythonAI");
     }
 
     return false;

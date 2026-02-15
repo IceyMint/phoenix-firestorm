@@ -33,14 +33,35 @@
 #include "fsfloaternearbychat.h"
 
 #include "chatbar_as_cmdline.h"
+
+// Minimal forward declarations to satisfy compile order without pulling heavy headers
+class LLViewerRegion;
+class LLViewerObject;
+
+// Forward declarations of file-scope helpers used earlier in this TU
+// static std::string getOrRequestObjectName(LLViewerObject* objectp);
+// static void        flushObjectNameRequests();
+// static void        IdleFlushPump(void* userdata);
+
+// Optional: if your TU cannot see gIdleCallbacks via transitive includes, uncomment this extern.
+// The real definition is provided by the app layer during link.
+#include "llcallbacklist.h"
+extern LLCallbackList gIdleCallbacks;
+// Added forward declarations/headers required by helper block
+
+#include "llviewerregion.h" // LLViewerRegion
+#include "llworld.h"        // LLWorld::getInstance()
+#include "message.h"        // LLMessageSystem, gMessageSystem
+#include "llappviewer.h"    // gIdleCallbacks
 #include "fschathistory.h"
 #include "fschatoptionsmenu.h"
 #include "fscommon.h"
+#include "fsaiintegration.h"
 #include "fsfloaterim.h"
 #include "fsfloaterimcontainer.h"
 #include "fsnearbychathub.h"
-#include "llagent.h"            // gAgent
-#include "llanimationstates.h"  // ANIM_AGENT_WHISPER, ANIM_AGENT_TALK, ANIM_AGENT_SHOUT
+#include "llagent.h"           // gAgent
+#include "llanimationstates.h" // ANIM_AGENT_WHISPER, ANIM_AGENT_TALK, ANIM_AGENT_SHOUT
 #include "llautoreplace.h"
 #include "llavatarnamecache.h"
 #include "llbutton.h"
@@ -72,33 +93,74 @@
 #include "lltextbox.h"
 #include "lltrans.h"
 #include "llviewercontrol.h"
-#include "llviewermenu.h"//for gMenuHolder
+#include "llviewermenu.h" //for gMenuHolder
 #include "llviewerstats.h"
 #include "llviewerwindow.h"
 #include "llworld.h"
+#include "llviewerobjectlist.h"
 #include "rlvhandler.h"
 // <FS:TS> FIRE-23123: Don't log newline spam even from own objects
 #include "NACLantispam.h"
 // </FS:TS> FIRE-23123
 #include "lfsimfeaturehandler.h"
 
+#include "fsareasearch.h"
+
+// AI Integration includes
+#include <thread>
+#include <future>
+#include <chrono>
+
 S32 FSFloaterNearbyChat::sLastSpecialChatChannel = 0;
 
-
-FSFloaterNearbyChat::FSFloaterNearbyChat(const LLSD& key)
-    : LLFloater(key)
-    ,mChatHistory(NULL)
-    ,mChatHistoryMuted(NULL)
-    ,mInputEditor(NULL)
-    ,mChatLayoutPanel(NULL)
-    ,mInputPanels(NULL)
-    ,mChatLayoutPanelHeight(0)
-    ,mUnreadMessagesNotificationPanel(NULL)
-    ,mUnreadMessagesNotificationTextBox(NULL)
-    ,mUnreadMessages(0)
-    ,mUnreadMessagesMuted(0)
+// Static handler for EnablePythonAI setting changes.
+// Keep side-effects minimal and UI-thread safe.
+void FSFloaterNearbyChat::onEnablePythonAIChanged(const LLSD& newvalue)
 {
-    //menu
+    const bool enabled = newvalue.asBoolean();
+
+    // Optionally log to viewer log for diagnostics
+    LL_INFOS("AI") << "[AI] EnablePythonAI changed -> " << (enabled ? "ON" : "OFF") << LL_ENDL;
+
+    if (enabled) {
+        // Initialize FSAIIntegration immediately when AI is enabled
+        LL_INFOS("AI") << "[AI] Initializing FSAIIntegration singleton..." << LL_ENDL;
+        FSAIIntegration* ai = FSAIIntegration::getInstance(); // This creates the singleton and triggers persona setup
+        LL_INFOS("AI") << "[AI] FSAIIntegration initialization complete" << LL_ENDL;
+        
+        // Notify of enable (handles reconnection logic)
+        ai->onAIEnabled();
+    } else {
+        // Handle AI being disabled - notify existing instance if it exists
+        if (FSAIIntegration::instanceExists()) {
+            LL_INFOS("AI") << "[AI] Notifying FSAIIntegration of disable..." << LL_ENDL;
+            FSAIIntegration::getInstance()->onAIDisabled();
+        }
+    }
+
+    // If the floater exists, we could update any AI-related UI affordances here in future.
+    if (FSFloaterNearbyChat* floater = FSFloaterNearbyChat::findInstance())
+    {
+        // Example: ensure input remains enabled; reserve space for future UI toggles.
+        // floater->getChatBox()->setToolTip(enabled ? LLTrans::getString("AI_Enabled") : LLTrans::getString("AI_Disabled"));
+        (void)floater; // suppress unused warning when no UI updates are needed yet
+    }
+}
+
+FSFloaterNearbyChat::FSFloaterNearbyChat(const LLSD& key) :
+    LLFloater(key),
+    mChatHistory(NULL),
+    mChatHistoryMuted(NULL),
+    mInputEditor(NULL),
+    mChatLayoutPanel(NULL),
+    mInputPanels(NULL),
+    mChatLayoutPanelHeight(0),
+    mUnreadMessagesNotificationPanel(NULL),
+    mUnreadMessagesNotificationTextBox(NULL),
+    mUnreadMessages(0),
+    mUnreadMessagesMuted(0)
+{
+    // menu
     mEnableCallbackRegistrar.add("ChatOptions.Check", boost::bind(&FSFloaterNearbyChat::onChatOptionsCheckContextMenuItem, this, _2));
     mCommitCallbackRegistrar.add("ChatOptions.Action", boost::bind(&FSFloaterNearbyChat::onChatOptionsContextMenuItemClicked, this, _2));
     mEnableCallbackRegistrar.add("ChatOptions.Visible", boost::bind(&FSFloaterNearbyChat::onChatOptionsVisibleContextMenuItem, this, _2));
@@ -114,10 +176,13 @@ FSFloaterNearbyChat::~FSFloaterNearbyChat()
 
     mEmojiCloseConn.disconnect();
 
+    // Unregister idle flusher
+    //gIdleCallbacks.deleteFunction(IdleFlushPump, this);
+
     LLFloaterChatMentionPicker::removeParticipantSource(this);
 }
 
-void FSFloaterNearbyChat::updateFSUseNearbyChatConsole(const LLSD &data)
+void FSFloaterNearbyChat::updateFSUseNearbyChatConsole(const LLSD& data)
 {
     FSUseNearbyChatConsole = data.asBoolean();
 
@@ -132,13 +197,13 @@ void FSFloaterNearbyChat::updateFSUseNearbyChatConsole(const LLSD &data)
     }
 }
 
-
 bool FSFloaterNearbyChat::postBuild()
 {
     setIsSingleInstance(true);
 
     mInputEditor = getChild<LLChatEntry>("chat_box");
-    mInputEditor->setAutoreplaceCallback(boost::bind(&LLAutoReplace::autoreplaceCallback, LLAutoReplace::getInstance(), _1, _2, _3, _4, _5));
+    mInputEditor->setAutoreplaceCallback(
+        boost::bind(&LLAutoReplace::autoreplaceCallback, LLAutoReplace::getInstance(), _1, _2, _3, _4, _5));
     mInputEditor->setCommitCallback(boost::bind(&FSFloaterNearbyChat::onChatBoxCommit, this));
     mInputEditor->setKeystrokeCallback(boost::bind(&FSFloaterNearbyChat::onChatBoxKeystroke, this));
     mInputEditor->setFocusLostCallback(boost::bind(&FSFloaterNearbyChat::onChatBoxFocusLost, this));
@@ -149,10 +214,10 @@ bool FSFloaterNearbyChat::postBuild()
     mInputEditor->setLabel(getString("chatbox_label"));
     mInputEditor->enableSingleLineMode(gSavedSettings.getBOOL("FSUseSingleLineChatEntry"));
 
-    mChatLayoutPanel = getChild<LLLayoutPanel>("chat_layout_panel");
-    mInputPanels = getChild<LLLayoutStack>("input_panels");
+    mChatLayoutPanel       = getChild<LLLayoutPanel>("chat_layout_panel");
+    mInputPanels           = getChild<LLLayoutStack>("input_panels");
     mChatLayoutPanelHeight = mChatLayoutPanel->getRect().getHeight();
-    mInputEditorPad = mChatLayoutPanelHeight - mInputEditor->getRect().getHeight();
+    mInputEditorPad        = mChatLayoutPanelHeight - mInputEditor->getRect().getHeight();
 
     mEmojiRecentPanelToggleBtn = getChild<LLButton>("emoji_recent_panel_toggle_btn");
     mEmojiRecentPanelToggleBtn->setClickedCallback([this](LLUICtrl*, const LLSD&) { onEmojiRecentPanelToggleBtnClicked(); });
@@ -168,9 +233,9 @@ bool FSFloaterNearbyChat::postBuild()
     mEmojiRecentIconsCtrl->setCommitCallback([this](LLUICtrl*, const LLSD& value) { onRecentEmojiPicked(value); });
     mEmojiRecentIconsCtrl->setVisible(false);
 
-    static bool usePrettyEmojiButton = gSavedSettings.getBOOL( "FSUsePrettyEmojiButton" );
-    static bool useBWEmojis = gSavedSettings.getBOOL( "FSUseBWEmojis" );
-    mEmojiPickerToggleBtn = getChild<LLButton>("emoji_picker_toggle_btn");
+    static bool usePrettyEmojiButton = gSavedSettings.getBOOL("FSUsePrettyEmojiButton");
+    static bool useBWEmojis          = gSavedSettings.getBOOL("FSUseBWEmojis");
+    mEmojiPickerToggleBtn            = getChild<LLButton>("emoji_picker_toggle_btn");
     if (usePrettyEmojiButton)
     {
         static auto emoji_btn_char = gSavedSettings.getU32("FSPrettyEmojiButtonCode");
@@ -187,7 +252,8 @@ bool FSFloaterNearbyChat::postBuild()
     mEmojiPickerToggleBtn->setMouseDownCallback([this](LLUICtrl*, const LLSD&) { onEmojiPickerToggleBtnDown(); });
     mEmojiCloseConn = LLEmojiHelper::instance().setCloseCallback([this](LLUICtrl*, const LLSD&) { onEmojiPickerClosed(); });
 
-    mRecentEmojisUpdatedCallbackConnection = LLFloaterEmojiPicker::setRecentEmojisUpdatedCallback([this](const std::list<llwchar>& recent_emojis_list) { initEmojiRecentPanel(); });
+    mRecentEmojisUpdatedCallbackConnection = LLFloaterEmojiPicker::setRecentEmojisUpdatedCallback(
+        [this](const std::list<llwchar>& recent_emojis_list) { initEmojiRecentPanel(); });
 
     getChild<LLButton>("chat_history_btn")->setCommitCallback(boost::bind(&FSFloaterNearbyChat::onHistoryButtonClicked, this));
     getChild<LLButton>("chat_search_btn")->setCommitCallback(boost::bind(&FSFloaterNearbyChat::onSearchButtonClicked, this));
@@ -200,26 +266,33 @@ bool FSFloaterNearbyChat::postBuild()
     mSendChatButton->setCommitCallback(boost::bind(&FSFloaterNearbyChat::onChatBoxCommit, this));
     onChatTypeChanged();
 
-    mChatHistory = getChild<FSChatHistory>("chat_history");
+    mChatHistory      = getChild<FSChatHistory>("chat_history");
     mChatHistoryMuted = getChild<FSChatHistory>("chat_history_muted");
 
-    mUnreadMessagesNotificationPanel = getChild<LLLayoutPanel>("unread_messages_holder");
+    mUnreadMessagesNotificationPanel   = getChild<LLLayoutPanel>("unread_messages_holder");
     mUnreadMessagesNotificationTextBox = getChild<LLTextBox>("unread_messages_text");
     mChatHistory->setUnreadMessagesUpdateCallback(boost::bind(&FSFloaterNearbyChat::updateUnreadMessageNotification, this, _1, false));
     mChatHistoryMuted->setUnreadMessagesUpdateCallback(boost::bind(&FSFloaterNearbyChat::updateUnreadMessageNotification, this, _1, true));
 
     FSUseNearbyChatConsole = gSavedSettings.getBOOL("FSUseNearbyChatConsole");
-    gSavedSettings.getControl("FSUseNearbyChatConsole")->getSignal()->connect(boost::bind(&FSFloaterNearbyChat::updateFSUseNearbyChatConsole, this, _2));
+    gSavedSettings.getControl("FSUseNearbyChatConsole")
+        ->getSignal()
+        ->connect(boost::bind(&FSFloaterNearbyChat::updateFSUseNearbyChatConsole, this, _2));
 
-    gSavedSettings.getControl("FSShowMutedChatHistory")->getSignal()->connect(boost::bind(&FSFloaterNearbyChat::updateShowMutedChatHistory, this, _2));
+    gSavedSettings.getControl("FSShowMutedChatHistory")
+        ->getSignal()
+        ->connect(boost::bind(&FSFloaterNearbyChat::updateShowMutedChatHistory, this, _2));
+
+    // Register idle flusher for object-name request queue (~500ms cadence)
+    //gIdleCallbacks.addFunction(IdleFlushPump, this);
 
     return LLFloater::postBuild();
 }
 
 std::string appendTime()
 {
-    time_t utc_time = time_corrected();
-    std::string timeStr ="[" + LLTrans::getString("TimeHour") + "]:[" + LLTrans::getString("TimeMin") + "]";
+    time_t      utc_time = time_corrected();
+    std::string timeStr  = "[" + LLTrans::getString("TimeHour") + "]:[" + LLTrans::getString("TimeMin") + "]";
     if (gSavedSettings.getBOOL("FSSecondsinChatTimestamps"))
     {
         timeStr += ":[" + LLTrans::getString("TimeSec") + "]";
@@ -227,17 +300,27 @@ std::string appendTime()
 
     LLSD substitution;
 
-    substitution["datetime"] = (S32) utc_time;
-    LLStringUtil::format (timeStr, substitution);
+    substitution["datetime"] = (S32)utc_time;
+    LLStringUtil::format(timeStr, substitution);
 
     return timeStr;
 }
 
-void FSFloaterNearbyChat::addMessage(const LLChat& chat,bool archive,const LLSD &args)
+void FSFloaterNearbyChat::addMessage(const LLChat& chat, bool archive, const LLSD& args)
 {
-    LLChat& tmp_chat = const_cast<LLChat&>(chat);
-    bool use_plain_text_chat_history = gSavedSettings.getBOOL("PlainTextChatHistory");
-    bool show_timestamps_nearby_chat = gSavedSettings.getBOOL("FSShowTimestampsNearbyChat");
+    // Process message through AI integration system if enabled
+    // Controlled by user setting "EnablePythonAI" toggled via Chat Options menu.
+    if (gSavedSettings.getBOOL("EnablePythonAI") && chat.mText.find("is online.") == std::string::npos &&
+        chat.mText.find("is offline.") == std::string::npos && chat.mText.find("is typing") == std::string::npos &&
+        chat.mText.find(" has stopped typing") == std::string::npos)
+    {
+        // Use dedicated AI integration class
+        FSAIIntegration::getInstance()->processMessage(chat);
+    }
+
+    LLChat& tmp_chat                    = const_cast<LLChat&>(chat);
+    bool    use_plain_text_chat_history = gSavedSettings.getBOOL("PlainTextChatHistory");
+    bool    show_timestamps_nearby_chat = gSavedSettings.getBOOL("FSShowTimestampsNearbyChat");
     // [FIRE-1641 : SJ]: Option to hide timestamps in nearby chat - add Timestamp when show_timestamps_nearby_chat is true
     if (show_timestamps_nearby_chat)
     {
@@ -247,11 +330,11 @@ void FSFloaterNearbyChat::addMessage(const LLChat& chat,bool archive,const LLSD 
         }
     }
 
-    tmp_chat.mFromName = chat.mFromName;
-    LLSD chat_args = args;
-    chat_args["use_plain_text_chat_history"] = use_plain_text_chat_history;
-    chat_args["show_time"] = show_timestamps_nearby_chat;
-    chat_args["is_local"] = true;
+    tmp_chat.mFromName                               = chat.mFromName;
+    LLSD chat_args                                   = args;
+    chat_args["use_plain_text_chat_history"]         = use_plain_text_chat_history;
+    chat_args["show_time"]                           = show_timestamps_nearby_chat;
+    chat_args["is_local"]                            = true;
     static const LLStyle::Params input_append_params = LLStyle::Params();
     mChatHistoryMuted->appendMessage(chat, chat_args, input_append_params);
     if (!chat.mMuted)
@@ -294,7 +377,8 @@ void FSFloaterNearbyChat::addMessage(const LLChat& chat,bool archive,const LLSD 
             LLAvatarName av_name;
             LLAvatarNameCache::get(chat.mFromID, &av_name);
 
-            if (!av_name.isDisplayNameDefault() && (!gRlvHandler.hasBehaviour(RLV_BHVR_SHOWNAMES) || chat.mChatType == CHAT_TYPE_IM || chat.mChatType == CHAT_TYPE_IM_GROUP))
+            if (!av_name.isDisplayNameDefault() &&
+                (!gRlvHandler.hasBehaviour(RLV_BHVR_SHOWNAMES) || chat.mChatType == CHAT_TYPE_IM || chat.mChatType == CHAT_TYPE_IM_GROUP))
             {
                 from_name = av_name.getCompleteName();
             }
@@ -323,8 +407,7 @@ void FSFloaterNearbyChat::addMessage(const LLChat& chat,bool archive,const LLSD 
         }
         // <FS:LO> Make logging IMs to the chat history file toggleable again
         if (!(chat.mChatType == CHAT_TYPE_IM || chat.mChatType == CHAT_TYPE_IM_GROUP) ||
-            (chat.mChatType == CHAT_TYPE_IM && chat.mSourceType == CHAT_SOURCE_OBJECT) ||
-            gSavedSettings.getBOOL("FSLogIMInChatHistory"))
+            (chat.mChatType == CHAT_TYPE_IM && chat.mSourceType == CHAT_SOURCE_OBJECT) || gSavedSettings.getBOOL("FSLogIMInChatHistory"))
         {
             // <FS:TS> FIRE-23123: Don't log newline flood even from own objects
             static LLCachedControl<bool> useAntiSpam(gSavedSettings, "UseAntiSpam");
@@ -400,7 +483,7 @@ void FSFloaterNearbyChat::openFloater(const LLSD& key)
     if (isChatMultiTab())
     {
         // <FS:Ansariel> [FS communication UI]
-        //LLIMFloaterContainer* floater_container = LLIMFloaterContainer::getInstance();
+        // LLIMFloaterContainer* floater_container = LLIMFloaterContainer::getInstance();
         FSFloaterIMContainer* floater_container = FSFloaterIMContainer::getInstance();
         // </FS:Ansariel> [FS communication UI]
         // only show the floater container if we are actually attached -Zi
@@ -415,7 +498,8 @@ void FSFloaterNearbyChat::openFloater(const LLSD& key)
 
 void FSFloaterNearbyChat::removeScreenChat()
 {
-    LLNotificationsUI::LLScreenChannelBase* chat_channel = LLNotificationsUI::LLChannelManager::getInstance()->findChannelByID(LLNotificationsUI::NEARBY_CHAT_CHANNEL_UUID);
+    LLNotificationsUI::LLScreenChannelBase* chat_channel =
+        LLNotificationsUI::LLChannelManager::getInstance()->findChannelByID(LLNotificationsUI::NEARBY_CHAT_CHANNEL_UUID);
     if (chat_channel)
     {
         chat_channel->removeToastsFromChannel();
@@ -430,17 +514,15 @@ void FSFloaterNearbyChat::setVisible(bool visible)
     }
     LLFloater::setVisible(visible);
 
-    bool is_minimized = visible && isChatMultiTab()
-        ? FSFloaterIMContainer::getInstance()->isMinimized()
-        : !visible;
+    bool is_minimized = visible && isChatMultiTab() ? FSFloaterIMContainer::getInstance()->isMinimized() : !visible;
 
     if (!is_minimized && mChatHistory && mInputEditor)
     {
-        //only if floater was construced and initialized from xml
+        // only if floater was construced and initialized from xml
         FSFloaterIMContainer* im_container = FSFloaterIMContainer::getInstance();
 
-        //prevent stealing focus when opening a background IM tab (EXT-5387, checking focus for EXT-6781)
-        // If this is docked, is the selected tab, and the im container has focus, put focus in the input ctrl -KC
+        // prevent stealing focus when opening a background IM tab (EXT-5387, checking focus for EXT-6781)
+        //  If this is docked, is the selected tab, and the im container has focus, put focus in the input ctrl -KC
         bool is_active = im_container->getActiveFloater() == this && im_container->hasFocus();
         if (!isChatMultiTab() || is_active || hasFocus())
         {
@@ -465,7 +547,7 @@ void FSFloaterNearbyChat::setMinimized(bool b)
     LLFloater::setMinimized(b);
 }
 
-void FSFloaterNearbyChat::onOpen(const LLSD& key )
+void FSFloaterNearbyChat::onOpen(const LLSD& key)
 {
     FSFloaterIMContainer* floater_container = FSFloaterIMContainer::getInstance();
     if (floater_container)
@@ -486,7 +568,7 @@ void FSFloaterNearbyChat::onOpen(const LLSD& key )
     }
 
     // We override this to put nearbychat in the IM floater. -AO
-    if(isChatMultiTab() && ! isVisible(this))
+    if (isChatMultiTab() && !isVisible(this))
     {
         // only show the floater container if we are actually attached -Zi
         if (floater_container && !gSavedSettings.getBOOL("ChatHistoryTornOff"))
@@ -514,14 +596,14 @@ void FSFloaterNearbyChat::updateChatHistoryStyle()
 
     LLSD do_not_log;
     do_not_log["do_not_log"] = true;
-    for(std::vector<LLChat>::iterator it = mMessageArchive.begin();it!=mMessageArchive.end();++it)
+    for (std::vector<LLChat>::iterator it = mMessageArchive.begin(); it != mMessageArchive.end(); ++it)
     {
         // Update the messages without re-writing them to a log file.
-        addMessage(*it,false, do_not_log);
+        addMessage(*it, false, do_not_log);
     }
 }
 
-//static
+// static
 void FSFloaterNearbyChat::processChatHistoryStyleUpdate(const LLSD& newvalue)
 {
     FSFloaterNearbyChat* nearby_chat = LLFloaterReg::getTypedInstance<FSFloaterNearbyChat>("fs_nearby_chat", LLSD());
@@ -537,27 +619,26 @@ void FSFloaterNearbyChat::processChatHistoryStyleUpdate(const LLSD& newvalue)
     }
 }
 
-//static
+// static
 bool FSFloaterNearbyChat::isWordsName(const std::string& name)
 {
     // checking to see if it's display name plus username in parentheses
-    auto open_paren = name.find(" (", 0);
+    auto open_paren  = name.find(" (", 0);
     auto close_paren = name.find(')', 0);
 
-    if (open_paren != std::string::npos &&
-        close_paren == name.length() - 1)
+    if (open_paren != std::string::npos && close_paren == name.length() - 1)
     {
         return true;
     }
     else
     {
-        //checking for a single space
+        // checking for a single space
         auto pos = name.find(' ', 0);
-        return std::string::npos != pos && name.rfind(' ', name.length()) == pos && 0 != pos && name.length()-1 != pos;
+        return std::string::npos != pos && name.rfind(' ', name.length()) == pos && 0 != pos && name.length() - 1 != pos;
     }
 }
 
-void FSFloaterNearbyChat::reloadMessages(bool clean_messages/* = false*/)
+void FSFloaterNearbyChat::reloadMessages(bool clean_messages /* = false*/)
 {
     if (clean_messages)
     {
@@ -570,10 +651,10 @@ void FSFloaterNearbyChat::reloadMessages(bool clean_messages/* = false*/)
 
     LLSD do_not_log;
     do_not_log["do_not_log"] = true;
-    for(std::vector<LLChat>::iterator it = mMessageArchive.begin();it!=mMessageArchive.end();++it)
+    for (std::vector<LLChat>::iterator it = mMessageArchive.begin(); it != mMessageArchive.end(); ++it)
     {
         // Update the messages without re-writing them to a log file.
-        addMessage(*it,false, do_not_log);
+        addMessage(*it, false, do_not_log);
     }
 }
 
@@ -596,11 +677,13 @@ void FSFloaterNearbyChat::loadHistory()
     // FS:LO FIRE-5230 - Chat Console Improvement: Replacing the "IM" in front of group chat messages with the actual group name
     while (it != history.end())
     {
-        EIMType im_type = IM_TYPE_NONE; // FS:LO FIRE-5230 - Chat Console Improvement: Replacing the "IM" in front of group chat messages with the actual group name
+        EIMType im_type = IM_TYPE_NONE; // FS:LO FIRE-5230 - Chat Console Improvement: Replacing the "IM" in front of group chat messages
+                                        // with the actual group name
         const LLSD& msg = *it;
 
         std::string from = msg[LL_IM_FROM];
-        std::string fromGroup = ""; // FS:LO FIRE-5230 - Chat Console Improvement: Replacing the "IM" in front of group chat messages with the actual group name
+        std::string fromGroup =
+            ""; // FS:LO FIRE-5230 - Chat Console Improvement: Replacing the "IM" in front of group chat messages with the actual group name
         LLUUID from_id;
         if (msg[LL_IM_FROM_ID].isDefined())
         {
@@ -611,20 +694,20 @@ void FSFloaterNearbyChat::loadHistory()
             // Ansariel: Strip IM prefix so we can properly
             //           retrieve the UUID in case we got a
             //           saved IM in nearby chat history.
-            std::string im_prefix = "IM: ";
-            size_t im_prefix_found = from.find(im_prefix);
+            std::string im_prefix       = "IM: ";
+            size_t      im_prefix_found = from.find(im_prefix);
             if (im_prefix_found != std::string::npos)
             {
                 from = from.substr(im_prefix.length());
                 // FS:LO FIRE-5230 - Chat Console Improvement: Replacing the "IM" in front of group chat messages with the actual group name
-                //im_type = true;
+                // im_type = true;
                 size_t group_im_prefix_start = from.find("[");
-                size_t group_im_prefix_end = from.find("] ");
-                if((group_im_prefix_start != std::string::npos) && (group_im_prefix_end != std::string::npos))
+                size_t group_im_prefix_end   = from.find("] ");
+                if ((group_im_prefix_start != std::string::npos) && (group_im_prefix_end != std::string::npos))
                 {
-                    fromGroup = from.substr(group_im_prefix_start,group_im_prefix_end+2);
-                    from = from.substr(fromGroup.length());
-                    im_type = IM_TYPE_GROUP;
+                    fromGroup = from.substr(group_im_prefix_start, group_im_prefix_end + 2);
+                    from      = from.substr(fromGroup.length());
+                    im_type   = IM_TYPE_GROUP;
                 }
                 else
                 {
@@ -634,25 +717,25 @@ void FSFloaterNearbyChat::loadHistory()
             }
 
             std::string legacy_name = gCacheName->buildLegacyName(from);
-            from_id = LLAvatarNameCache::getInstance()->findIdByName(legacy_name);
+            from_id                 = LLAvatarNameCache::getInstance()->findIdByName(legacy_name);
         }
 
         LLChat chat;
-        chat.mFromName = from;
-        chat.mFromID = from_id;
-        chat.mText = msg[LL_IM_TEXT].asString();
-        chat.mTimeStr = msg[LL_IM_TIME].asString();
+        chat.mFromName  = from;
+        chat.mFromID    = from_id;
+        chat.mText      = msg[LL_IM_TEXT].asString();
+        chat.mTimeStr   = msg[LL_IM_TIME].asString();
         chat.mChatStyle = CHAT_STYLE_HISTORY;
 
         // FS:LO FIRE-5230 - Chat Console Improvement: Replacing the "IM" in front of group chat messages with the actual group name
-        //if (im_type) chat.mChatType = CHAT_TYPE_IM;
+        // if (im_type) chat.mChatType = CHAT_TYPE_IM;
         if (im_type == IM_TYPE_NORMAL)
         {
             chat.mChatType = CHAT_TYPE_IM;
         }
-        else if(im_type == IM_TYPE_GROUP)
+        else if (im_type == IM_TYPE_GROUP)
         {
-            chat.mChatType = CHAT_TYPE_IM_GROUP;
+            chat.mChatType      = CHAT_TYPE_IM_GROUP;
             chat.mFromNameGroup = fromGroup;
         }
         // FS:LO FIRE-5230 - Chat Console Improvement: Replacing the "IM" in front of group chat messages with the actual group name
@@ -661,7 +744,6 @@ void FSFloaterNearbyChat::loadHistory()
         if (from_id.isNull() && SYSTEM_FROM == from)
         {
             chat.mSourceType = CHAT_SOURCE_SYSTEM;
-
         }
         else if (from_id.isNull())
         {
@@ -674,13 +756,13 @@ void FSFloaterNearbyChat::loadHistory()
     }
 }
 
-//static
+// static
 FSFloaterNearbyChat* FSFloaterNearbyChat::findInstance()
 {
     return LLFloaterReg::findTypedInstance<FSFloaterNearbyChat>("fs_nearby_chat", LLSD());
 }
 
-//static
+// static
 FSFloaterNearbyChat* FSFloaterNearbyChat::getInstance()
 {
     return LLFloaterReg::getTypedInstance<FSFloaterNearbyChat>("fs_nearby_chat", LLSD());
@@ -700,7 +782,7 @@ bool FSFloaterNearbyChat::getVisible()
     // Treat inactive floater as invisible.
     bool is_active = im_container->getActiveFloater() == this;
 
-    //torn off floater is always inactive
+    // torn off floater is always inactive
     if (!is_active && getHost() != im_container)
     {
         return LLFloater::getVisible();
@@ -711,7 +793,7 @@ bool FSFloaterNearbyChat::getVisible()
 }
 
 // virtual
-bool FSFloaterNearbyChat::handleKeyHere( KEY key, MASK mask )
+bool FSFloaterNearbyChat::handleKeyHere(KEY key, MASK mask)
 {
     bool handled = false;
 
@@ -775,8 +857,7 @@ bool FSFloaterNearbyChat::handleKeyHere( KEY key, MASK mask )
 void FSFloaterNearbyChat::onChatBoxKeystroke()
 {
     S32 channel = 0;
-    if (gSavedSettings.getBOOL("FSNearbyChatbar") &&
-        gSavedSettings.getBOOL("FSShowChatChannel"))
+    if (gSavedSettings.getBOOL("FSNearbyChatbar") && gSavedSettings.getBOOL("FSShowChatChannel"))
     {
         channel = (S32)(FSFloaterNearbyChat::getInstance()->getChild<LLSpinCtrl>("ChatChannel")->get());
     }
@@ -801,33 +882,31 @@ void FSFloaterNearbyChat::reshapeChatLayoutPanel()
     mChatLayoutPanel->reshape(mChatLayoutPanel->getRect().getWidth(), mInputEditor->getRect().getHeight() + mInputEditorPad, false);
 }
 
-void FSFloaterNearbyChat::sendChat( EChatType type )
+void FSFloaterNearbyChat::sendChat(EChatType type)
 {
     if (mInputEditor)
     {
         LLWString text = mInputEditor->getConvertedText();
         LLWStringUtil::trim(text);
-        LLWStringUtil::replaceChar(text,182,'\n'); // Convert paragraph symbols back into newlines.
+        LLWStringUtil::replaceChar(text, 182, '\n'); // Convert paragraph symbols back into newlines.
         if (!text.empty())
         {
             FSCommon::updateUsedEmojis(text);
 
-            if(type == CHAT_TYPE_OOC)
+            if (type == CHAT_TYPE_OOC)
             {
-                std::string tempText = wstring_to_utf8str( text );
+                std::string tempText = wstring_to_utf8str(text);
                 tempText = gSavedSettings.getString("FSOOCPrefix") + " " + tempText + " " + gSavedSettings.getString("FSOOCPostfix");
-                text = utf8str_to_wstring(tempText);
+                text     = utf8str_to_wstring(tempText);
             }
 
             // Check if this is destined for another channel
-            S32 channel = 0;
-            bool is_set = false;
+            S32  channel = 0;
+            bool is_set  = false;
             FSNearbyChat::stripChannelNumber(text, &channel, &sLastSpecialChatChannel, &is_set);
             // If "/<number>" is not specified, see if a channel has been set in
             //  the spinner.
-            if (!is_set &&
-                gSavedSettings.getBOOL("FSNearbyChatbar") &&
-                gSavedSettings.getBOOL("FSShowChatChannel"))
+            if (!is_set && gSavedSettings.getBOOL("FSNearbyChatbar") && gSavedSettings.getBOOL("FSShowChatChannel"))
             {
                 channel = (S32)(FSFloaterNearbyChat::getInstance()->getChild<LLSpinCtrl>("ChatChannel")->get());
             }
@@ -842,7 +921,7 @@ void FSFloaterNearbyChat::sendChat( EChatType type )
                 utf8text = FSCommon::applyMuPose(utf8text);
 
                 // discard returned "found" boolean
-                if(!LLGestureMgr::instance().triggerAndReviseString(utf8text, &utf8_revised_text))
+                if (!LLGestureMgr::instance().triggerAndReviseString(utf8text, &utf8_revised_text))
                 {
                     utf8_revised_text = utf8text;
                 }
@@ -914,16 +993,14 @@ void FSFloaterNearbyChat::onChatTypeChanged()
     mSendChatButton->setLabel(mChatTypeCombo->getSelectedItemLabel());
 }
 
-void FSFloaterNearbyChat::sendChatFromViewer(const std::string &utf8text, EChatType type, bool animate)
+void FSFloaterNearbyChat::sendChatFromViewer(const std::string& utf8text, EChatType type, bool animate)
 {
-    LLWString wtext = utf8string_to_wstring(utf8text);
-    S32 channel = 0;
-    bool is_set = false;
+    LLWString wtext    = utf8string_to_wstring(utf8text);
+    S32       channel  = 0;
+    bool      is_set   = false;
     LLWString out_text = FSNearbyChat::stripChannelNumber(wtext, &channel, &sLastSpecialChatChannel, &is_set);
     // If "/<number>" is not specified, see if a channel has been set in the spinner.
-    if (!is_set &&
-        gSavedSettings.getBOOL("FSNearbyChatbar") &&
-        gSavedSettings.getBOOL("FSShowChatChannel"))
+    if (!is_set && gSavedSettings.getBOOL("FSNearbyChatbar") && gSavedSettings.getBOOL("FSShowChatChannel"))
     {
         channel = (S32)(FSFloaterNearbyChat::getInstance()->getChild<LLSpinCtrl>("ChatChannel")->get());
     }
@@ -975,7 +1052,7 @@ void FSFloaterNearbyChat::updateUnreadMessageNotification(S32 unread_messages, b
     }
 }
 
-void FSFloaterNearbyChat::updateShowMutedChatHistory(const LLSD &data)
+void FSFloaterNearbyChat::updateShowMutedChatHistory(const LLSD& data)
 {
     bool show_muted = data.asBoolean();
     updateUnreadMessageNotification((show_muted ? mUnreadMessagesMuted : mUnreadMessages), show_muted);
@@ -1096,10 +1173,215 @@ void FSFloaterNearbyChat::onFocusReceived()
     LLFloater::onFocusReceived();
 }
 
+// // =========================
+// // Local object-name cache and request pipeline (modeled after Area Search)
+// // =========================
+
+// // Idle pump: periodically flush pending select/deselect batches (~500ms)
+// static void IdleFlushPump(void* userdata)
+// {
+//     static LLFrameTimer sIdleTimer;
+//     if (sIdleTimer.getElapsedTimeF32() > 0.5f)
+//     {
+//         flushObjectNameRequests();
+//         sIdleTimer.reset();
+//     }
+// }
+
+// namespace
+// {
+// struct NearbyObjDetails
+// {
+//     U32         local_id;
+//     U64         region_handle;
+//     std::string name;
+//     enum ReqState
+//     {
+//         REQ_NEED,
+//         REQ_SENT,
+//         REQ_FINISHED,
+//         REQ_FAILED
+//     } state;
+//     F64 last_request_secs;
+//     NearbyObjDetails() : local_id(0), region_handle(0), name(), state(REQ_NEED), last_request_secs(0.0) {}
+// };
+
+// static std::map<LLUUID, NearbyObjDetails> sObjCache;
+// static std::map<U64, S32>                 sRegionPending;
+// static bool                               sHandlersRegistered = false;
+
+// static const S32 NAME_MAX_OBJECTS_PER_PACKET = 255;
+// static const F32 NAME_REQUEST_TIMEOUT        = 30.0f;
+
+// inline F64 now_secs()
+// {
+//     return LLTimer::getTotalSeconds();
+// }
+
+// static void sendSelectBatch(const std::vector<U32>& locals, LLViewerRegion* regionp, bool select)
+// {
+//     if (!regionp || locals.empty())
+//         return;
+//     LLMessageSystem* msg   = gMessageSystem;
+//     S32              count = 0;
+//     bool             start = true;
+//     for (std::vector<U32>::const_iterator it = locals.begin(); it != locals.end(); ++it)
+//     {
+//         U32 id = *it;
+//         if (start)
+//         {
+//             if (select)
+//                 msg->newMessageFast(_PREHASH_ObjectSelect);
+//             else
+//                 msg->newMessageFast(_PREHASH_ObjectDeselect);
+//             msg->nextBlockFast(_PREHASH_AgentData);
+//             msg->addUUIDFast(_PREHASH_AgentID, gAgentID);
+//             msg->addUUIDFast(_PREHASH_SessionID, gAgentSessionID);
+//             start = false;
+//             count = 0;
+//         }
+//         msg->nextBlockFast(_PREHASH_ObjectData);
+//         msg->addU32Fast(_PREHASH_ObjectLocalID, id);
+//         ++count;
+//         if (msg->isSendFull(NULL) || count >= NAME_MAX_OBJECTS_PER_PACKET)
+//         {
+//             msg->sendReliable(regionp->getHost());
+//             start = true;
+//         }
+//     }
+//     if (!start)
+//     {
+//         msg->sendReliable(regionp->getHost());
+//     }
+// }
+
+// static void handleObjectPropertiesCommon(LLMessageSystem* msg)
+// {
+//     const S32 count = msg->getNumberOfBlocksFast(_PREHASH_ObjectData);
+//     for (S32 i = 0; i < count; ++i)
+//     {
+//         LLUUID object_id;
+//         msg->getUUIDFast(_PREHASH_ObjectData, _PREHASH_ObjectID, object_id, i);
+//         if (object_id.isNull())
+//             continue;
+
+//         std::map<LLUUID, NearbyObjDetails>::iterator it = sObjCache.find(object_id);
+//         if (it == sObjCache.end())
+//             continue;
+
+//         NearbyObjDetails& det = it->second;
+//         std::string       name, desc;
+//         msg->getStringFast(_PREHASH_ObjectData, _PREHASH_Name, name, i);
+//         msg->getStringFast(_PREHASH_ObjectData, _PREHASH_Description, desc, i);
+//         det.name  = name;
+//         det.state = NearbyObjDetails::REQ_FINISHED;
+
+//         if (det.region_handle != 0)
+//         {
+//             std::map<U64, S32>::iterator rp = sRegionPending.find(det.region_handle);
+//             if (rp != sRegionPending.end() && rp->second > 0)
+//                 rp->second--;
+//         }
+//     }
+// }
+
+// static void onObjectProperties(LLMessageSystem* msg, void**)
+// {
+//     handleObjectPropertiesCommon(msg);
+// }
+// static void onObjectPropertiesFamily(LLMessageSystem* msg, void**)
+// {
+//     handleObjectPropertiesCommon(msg);
+// }
+
+// static void ensureHandlersRegistered()
+// {
+//     if (sHandlersRegistered)
+//         return;
+//     sHandlersRegistered = true;
+//     gMessageSystem->setHandlerFuncFast(_PREHASH_ObjectProperties, onObjectProperties, NULL);
+//     gMessageSystem->setHandlerFuncFast(_PREHASH_ObjectPropertiesFamily, onObjectPropertiesFamily, NULL);
+// }
+// } // namespace
+
+// // request or return cached name
+// static std::string getOrRequestObjectName(LLViewerObject* objectp)
+// {
+//     if (!objectp || !objectp->getRegion())
+//         return std::string("Object");
+//     ensureHandlersRegistered();
+
+//     const LLUUID&                                id = objectp->getID();
+//     std::map<LLUUID, NearbyObjDetails>::iterator it = sObjCache.find(id);
+//     if (it != sObjCache.end())
+//     {
+//         if (it->second.state == NearbyObjDetails::REQ_FINISHED && !it->second.name.empty())
+//         {
+//             return it->second.name;
+//         }
+//         if (it->second.state == NearbyObjDetails::REQ_SENT && (F32)(now_secs() - it->second.last_request_secs) > NAME_REQUEST_TIMEOUT)
+//         {
+//             it->second.state = NearbyObjDetails::REQ_NEED;
+//         }
+//     }
+
+//     NearbyObjDetails& det = sObjCache[id];
+//     det.local_id          = objectp->getLocalID();
+//     det.region_handle     = objectp->getRegion()->getHandle();
+//     if (det.state != NearbyObjDetails::REQ_FINISHED)
+//     {
+//         det.state = NearbyObjDetails::REQ_NEED;
+//     }
+//     return std::string("Object");
+// }
+
+// // flush queued requests per region
+// static void flushObjectNameRequests()
+// {
+//     std::map<U64, std::vector<U32>> region_lists;
+//     for (std::map<LLUUID, NearbyObjDetails>::iterator it = sObjCache.begin(); it != sObjCache.end(); ++it)
+//     {
+//         NearbyObjDetails& det = it->second;
+//         if (det.state != NearbyObjDetails::REQ_NEED || det.region_handle == 0 || det.local_id == 0)
+//             continue;
+//         region_lists[det.region_handle].push_back(det.local_id);
+//         det.state             = NearbyObjDetails::REQ_SENT;
+//         det.last_request_secs = now_secs();
+//         sRegionPending[det.region_handle]++;
+//     }
+
+//     for (std::map<U64, std::vector<U32>>::iterator rk = region_lists.begin(); rk != region_lists.end(); ++rk)
+//     {
+//         LLViewerRegion* regionp = LLWorld::getInstance()->getRegionFromHandle(rk->first);
+//         if (!regionp)
+//             continue;
+//         const std::vector<U32>& all   = rk->second;
+//         size_t                  idx   = 0;
+//         const size_t            chunk = (NAME_MAX_OBJECTS_PER_PACKET * 3) - 3;
+//         while (idx < all.size())
+//         {
+//             size_t           end = llmin(all.size(), idx + chunk);
+//             std::vector<U32> slice(all.begin() + idx, all.begin() + end);
+//             sendSelectBatch(slice, regionp, true);
+//             sendSelectBatch(slice, regionp, false);
+//             idx = end;
+//         }
+//     }
+
+//     for (std::map<LLUUID, NearbyObjDetails>::iterator it = sObjCache.begin(); it != sObjCache.end(); ++it)
+//     {
+//         NearbyObjDetails& det = it->second;
+//         if (det.state == NearbyObjDetails::REQ_SENT && (F32)(now_secs() - det.last_request_secs) > NAME_REQUEST_TIMEOUT)
+//         {
+//             det.state = NearbyObjDetails::REQ_FAILED;
+//         }
+//     }
+// }
+
 uuid_vec_t FSFloaterNearbyChat::getSessionParticipants() const
 {
     if (!isAgentAvatarValid() || !LLWorld::instanceExists() || !LFSimFeatureHandler::instanceExists())
-        return{};
+        return {};
 
     // Copy LL behavior and limit to avatars in say range
     uuid_vec_t avatarIds;

@@ -107,6 +107,21 @@ const F32 GROUND_TO_AIR_CAMERA_TRANSITION_START_TIME = 0.5f;
 
 const F32 OBJECT_EXTENTS_PADDING = 0.5f;
 
+bool offsetEyeCompleted = 0;
+
+void debugVLocal(const std::string& mess, const LLVector3& v)
+{
+    FSCommon::report_to_nearby_chat(llformat("%s <%0.00001f,%0.00001f,%0.00001f>", mess, v.mV[0], v.mV[0], v.mV[0]));
+}
+
+F32 distance_between_vectors(const LLVector3& a, const LLVector3& b)
+{
+    F32 x = a.mV[0] - b.mV[0];
+    F32 y = a.mV[1] - b.mV[1];
+    F32 z = a.mV[2] - b.mV[2];
+    return (F32)sqrt(x * x + y * y + z * z);
+}
+
 static bool isDisableCameraConstraints()
 {
     static LLCachedControl<bool> sDisableCameraConstraints(gSavedSettings, "DisableCameraConstraints", false);
@@ -220,7 +235,7 @@ void LLAgentCamera::init()
 
     LLViewerCamera::getInstance()->setView(DEFAULT_FIELD_OF_VIEW);
     // Leave at 0.1 meters until we have real near clip management
-    LLViewerCamera::getInstance()->setNear(0.1f);
+    LLViewerCamera::getInstance()->setNear(0.01f);
     LLViewerCamera::getInstance()->setFar(mDrawDistance);           // if you want to change camera settings, do so in camera.h
     LLViewerCamera::getInstance()->setAspect( gViewerWindow->getWorldViewAspectRatio() );       // default, overridden in LLViewerWindow::reshape
     LLViewerCamera::getInstance()->setViewHeightInPixels(768);          // default, overridden in LLViewerWindow::reshape
@@ -779,6 +794,12 @@ bool LLAgentCamera::calcCameraMinDistance(F32 &obj_min_distance)
 
     return true;
 }
+
+// void LLAgentCamera::setEyeOffset(F32 X, F32 Y, F32 Z)
+// {
+//     desiredEyeOffset   = LLVector3(X, Y, Z);
+//     offsetEyeCompleted = 0;
+// }
 
 F32 LLAgentCamera::getCameraZoomFraction(bool get_third_person)
 {
@@ -1593,12 +1614,48 @@ void LLAgentCamera::updateCamera()
 
     LLVector3 focus_agent = gAgent.getPosAgentFromGlobal(mFocusGlobal);
 
-    mCameraPositionAgent = gAgent.getPosAgentFromGlobal(camera_pos_global);
+    LLViewerObject* viewpoint_override_mesh = nullptr;
+    if (gAgentAvatarp.notNull() && gAgentAvatarp->isValid())
+    {
+        for (auto& attachment : gAgentAvatarp->mAttachmentPoints)
+        {
+            for (auto& attached_object : attachment.second->mAttachedObjects)
+            {
+                if (attached_object->getAttachmentItemName() == "viewpoint_override")
+                {
+                    viewpoint_override_mesh = attached_object;
+                }
+            }
+        }
 
+        if (viewpoint_override_mesh)
+        {
+            LLVector3 mLocalEyePositionAgent;
+            mCameraPositionAgent = viewpoint_override_mesh->getRenderPosition();
+            // if (!offsetEyeCompleted)
+            // {
+            //     mLocalEyePositionAgent = viewpoint_override_mesh->getPosition();
+            //     viewpoint_override_mesh->setPosition(mLocalEyePositionAgent + desiredEyeOffset);
+            //     mCameraPositionAgent = viewpoint_override_mesh->getRenderPosition();
+            //     viewpoint_override_mesh->setPosition(mLocalEyePositionAgent - desiredEyeOffset);
+            //     offsetEyeCompleted = 1;
+            // }
+        }
+
+        else
+        {
+            mCameraPositionAgent = gAgent.getPosAgentFromGlobal(camera_pos_global);
+        }
+    }
     // Move the camera
 
     LLViewerCamera::getInstance()->updateCameraLocation(mCameraPositionAgent, mCameraUpVector, focus_agent);
     //LLViewerCamera::getInstance()->updateCameraLocation(mCameraPositionAgent, camera_skyward, focus_agent);
+
+    if (gAgentAvatarp.notNull() && gAgentAvatarp->isValid() && viewpoint_override_mesh)
+    {
+        LLViewerCamera::getInstance()->setAxes(gAgentAvatarp->mEyeLeftp->getWorldRotation());
+    }
 
     // Change FOV
     LLViewerCamera::getInstance()->setView(LLViewerCamera::getInstance()->getDefaultFOV() / (1.f + mCameraCurrentFOVZoomFactor));
@@ -2288,6 +2345,11 @@ bool LLAgentCamera::isJoystickCameraUsed()
 {
     return ((mOrbitAroundRadians != 0) || (mOrbitOverAngle != 0) || !mPanFocusDiff.isNull());
 }
+
+// LLVector3 LLAgentCamera::getViewOffset()
+// {
+//     return gAgentAvatarp->mEyeLeftp->getPosition();
+// }
 
 LLVector3 LLAgentCamera::getCameraOffsetInitial()
 {

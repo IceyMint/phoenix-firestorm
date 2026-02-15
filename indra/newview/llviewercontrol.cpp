@@ -30,7 +30,7 @@
 #include "llviewercontrol.h"
 
 // Library includes
-#include "llwindow.h"   // getGamma()
+#include "llwindow.h" // getGamma()
 
 // <FS:Zi> Handle IME text input getting enabled or disabled
 #if LL_SDL2
@@ -77,7 +77,7 @@
 #include "llfloatertools.h"
 #include "llpaneloutfitsinventory.h"
 // <FS:Ansariel> [FS Login Panel]
-//#include "llpanellogin.h"
+// #include "llpanellogin.h"
 #include "fspanellogin.h"
 // </FS:Ansariel> [FS Login Panel]
 // <FS:Zi> We don't use the mini location panel in Firestorm
@@ -124,16 +124,16 @@
 #include <boost/algorithm/string.hpp>
 
 #ifdef TOGGLE_HACKED_GODLIKE_VIEWER
-bool                gHackGodmode = false;
+bool gHackGodmode = false;
 #endif
 
 // Should you contemplate changing the name "Global", please first grep for
 // that string literal. There are at least a couple other places in the C++
 // code that assume the LLControlGroup named "Global" is gSavedSettings.
-LLControlGroup gSavedSettings("Global");    // saved at end of session
+LLControlGroup gSavedSettings("Global");               // saved at end of session
 LLControlGroup gSavedPerAccountSettings("PerAccount"); // saved at end of session
-LLControlGroup gCrashSettings("CrashSettings"); // saved at end of session
-LLControlGroup gWarningSettings("Warnings"); // persists ignored dialogs/warnings
+LLControlGroup gCrashSettings("CrashSettings");        // saved at end of session
+LLControlGroup gWarningSettings("Warnings");           // persists ignored dialogs/warnings
 
 std::string gLastRunVersion;
 
@@ -145,13 +145,9 @@ extern bool gDebugGL;
 class BandwidthUpdater : public LLEventTimer
 {
 public:
-    BandwidthUpdater()
-        :LLEventTimer(0.5f)
-    {
-        mEventTimer.stop();
-    }
+    BandwidthUpdater() : LLEventTimer(0.5f) { mEventTimer.stop(); }
 
-    virtual ~BandwidthUpdater(){}
+    virtual ~BandwidthUpdater() {}
 
     void update(const LLSD& new_value)
     {
@@ -194,10 +190,10 @@ static bool handleRenderFarClipChanged(const LLSD& newvalue)
 {
     if (LLStartUp::getStartupState() >= STATE_STARTED)
     {
-        F32 draw_distance = (F32)newvalue.asReal();
-    gAgentCamera.mDrawDistance = draw_distance;
-    LLWorld::getInstance()->setLandFarClip(draw_distance);
-    return true;
+        F32 draw_distance          = (F32)newvalue.asReal();
+        gAgentCamera.mDrawDistance = draw_distance;
+        LLWorld::getInstance()->setLandFarClip(draw_distance);
+        return true;
     }
     return false;
 }
@@ -238,13 +234,13 @@ static bool handleAvatarHoverOffsetChanged(const LLSD& newvalue)
     return true;
 }
 
-
 // <FS:Ansariel> Expose handleSetShaderChanged()
-//static bool handleSetShaderChanged(const LLSD& newvalue)
+// static bool handleSetShaderChanged(const LLSD& newvalue)
 bool handleSetShaderChanged(const LLSD& newvalue)
 // </FS:Ansariel>
 {
-    // changing shader level may invalidate existing cached bump maps, as the shader type determines the format of the bump map it expects - clear and repopulate the bump cache
+    // changing shader level may invalidate existing cached bump maps, as the shader type determines the format of the bump map it expects -
+    // clear and repopulate the bump cache
     gBumpImageList.destroyGL();
     gBumpImageList.restoreGL();
 
@@ -261,37 +257,37 @@ bool handleSetShaderChanged(const LLSD& newvalue)
 
 static bool handleRenderPerfTestChanged(const LLSD& newvalue)
 {
-       bool status = !newvalue.asBoolean();
-       if (!status)
-       {
-               gPipeline.clearRenderTypeMask(LLPipeline::RENDER_TYPE_WL_SKY,
-                                                                         LLPipeline::RENDER_TYPE_TERRAIN,
-                                                                         LLPipeline::RENDER_TYPE_GRASS,
-                                                                         LLPipeline::RENDER_TYPE_TREE,
-                                                                         LLPipeline::RENDER_TYPE_WATER,
-                                                                         LLPipeline::RENDER_TYPE_PASS_GRASS,
-                                                                         LLPipeline::RENDER_TYPE_HUD,
-                                                                         LLPipeline::RENDER_TYPE_CLOUDS,
-                                                                         LLPipeline::RENDER_TYPE_HUD_PARTICLES,
-                                                                         LLPipeline::END_RENDER_TYPES);
-               gPipeline.setRenderDebugFeatureControl(LLPipeline::RENDER_DEBUG_FEATURE_UI, false);
-       }
-       else
-       {
-               gPipeline.setRenderTypeMask(LLPipeline::RENDER_TYPE_WL_SKY,
-                                                                         LLPipeline::RENDER_TYPE_TERRAIN,
-                                                                         LLPipeline::RENDER_TYPE_GRASS,
-                                                                         LLPipeline::RENDER_TYPE_TREE,
-                                                                         LLPipeline::RENDER_TYPE_WATER,
-                                                                         LLPipeline::RENDER_TYPE_PASS_GRASS,
-                                                                         LLPipeline::RENDER_TYPE_HUD,
-                                                                         LLPipeline::RENDER_TYPE_CLOUDS,
-                                                                         LLPipeline::RENDER_TYPE_HUD_PARTICLES,
-                                                                         LLPipeline::END_RENDER_TYPES);
-               gPipeline.setRenderDebugFeatureControl(LLPipeline::RENDER_DEBUG_FEATURE_UI, true);
-       }
+    bool status = !newvalue.asBoolean();
+    if (!status)
+    {
+        gPipeline.clearRenderTypeMask(LLPipeline::RENDER_TYPE_WL_SKY,
+                                      LLPipeline::RENDER_TYPE_TERRAIN,
+                                      LLPipeline::RENDER_TYPE_GRASS,
+                                      LLPipeline::RENDER_TYPE_TREE,
+                                      LLPipeline::RENDER_TYPE_WATER,
+                                      LLPipeline::RENDER_TYPE_PASS_GRASS,
+                                      LLPipeline::RENDER_TYPE_HUD,
+                                      LLPipeline::RENDER_TYPE_CLOUDS,
+                                      LLPipeline::RENDER_TYPE_HUD_PARTICLES,
+                                      LLPipeline::END_RENDER_TYPES);
+        gPipeline.setRenderDebugFeatureControl(LLPipeline::RENDER_DEBUG_FEATURE_UI, false);
+    }
+    else
+    {
+        gPipeline.setRenderTypeMask(LLPipeline::RENDER_TYPE_WL_SKY,
+                                    LLPipeline::RENDER_TYPE_TERRAIN,
+                                    LLPipeline::RENDER_TYPE_GRASS,
+                                    LLPipeline::RENDER_TYPE_TREE,
+                                    LLPipeline::RENDER_TYPE_WATER,
+                                    LLPipeline::RENDER_TYPE_PASS_GRASS,
+                                    LLPipeline::RENDER_TYPE_HUD,
+                                    LLPipeline::RENDER_TYPE_CLOUDS,
+                                    LLPipeline::RENDER_TYPE_HUD_PARTICLES,
+                                    LLPipeline::END_RENDER_TYPES);
+        gPipeline.setRenderDebugFeatureControl(LLPipeline::RENDER_DEBUG_FEATURE_UI, true);
+    }
 
-       return true;
+    return true;
 }
 
 bool handleRenderTransparentWaterChanged(const LLSD& newvalue)
@@ -306,7 +302,6 @@ bool handleRenderTransparentWaterChanged(const LLSD& newvalue)
     LLWorld::getInstance()->updateWaterObjects();
     return true;
 }
-
 
 static bool handleShadowsResized(const LLSD& newvalue)
 {
@@ -385,8 +380,8 @@ static bool handleVSyncChanged(const LLSD& newvalue)
 
 static bool handleVolumeLODChanged(const LLSD& newvalue)
 {
-    LLVOVolume::sLODFactor = llclamp((F32) newvalue.asReal(), 0.01f, MAX_LOD_FACTOR);
-    LLVOVolume::sDistanceFactor = 1.f-LLVOVolume::sLODFactor * 0.1f;
+    LLVOVolume::sLODFactor      = llclamp((F32)newvalue.asReal(), 0.01f, MAX_LOD_FACTOR);
+    LLVOVolume::sDistanceFactor = 1.f - LLVOVolume::sLODFactor * 0.1f;
 
     // <FS:PP> Warning about too high LOD on LOD change
     if (LLVOVolume::sLODFactor > 4.0f)
@@ -410,41 +405,41 @@ static bool handleOverrideVRAMDetectionChanged(const LLSD& newvalue)
 
 static bool handleAvatarLODChanged(const LLSD& newvalue)
 {
-    LLVOAvatar::sLODFactor = llclamp((F32) newvalue.asReal(), 0.f, MAX_AVATAR_LOD_FACTOR);
+    LLVOAvatar::sLODFactor = llclamp((F32)newvalue.asReal(), 0.f, MAX_AVATAR_LOD_FACTOR);
     return true;
 }
 
 static bool handleAvatarPhysicsLODChanged(const LLSD& newvalue)
 {
-    LLVOAvatar::sPhysicsLODFactor = llclamp((F32) newvalue.asReal(), 0.f, MAX_AVATAR_LOD_FACTOR);
+    LLVOAvatar::sPhysicsLODFactor = llclamp((F32)newvalue.asReal(), 0.f, MAX_AVATAR_LOD_FACTOR);
     return true;
 }
 
 static bool handleTerrainLODChanged(const LLSD& newvalue)
 {
     LLVOSurfacePatch::sLODFactor = (F32)newvalue.asReal();
-    //sqaure lod factor to get exponential range of [0,4] and keep
-    //a value of 1 in the middle of the detail slider for consistency
-    //with other detail sliders (see panel_preferences_graphics1.xml)
+    // sqaure lod factor to get exponential range of [0,4] and keep
+    // a value of 1 in the middle of the detail slider for consistency
+    // with other detail sliders (see panel_preferences_graphics1.xml)
     LLVOSurfacePatch::sLODFactor *= LLVOSurfacePatch::sLODFactor;
     return true;
 }
 
 static bool handleTreeLODChanged(const LLSD& newvalue)
 {
-    LLVOTree::sTreeFactor = (F32) newvalue.asReal();
+    LLVOTree::sTreeFactor = (F32)newvalue.asReal();
     return true;
 }
 
 static bool handleFlexLODChanged(const LLSD& newvalue)
 {
-    LLVolumeImplFlexible::sUpdateFactor = (F32) newvalue.asReal();
+    LLVolumeImplFlexible::sUpdateFactor = (F32)newvalue.asReal();
     return true;
 }
 
 static bool handleGammaChanged(const LLSD& newvalue)
 {
-    F32 gamma = (F32) newvalue.asReal();
+    F32 gamma = (F32)newvalue.asReal();
     if (gamma == 0.0f)
     {
         gamma = 1.0f; // restore normal gamma
@@ -466,7 +461,7 @@ const F32 MIN_USER_FOG_RATIO = 0.5f;
 
 static bool handleFogRatioChanged(const LLSD& newvalue)
 {
-    F32 fog_ratio = llmax(MIN_USER_FOG_RATIO, llmin((F32) newvalue.asReal(), MAX_USER_FOG_RATIO));
+    F32 fog_ratio = llmax(MIN_USER_FOG_RATIO, llmin((F32)newvalue.asReal(), MAX_USER_FOG_RATIO));
     gSky.setFogRatio(fog_ratio);
     return true;
 }
@@ -479,7 +474,7 @@ static bool handleMaxPartCountChanged(const LLSD& newvalue)
 
 static bool handleChatFontSizeChanged(const LLSD& newvalue)
 {
-    if(gConsole)
+    if (gConsole)
     {
         gConsole->setFontSize(newvalue.asInteger());
     }
@@ -489,9 +484,9 @@ static bool handleChatFontSizeChanged(const LLSD& newvalue)
 // <FS:Ansariel> Keep custom chat persist time
 static bool handleChatPersistTimeChanged(const LLSD& newvalue)
 {
-    if(gConsole)
+    if (gConsole)
     {
-        gConsole->setLinePersistTime((F32) newvalue.asReal());
+        gConsole->setLinePersistTime((F32)newvalue.asReal());
     }
     return true;
 }
@@ -499,7 +494,7 @@ static bool handleChatPersistTimeChanged(const LLSD& newvalue)
 
 static bool handleConsoleMaxLinesChanged(const LLSD& newvalue)
 {
-    if(gConsole)
+    if (gConsole)
     {
         gConsole->setMaxLines(newvalue.asInteger());
     }
@@ -519,8 +514,8 @@ static bool handleJoystickChanged(const LLSD& newvalue)
 
 static bool handleUseOcclusionChanged(const LLSD& newvalue)
 {
-    LLPipeline::sUseOcclusion = (newvalue.asBoolean()
-        && LLFeatureManager::getInstance()->isFeatureAvailable("UseOcclusion") && !gUseWireframe) ? 2 : 0;
+    LLPipeline::sUseOcclusion =
+        (newvalue.asBoolean() && LLFeatureManager::getInstance()->isFeatureAvailable("UseOcclusion") && !gUseWireframe) ? 2 : 0;
     return true;
 }
 
@@ -529,7 +524,6 @@ static bool handleUploadBakedTexOldChanged(const LLSD& newvalue)
     LLPipeline::sForceOldBakedUpload = newvalue.asBoolean();
     return true;
 }
-
 
 static bool handleWLSkyDetailChanged(const LLSD&)
 {
@@ -545,7 +539,7 @@ static bool handleRepartition(const LLSD&)
     if (gPipeline.isInit())
     {
         gOctreeMaxCapacity = gSavedSettings.getU32("OctreeMaxNodeCapacity");
-        gOctreeMinSize = gSavedSettings.getF32("OctreeMinimumNodeSize");
+        gOctreeMinSize     = gSavedSettings.getF32("OctreeMinimumNodeSize");
         gObjectList.repartitionObjects();
     }
     return true;
@@ -597,7 +591,7 @@ static bool handleAppleUseMultGLChanged(const LLSD& newvalue)
 }
 #endif
 
-static bool handleHeroProbeResolutionChanged(const LLSD &newvalue)
+static bool handleHeroProbeResolutionChanged(const LLSD& newvalue)
 {
     if (gPipeline.isInit())
     {
@@ -653,7 +647,7 @@ bool handleHighResSnapshotChanged(const LLSD& newvalue)
     // High Res Snapshot active, must uncheck RenderUIInSnapshot
     if (newvalue.asBoolean())
     {
-        gSavedSettings.setBOOL( "RenderUIInSnapshot", false);
+        gSavedSettings.setBOOL("RenderUIInSnapshot", false);
     }
     return true;
 }
@@ -688,7 +682,7 @@ bool handleNaclAntiSpamAmountChanged(const LLSD& newvalue)
 bool handleVelocityInterpolate(const LLSD& newvalue)
 {
     LLMessageSystem* msg = gMessageSystem;
-    if ( newvalue.asBoolean() )
+    if (newvalue.asBoolean())
     {
         msg->newMessageFast(_PREHASH_VelocityInterpolateOn);
         msg->nextBlockFast(_PREHASH_AgentData);
@@ -712,8 +706,8 @@ bool handleVelocityInterpolate(const LLSD& newvalue)
 bool handleForceShowGrid(const LLSD& newvalue)
 {
     // <FS:Ansariel> [FS Login Panel]
-    //LLPanelLogin::updateLocationSelectorsVisibility( );
-    FSPanelLogin::updateLocationSelectorsVisibility( );
+    // LLPanelLogin::updateLocationSelectorsVisibility( );
+    FSPanelLogin::updateLocationSelectorsVisibility();
     // </FS:Ansariel> [FS Login Panel]
     return true;
 }
@@ -727,7 +721,7 @@ bool handleLoginLocationChanged()
      * panel immediately changes to match your new preference.
      */
     std::string new_login_location = gSavedSettings.getString("LoginLocation");
-    LL_DEBUGS("AppInit")<<new_login_location<<LL_ENDL;
+    LL_DEBUGS("AppInit") << new_login_location << LL_ENDL;
     LLStartUp::setStartSLURL(LLSLURL(new_login_location));
     return true;
 }
@@ -737,7 +731,7 @@ bool handleSpellCheckChanged()
     if (gSavedSettings.getBOOL("SpellCheck"))
     {
         std::list<std::string> dict_list;
-        std::string dict_setting = gSavedSettings.getString("SpellCheckDictionary");
+        std::string            dict_setting = gSavedSettings.getString("SpellCheckDictionary");
         boost::split(dict_list, dict_setting, boost::is_any_of(std::string(",")));
         if (!dict_list.empty())
         {
@@ -753,7 +747,7 @@ bool handleSpellCheckChanged()
 
 bool toggle_agent_pause(const LLSD& newvalue)
 {
-    if ( newvalue.asBoolean() )
+    if (newvalue.asBoolean())
     {
         send_agent_pause();
     }
@@ -767,23 +761,23 @@ bool toggle_agent_pause(const LLSD& newvalue)
 // <FS:Zi> Is done inside XUI now, using visibility_control
 // bool toggle_show_navigation_panel(const LLSD& newvalue)
 // {
-    //bool value = newvalue.asBoolean();
+// bool value = newvalue.asBoolean();
 
-    //LLNavigationBar::getInstance()->setVisible(value);
-    //gSavedSettings.setBOOL("ShowMiniLocationPanel", !value);
-    //gViewerWindow->reshapeStatusBarContainer();
-    //return true;
+// LLNavigationBar::getInstance()->setVisible(value);
+// gSavedSettings.setBOOL("ShowMiniLocationPanel", !value);
+// gViewerWindow->reshapeStatusBarContainer();
+// return true;
 // }
 
 // <FS:Zi> We don't have the mini location bar
 // bool toggle_show_mini_location_panel(const LLSD& newvalue)
 // {
-    //bool value = newvalue.asBoolean();
+// bool value = newvalue.asBoolean();
 
-    //LLPanelTopInfoBar::getInstance()->setVisible(value);
-    //gSavedSettings.setBOOL("ShowNavbarNavigationPanel", !value);
+// LLPanelTopInfoBar::getInstance()->setVisible(value);
+// gSavedSettings.setBOOL("ShowNavbarNavigationPanel", !value);
 
-    //return true;
+// return true;
 // </FS:Zi>
 
 bool toggle_show_menubar_location_panel(const LLSD& newvalue)
@@ -791,7 +785,7 @@ bool toggle_show_menubar_location_panel(const LLSD& newvalue)
     bool value = newvalue.asBoolean();
 
     if (gStatusBar)
-        gStatusBar->childSetVisible("parcel_info_panel",value);
+        gStatusBar->childSetVisible("parcel_info_panel", value);
 
     return true;
 }
@@ -843,7 +837,6 @@ static void handleSetPoseStandLock(const LLSD& newvalue)
         pose_stand->setLock(newvalue);
         pose_stand->onCommitCombo();
     }
-
 }
 // </FS:CR> Posestand Ground Lock
 
@@ -912,7 +905,7 @@ void handleGlobalOnlineStatusChanged(const LLSD& newvalue)
     LLAvatarTracker::buddy_map_t::const_iterator buddy_it = all_buddies.begin();
     for (; buddy_it != all_buddies.end(); ++buddy_it)
     {
-        LLUUID buddy_id = buddy_it->first;
+        LLUUID                buddy_id = buddy_it->first;
         const LLRelationship* relation = LLAvatarTracker::instance().getBuddyInfo(buddy_id);
         if (relation == NULL)
         {
@@ -925,7 +918,8 @@ void handleGlobalOnlineStatusChanged(const LLSD& newvalue)
         S32 new_rights = 0;
         if (visible)
         {
-            new_rights = LLRelationship::GRANT_ONLINE_STATUS + (cur_rights & LLRelationship::GRANT_MAP_LOCATION) + (cur_rights & LLRelationship::GRANT_MODIFY_OBJECTS);
+            new_rights = LLRelationship::GRANT_ONLINE_STATUS + (cur_rights & LLRelationship::GRANT_MAP_LOCATION) +
+                         (cur_rights & LLRelationship::GRANT_MODIFY_OBJECTS);
         }
         else
         {
@@ -1086,8 +1080,8 @@ void handlePlayBentoIdleAnimationChanged(const LLSD& newValue)
 // <FS:Ansariel> Better asset cache size control
 void handleDiskCacheSizeChanged(const LLSD& newValue)
 {
-    const unsigned int disk_cache_mb = gSavedSettings.getU32("FSDiskCacheSize");
-    const U64 disk_cache_bytes = disk_cache_mb * 1024ULL * 1024ULL;
+    const unsigned int disk_cache_mb    = gSavedSettings.getU32("FSDiskCacheSize");
+    const U64          disk_cache_bytes = disk_cache_mb * 1024ULL * 1024ULL;
     LLDiskCache::getInstance()->setMaxSizeBytes(disk_cache_bytes);
 }
 // </FS:Ansariel>
@@ -1111,7 +1105,7 @@ void handleTargetFPSChanged(const LLSD& newValue)
     const auto targetFPS = gSavedSettings.getU32("TargetFPS");
 
     U32 frame_rate_limit = gViewerWindow->getWindow()->getRefreshRate();
-    if(LLPerfStats::tunables.vsyncEnabled && (targetFPS > frame_rate_limit))
+    if (LLPerfStats::tunables.vsyncEnabled && (targetFPS > frame_rate_limit))
     {
         gSavedSettings.setU32("TargetFPS", std::min(frame_rate_limit, targetFPS));
     }
@@ -1123,7 +1117,7 @@ void handleTargetFPSChanged(const LLSD& newValue)
 
 void handleAutoTuneLockChanged(const LLSD& newValue)
 {
-    const auto newval = gSavedSettings.getBOOL("AutoTuneLock");
+    const auto newval                      = gSavedSettings.getBOOL("AutoTuneLock");
     LLPerfStats::tunables.userAutoTuneLock = newval;
 
     gSavedSettings.setBOOL("AutoTuneFPS", newval);
@@ -1131,11 +1125,12 @@ void handleAutoTuneLockChanged(const LLSD& newValue)
 
 void handleAutoTuneFPSChanged(const LLSD& newValue)
 {
-    const auto newval = gSavedSettings.getBOOL("AutoTuneFPS");
+    const auto newval                         = gSavedSettings.getBOOL("AutoTuneFPS");
     LLPerfStats::tunables.userAutoTuneEnabled = newval;
-    if(newval && LLPerfStats::renderAvatarMaxART_ns == 0) // If we've enabled autotune we override "unlimited" to max
+    if (newval && LLPerfStats::renderAvatarMaxART_ns == 0) // If we've enabled autotune we override "unlimited" to max
     {
-        gSavedSettings.setF32("RenderAvatarMaxART", (F32)log10(LLPerfStats::ART_UNLIMITED_NANOS-1000));//triggers callback to update static var
+        gSavedSettings.setF32("RenderAvatarMaxART",
+                              (F32)log10(LLPerfStats::ART_UNLIMITED_NANOS - 1000)); // triggers callback to update static var
     }
 }
 
@@ -1146,13 +1141,13 @@ void handleRenderAvatarMaxARTChanged(const LLSD& newValue)
 
 void handleUserTargetDrawDistanceChanged(const LLSD& newValue)
 {
-    const auto newval = gSavedSettings.getF32("AutoTuneRenderFarClipTarget");
+    const auto newval                            = gSavedSettings.getF32("AutoTuneRenderFarClipTarget");
     LLPerfStats::tunables.userTargetDrawDistance = newval;
 }
 
-void handleUserMinDrawDistanceChanged(const LLSD &newValue)
+void handleUserMinDrawDistanceChanged(const LLSD& newValue)
 {
-    const auto newval = gSavedSettings.getF32("AutoTuneRenderFarClipMin");
+    const auto newval                         = gSavedSettings.getF32("AutoTuneRenderFarClipMin");
     LLPerfStats::tunables.userMinDrawDistance = newval;
 }
 
@@ -1164,7 +1159,7 @@ void handlePerformanceStatsEnabledChanged(const LLSD& newValue)
 void handleUserImpostorByDistEnabledChanged(const LLSD& newValue)
 {
     bool auto_tune_newval = false;
-    S32 mode = gSavedSettings.getS32("RenderAvatarComplexityMode");
+    S32  mode             = gSavedSettings.getS32("RenderAvatarComplexityMode");
     if (mode != LLVOAvatar::AV_RENDER_ONLY_SHOW_FRIENDS)
     {
         auto_tune_newval = gSavedSettings.getBOOL("AutoTuneImpostorByDistEnabled");
@@ -1173,12 +1168,12 @@ void handleUserImpostorByDistEnabledChanged(const LLSD& newValue)
 }
 void handleUserImpostorDistanceChanged(const LLSD& newValue)
 {
-    const auto newval = gSavedSettings.getF32("AutoTuneImpostorFarAwayDistance");
+    const auto newval                          = gSavedSettings.getF32("AutoTuneImpostorFarAwayDistance");
     LLPerfStats::tunables.userImpostorDistance = newval;
 }
 void handleFPSTuningStrategyChanged(const LLSD& newValue)
 {
-    const auto newval = gSavedSettings.getU32("TuningFPSStrategy");
+    const auto newval                           = gSavedSettings.getU32("TuningFPSStrategy");
     LLPerfStats::tunables.userFPSTuningStrategy = newval;
 }
 
@@ -1186,19 +1181,21 @@ void handleLocalTerrainChanged(const LLSD& newValue)
 {
     for (U32 i = 0; i < LLTerrainMaterials::ASSET_COUNT; ++i)
     {
-        const auto setting = gSavedSettings.getString(std::string("LocalTerrainAsset") + std::to_string(i + 1));
+        const auto   setting = gSavedSettings.getString(std::string("LocalTerrainAsset") + std::to_string(i + 1));
         const LLUUID materialID(setting);
         gLocalTerrainMaterials.setDetailAssetID(i, materialID);
 
-        // *NOTE: The GLTF spec allows for different texture infos to have their texture transforms set independently, but as a simplification, this debug setting only updates all the transforms in-sync (i.e. only one texture transform per terrain material).
+        // *NOTE: The GLTF spec allows for different texture infos to have their texture transforms set independently, but as a
+        // simplification, this debug setting only updates all the transforms in-sync (i.e. only one texture transform per terrain
+        // material).
         LLGLTFMaterial::TextureTransform transform;
-        const std::string prefix = std::string("LocalTerrainTransform") + std::to_string(i + 1);
-        transform.mScale.mV[VX] = gSavedSettings.getF32(prefix + "ScaleU");
-        transform.mScale.mV[VY] = gSavedSettings.getF32(prefix + "ScaleV");
-        transform.mRotation = gSavedSettings.getF32(prefix + "Rotation") * DEG_TO_RAD;
-        transform.mOffset.mV[VX] = gSavedSettings.getF32(prefix + "OffsetU");
-        transform.mOffset.mV[VY] = gSavedSettings.getF32(prefix + "OffsetV");
-        LLPointer<LLGLTFMaterial> mat_override = new LLGLTFMaterial();
+        const std::string                prefix = std::string("LocalTerrainTransform") + std::to_string(i + 1);
+        transform.mScale.mV[VX]                 = gSavedSettings.getF32(prefix + "ScaleU");
+        transform.mScale.mV[VY]                 = gSavedSettings.getF32(prefix + "ScaleV");
+        transform.mRotation                     = gSavedSettings.getF32(prefix + "Rotation") * DEG_TO_RAD;
+        transform.mOffset.mV[VX]                = gSavedSettings.getF32(prefix + "OffsetU");
+        transform.mOffset.mV[VY]                = gSavedSettings.getF32(prefix + "OffsetV");
+        LLPointer<LLGLTFMaterial> mat_override  = new LLGLTFMaterial();
         for (U32 info = 0; info < LLGLTFMaterial::GLTF_TEXTURE_INFO_COUNT; ++info)
         {
             mat_override->mTextureTransform[info] = transform;
@@ -1242,30 +1239,43 @@ LLPointer<LLControlVariable> setting_get_control(LLControlGroup& group, const st
     if (cntrl_ptr.isNull())
     {
         LLError::LLUserWarningMsg::showMissingFiles();
-        LL_ERRS() << "Unable to set up setting listener for " << setting
-            << "." << LL_ENDL;
+        LL_ERRS() << "Unable to set up setting listener for " << setting << "." << LL_ENDL;
     }
     return cntrl_ptr;
 }
 
 void setting_setup_signal_listener(LLControlGroup& group, const std::string& setting, std::function<void(const LLSD& newvalue)> callback)
 {
-    setting_get_control(group, setting)->getSignal()->connect([callback](LLControlVariable* control, const LLSD& new_val, const LLSD& old_val)
-    {
-        callback(new_val);
-    });
+    setting_get_control(group, setting)
+        ->getSignal()
+        ->connect([callback](LLControlVariable* control, const LLSD& new_val, const LLSD& old_val) { callback(new_val); });
 }
 
 void setting_setup_signal_listener(LLControlGroup& group, const std::string& setting, std::function<void()> callback)
 {
-    setting_get_control(group, setting)->getSignal()->connect([callback](LLControlVariable* control, const LLSD& new_val, const LLSD& old_val)
-    {
-        callback();
-    });
+    setting_get_control(group, setting)
+        ->getSignal()
+        ->connect([callback](LLControlVariable* control, const LLSD& new_val, const LLSD& old_val) { callback(); });
 }
 
 void settings_setup_listeners()
 {
+    // Ensure the Python Roleplay AI toggle exists with a default value.
+    // Using declareBOOL here is safe even if the setting already exists; the control group will manage duplicates appropriately.
+    if (gSavedSettings.getControl("EnablePythonAI").isNull())
+    {
+        gSavedSettings.declareBOOL("EnablePythonAI", false, "Enable Python Roleplay AI in Nearby Chat");
+    }
+
+    // Notify Nearby Chat when the Python AI enable setting changes so it can react immediately.
+    setting_setup_signal_listener(gSavedSettings, "EnablePythonAI", FSFloaterNearbyChat::onEnablePythonAIChanged);
+    
+    // Also check if EnablePythonAI is already enabled from startup (since signal only fires on changes)
+    if (gSavedSettings.getBOOL("EnablePythonAI")) {
+        LL_INFOS("AI") << "[AI] EnablePythonAI already enabled at startup, initializing FSAIIntegration..." << LL_ENDL;
+        FSFloaterNearbyChat::onEnablePythonAIChanged(LLSD(true));
+    }
+
     setting_setup_signal_listener(gSavedSettings, "FirstPersonAvatarVisible", handleRenderAvatarMouselookChanged);
     setting_setup_signal_listener(gSavedSettings, "RenderFarClip", handleRenderFarClipChanged);
     setting_setup_signal_listener(gSavedSettings, "RenderTerrainScale", handleTerrainScaleChanged);
@@ -1296,7 +1306,9 @@ void settings_setup_listeners()
     setting_setup_signal_listener(gSavedSettings, "RenderHDREnabled", handleEnableHDR);
     setting_setup_signal_listener(gSavedSettings, "RenderGlowNoise", handleSetShaderChanged);
     setting_setup_signal_listener(gSavedSettings, "RenderGammaFull", handleSetShaderChanged);
-    setting_setup_signal_listener(gSavedSettings, "FSOverrideVRAMDetection", handleOverrideVRAMDetectionChanged); // <FS:Beq/> Override VRAM detection support
+    setting_setup_signal_listener(gSavedSettings,
+                                  "FSOverrideVRAMDetection",
+                                  handleOverrideVRAMDetectionChanged); // <FS:Beq/> Override VRAM detection support
     setting_setup_signal_listener(gSavedSettings, "RenderVolumeLODFactor", handleVolumeLODChanged);
     setting_setup_signal_listener(gSavedSettings, "RenderAvatarComplexityMode", handleUserImpostorByDistEnabledChanged);
     setting_setup_signal_listener(gSavedSettings, "RenderAvatarLODFactor", handleAvatarLODChanged);
@@ -1312,12 +1324,13 @@ void settings_setup_listeners()
     setting_setup_signal_listener(gSavedSettings, "RenderDeferredNoise", handleReleaseGLBufferChanged);
     setting_setup_signal_listener(gSavedSettings, "RenderDebugPipeline", handleRenderDebugPipelineChanged);
     setting_setup_signal_listener(gSavedSettings, "RenderResolutionDivisor", handleRenderResolutionDivisorChanged);
-// [SL:KB] - Patch: Settings-RenderResolutionMultiplier | Checked: Catznip-5.4
+    // [SL:KB] - Patch: Settings-RenderResolutionMultiplier | Checked: Catznip-5.4
     setting_setup_signal_listener(gSavedSettings, "RenderResolutionMultiplier", handleRenderResolutionDivisorChanged);
-// [/SL:KB]
+    // [/SL:KB]
     setting_setup_signal_listener(gSavedSettings, "RenderReflectionProbeLevel", handleReflectionProbeDetailChanged);
     setting_setup_signal_listener(gSavedSettings, "RenderReflectionProbeDetail", handleReflectionProbeDetailChanged);
-    // setting_setup_signal_listener(gSavedSettings, "RenderReflectionsEnabled", handleReflectionsEnabled); // <FS:Beq/> FIRE-33659 better way to enable/disable reflections
+    // setting_setup_signal_listener(gSavedSettings, "RenderReflectionsEnabled", handleReflectionsEnabled); // <FS:Beq/> FIRE-33659 better
+    // way to enable/disable reflections
 #if LL_DARWIN
     setting_setup_signal_listener(gSavedSettings, "RenderAppleUseMultGL", handleAppleUseMultGLChanged);
 #endif
@@ -1328,7 +1341,9 @@ void settings_setup_listeners()
     setting_setup_signal_listener(gSavedSettings, "RenderDeferredSSAO", handleSetShaderChanged);
     setting_setup_signal_listener(gSavedSettings, "RenderPerformanceTest", handleRenderPerfTestChanged);
     setting_setup_signal_listener(gSavedSettings, "ChatConsoleFontSize", handleChatFontSizeChanged);
-    setting_setup_signal_listener(gSavedSettings, "ChatPersistTime", handleChatPersistTimeChanged); // <FS:Ansariel> Keep custom chat persist time
+    setting_setup_signal_listener(gSavedSettings,
+                                  "ChatPersistTime",
+                                  handleChatPersistTimeChanged); // <FS:Ansariel> Keep custom chat persist time
     setting_setup_signal_listener(gSavedSettings, "ConsoleMaxLines", handleConsoleMaxLinesChanged);
     setting_setup_signal_listener(gSavedSettings, "UploadBakedTexOld", handleUploadBakedTexOldChanged);
     setting_setup_signal_listener(gSavedSettings, "UseOcclusion", handleUseOcclusionChanged);
@@ -1440,13 +1455,7 @@ void settings_setup_listeners()
     setting_setup_signal_listener(gSavedSettings, "TuningFPSStrategy", handleFPSTuningStrategyChanged);
     {
         setting_setup_signal_listener(gSavedSettings, "LocalTerrainPaintEnabled", handleLocalTerrainChanged);
-        const char* transform_suffixes[] = {
-            "ScaleU",
-            "ScaleV",
-            "Rotation",
-            "OffsetU",
-            "OffsetV"
-        };
+        const char* transform_suffixes[] = { "ScaleU", "ScaleV", "Rotation", "OffsetU", "OffsetV" };
         for (U32 i = 0; i < LLTerrainMaterials::ASSET_COUNT; ++i)
         {
             const auto asset_setting_name = std::string("LocalTerrainAsset") + std::to_string(i + 1);
@@ -1462,9 +1471,9 @@ void settings_setup_listeners()
 
     setting_setup_signal_listener(gSavedPerAccountSettings, "AvatarHoverOffsetZ", handleAvatarHoverOffsetChanged);
 
-// [RLVa:KB] - Checked: 2015-12-27 (RLVa-1.5.0)
+    // [RLVa:KB] - Checked: 2015-12-27 (RLVa-1.5.0)
     setting_setup_signal_listener(gSavedSettings, RlvSettingNames::Main, RlvSettings::onChangedSettingMain);
-// [/RLVa:KB]
+    // [/RLVa:KB]
     // NaCl - Antispam Registry
     setting_setup_signal_listener(gSavedSettings, "_NACL_AntiSpamGlobalQueue", handleNaclAntiSpamGlobalQueueChanged);
     setting_setup_signal_listener(gSavedSettings, "_NACL_AntiSpamTime", handleNaclAntiSpamTimeChanged);
@@ -1473,7 +1482,9 @@ void settings_setup_listeners()
     setting_setup_signal_listener(gSavedSettings, "AutohideChatBar", handleAutohideChatbarChanged);
 
     // <FS:Ansariel> Clear places / teleport history search filter
-    setting_setup_signal_listener(gSavedSettings, "FSUseStandaloneTeleportHistoryFloater", handleUseStandaloneTeleportHistoryFloaterChanged);
+    setting_setup_signal_listener(gSavedSettings,
+                                  "FSUseStandaloneTeleportHistoryFloater",
+                                  handleUseStandaloneTeleportHistoryFloaterChanged);
 
     // <FS:CR> Pose stand ground lock
     setting_setup_signal_listener(gSavedSettings, "FSPoseStandLock", handleSetPoseStandLock);
@@ -1556,7 +1567,7 @@ void settings_setup_listeners()
 
 #if TEST_CACHED_CONTROL
 
-#define DECL_LLCC(T, V) static LLCachedControl<T> mySetting_##T("TestCachedControl"#T, V)
+#define DECL_LLCC(T, V) static LLCachedControl<T> mySetting_##T("TestCachedControl" #T, V)
 DECL_LLCC(U32, (U32)666);
 DECL_LLCC(S32, (S32)-666);
 DECL_LLCC(F32, (F32)-666.666);
@@ -1575,20 +1586,24 @@ DECL_LLCC(LLSD, test_llsd);
 
 void test_cached_control()
 {
-#define do { TEST_LLCC(T, V) if((T)mySetting_##T != V) LL_ERRS() << "Fail "#T << LL_ENDL; } while(0)
+#define do                                                                             \
+    {                                                                                  \
+        TEST_LLCC(T, V) if ((T)mySetting_##T != V) LL_ERRS() << "Fail " #T << LL_ENDL; \
+    }                                                                                  \
+    while (0)
     TEST_LLCC(U32, 666);
     TEST_LLCC(S32, (S32)-666);
     TEST_LLCC(F32, (F32)-666.666);
     TEST_LLCC(bool, true);
     TEST_LLCC(bool, false);
-    if((std::string)mySetting_string != "Default String Value") LL_ERRS() << "Fail string" << LL_ENDL;
+    if ((std::string)mySetting_string != "Default String Value")
+        LL_ERRS() << "Fail string" << LL_ENDL;
     TEST_LLCC(LLVector3, LLVector3(1.0f, 2.0f, 3.0f));
     TEST_LLCC(LLVector3d, LLVector3d(6.0f, 5.0f, 4.0f));
     TEST_LLCC(LLRect, LLRect(0, 0, 100, 500));
     TEST_LLCC(LLColor4, LLColor4(0.0f, 0.5f, 1.0f));
     TEST_LLCC(LLColor3, LLColor3(1.0f, 0.f, 0.5f));
     TEST_LLCC(LLColor4U, LLColor4U(255, 200, 100, 255));
-//There's no LLSD comparsion for LLCC yet. TEST_LLCC(LLSD, test_llsd);
+    // There's no LLSD comparsion for LLCC yet. TEST_LLCC(LLSD, test_llsd);
 }
 #endif // TEST_CACHED_CONTROL
-

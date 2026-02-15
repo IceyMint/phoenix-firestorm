@@ -36,6 +36,7 @@
 #include "aoengine.h"
 #include "fscommon.h"
 #include "fsradar.h"
+#include "fsaiintegration.h"
 #include "llagent.h"
 #include "llagentcamera.h"
 #include "llavataractions.h"
@@ -569,11 +570,47 @@ bool cmd_line_chat(std::string_view revised_text, EChatType type, bool from_gest
     if (sFSCmdLine)
     {
         std::istringstream i(static_cast<std::string>(revised_text));
-        std::string command;
+        std::string        command;
         i >> command;
         if (!command.empty())
         {
-            if (command == sFSCmdLinePos())
+            if (command == "setnearclip")
+            {
+                /*F32 nearclip;
+                i >> nearclip;
+                LLViewerCamera::getInstance()->setNearClip(nearclip);*/
+                //FSCommon::report_to_nearby_chat(llformat("Near is: %.3f", nearclip));
+                return (false);
+            }
+            else if (command == "moveview")
+            {
+                // std::string direction;
+                // F32         moveviewdist;
+                // F32         X = 0, Y = 0, Z = 0;
+                // if (i >> direction)
+                // {
+                //     i >> moveviewdist;
+                //     if (direction == "forward")
+                //         X = -0.001f * moveviewdist;
+                //     else if (direction == "back")
+                //         X = 0.001f * moveviewdist;
+                //     else if (direction == "up")
+                //         Z = -0.001f * moveviewdist;
+                //     else if (direction == "down")
+                //         Z = 0.001f * moveviewdist;
+                //     else if (direction == "left")
+                //         Y = -0.001f * moveviewdist;
+                //     else if (direction == "right")
+                //         Y = 0.001f * moveviewdist;
+                // }
+                // gAgentCamera.setEyeOffset(X, Y, Z);
+                // LLVector3 offset;
+                // offset = gAgentCamera.getViewOffset();
+                // //saveCameraOffset(offset); // Save the offset to a file
+                // FSCommon::report_to_nearby_chat(llformat("Current offset: %.3f, %.3f, %.3f", offset[VX], offset[VY], offset[VZ]));
+                // return (false);
+            }
+            else if (command == sFSCmdLinePos())
             {
                 F32 x, y, z;
                 if (i >> x && i >> y)
@@ -733,6 +770,14 @@ bool cmd_line_chat(std::string_view revised_text, EChatType type, bool from_gest
                 }
                 return false;
             }
+            else if (command == "/ai")
+            {
+                bool enabled = FSAIIntegration::getInstance()->toggleLLMChatEnabled();
+                FSCommon::report_to_nearby_chat(
+                    enabled ? "Roleplay AI chat output enabled" : "Roleplay AI chat output disabled");
+                return false;
+            }
+
             else if (command == "/touch")
             {
                 LLUUID target_key;

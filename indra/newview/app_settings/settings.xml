@@ -26707,5 +26707,16 @@ Change of this parameter will affect the layout of buttons in notification toast
       <integer>0</integer>
     </map>
     <!-- </FS:Zi> Area Search Defaults -->
+    <key>AOMLocalHeadAnims</key>
+    <map>
+      <key>Comment</key>
+      <string>If true, AO will animate the head, neck and torso locally.</string>
+      <key>Persist</key>
+      <integer>1</integer>
+      <key>Type</key>
+      <string>Boolean</string>
+      <key>Value</key>
+      <boolean>true</boolean>
+    </map>
   </map>
 </llsd>

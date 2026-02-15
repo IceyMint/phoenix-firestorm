@@ -1300,24 +1300,24 @@ public:
         }
         // Congratulations, we've hit a new low.  :-P
 
-        LL_INFOS("FrameWatcher") << ' ';
-        if (! prevSize)
-        {
-            LL_CONT << "initial framerate ";
-        }
-        else
-        {
-            LL_CONT << "slowest framerate for last " << int(prevSize * MEM_INFO_THROTTLE)
-                    << " seconds ";
-        }
+    //    LL_INFOS("FrameWatcher") << ' ';
+    //    if (! prevSize)
+    //    {
+    //        LL_CONT << "initial framerate ";
+    //    }
+    //    else
+    //    {
+    //        LL_CONT << "slowest framerate for last " << int(prevSize * MEM_INFO_THROTTLE)
+    //                << " seconds ";
+    //    }
 
-    auto precision = LL_CONT.precision();
+    //auto precision = LL_CONT.precision();
 
-        LL_CONT << std::fixed << std::setprecision(1) << framerate << '\n'
-                << LLMemoryInfo();
+    //    LL_CONT << std::fixed << std::setprecision(1) << framerate << '\n'
+    //            << LLMemoryInfo();
 
-    LL_CONT.precision(precision);
-    LL_CONT << LL_ENDL;
+    //LL_CONT.precision(precision);
+    //LL_CONT << LL_ENDL;
         return false;
     }
 

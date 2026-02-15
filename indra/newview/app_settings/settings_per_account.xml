@@ -1490,5 +1490,16 @@
         <key>Value</key>
             <integer>1</integer>
         </map>
+        <key>FSRoleplayAIEnabled</key>
+        <map>
+            <key>Comment</key>
+            <string>Toggle Roleplay AI</string>
+            <key>Persist</key>
+            <integer>1</integer>
+            <key>Type</key>
+            <string>Integer</string>
+            <key>Value</key>
+            <integer>1</integer>
+        </map>
     </map>
 </llsd>

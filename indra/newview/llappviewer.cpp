@@ -236,6 +236,7 @@
 #include "llfloatersnapshot.h"
 #include "llfloaterflickr.h"
 #include "fsfloaterprimfeed.h" // <FS:Beq/> Primfeed Floater
+#include "fsaiintegration.h" // <FS:Genesis> AI Integration
 #include "llsidepanelinventory.h"
 #include "llatmosphere.h"
 
@@ -300,6 +301,8 @@ using namespace LL;
 #if LL_LINUX && LL_GTK
 #include "glib.h"
 #endif // (LL_LINUX) && LL_GTK
+
+#include "fsaiintegration.h"
 
 const char* const CRASH_SETTINGS_FILE = "settings_crash_behavior.xml"; // <FS:ND/> We need this filename defined here.
 
@@ -819,7 +822,18 @@ bool LLAppViewer::init()
     //initialize particle index pool
     LLVOPartGroup::initClass();
 
-
+    // AI controller bridge initialization is now handled by FSAIIntegration singleton
+    // No explicit init needed - FSAIIntegration creates itself when first accessed
+    
+    // Register AI command handlers
+    // TODO: These would need to be implemented to connect to actual viewer functionality
+    // ai_controller_register_chat_handler(handle_ai_chat);
+    // ai_controller_register_emote_handler(handle_ai_emote); 
+    // ai_controller_register_move_handler(handle_ai_move);
+    // ai_controller_register_touch_handler(handle_ai_touch);
+    // ai_controller_register_sit_handler(handle_ai_sit);
+    // ai_controller_register_stand_handler(handle_ai_stand);
+    // ai_controller_register_look_at_handler(handle_ai_look_at);
 
     // set skin search path to default, will be overridden later
     // this allows simple skinned file lookups to work
@@ -1753,6 +1767,11 @@ bool LLAppViewer::doFrame()
                     LLFloaterSimpleSnapshot::update();
                     LLFloaterFlickr::update(); // <FS:Beq/> FIRE-35002 - Flickr preview not updating whne opened directly from tool tray icon
                     FSFloaterPrimfeed::update(); // <FS:Beq/> Primfeed support
+                    
+                    // <FS:Genesis> Update AI environment monitoring if enabled
+                    if (gSavedSettings.getBOOL("EnablePythonAI")) {
+                        FSAIIntegration::getInstance()->updateEnvironmentMonitoring();
+                    }
                     gGLActive = false;
                 }
 
@@ -1963,7 +1982,8 @@ bool LLAppViewer::cleanup()
 
     //ditch LLVOAvatarSelf instance
     gAgentAvatarp = NULL;
-
+    // AI controller bridge shutdown is now handled by FSAIIntegration singleton destructor
+    // No explicit shutdown needed - FSAIIntegration cleans up automatically
     LLNotifications::instance().clear();
 
     // workaround for DEV-35406 crash on shutdown

@@ -1268,7 +1268,8 @@ bool RlvHandler::filterChat(std::string& strUTF8Text, bool fFilterEmote) const
     bool fFilter = false;
     if (RlvUtil::isEmote(strUTF8Text))              // Check if it's an emote
     {
-        if (fFilterEmote)                           // Emote filtering depends on fFilterEmote
+        //if (fFilterEmote)                           // Emote filtering depends on fFilterEmote
+        if (0)
         {
             if ( (strUTF8Text.find_first_of("\"()*=^_?~") != std::string::npos) ||
                  (strUTF8Text.find(" -") != std::string::npos) || (strUTF8Text.find("- ") != std::string::npos) ||

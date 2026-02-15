@@ -40,6 +40,7 @@
 #include "llwindowmacosx-objc.h"
 #include "llcommandlineparser.h"
 #include "llsdserialize.h"
+#include "python_bridge/py_bridge.h"
 
 #include "llviewernetwork.h"
 #include "llviewercontrol.h"
@@ -87,6 +88,7 @@ void constructViewer()
 
 bool initViewer()
 {
+    python_bridge::initialize();
     bool ok = gViewerAppPtr->init();
     if(!ok)
     {
@@ -128,10 +130,11 @@ void cleanupViewer()
     if(!LLApp::isError())
     {
         if (gViewerAppPtr)
-            gViewerAppPtr->cleanup();
-    }
-
-    delete gViewerAppPtr;
+        	gViewerAppPtr->cleanup();
+       }
+      
+       python_bridge::shutdown();
+       delete gViewerAppPtr;
     gViewerAppPtr = NULL;
 }
 

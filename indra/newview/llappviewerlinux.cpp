@@ -124,7 +124,7 @@ int main( int argc, char **argv )
     gOldTerminateHandler = std::set_terminate(exceptionTerminateHandler);
 
     unsetenv( "LD_PRELOAD" ); // <FS:ND/> Get rid of any preloading, we do not want this to happen during startup of plugins.
-
+   
     bool ok = viewer_app_ptr->init();
     if(!ok)
     {
@@ -144,8 +144,8 @@ int main( int argc, char **argv )
         // app cleanup if there was a problem.
         //
         viewer_app_ptr->cleanup();
-    }
-    delete viewer_app_ptr;
+       }
+       delete viewer_app_ptr;
     viewer_app_ptr = NULL;
     return 0;
 }
