@@ -127,6 +127,8 @@ namespace
 {
 constexpr const char* VIEWPOINT_OVERRIDE_ATTACHMENT_NAME = "viewpoint_override";
 constexpr const char* VIEWPOINT_OVERRIDE_DISABLE_HEAD_ANIMS_KEY = "FSViewpointOverrideDisableHeadAnims";
+constexpr F32 DEFAULT_CAMERA_NEAR_CLIP = 0.1f;
+constexpr F32 VIEWPOINT_OVERRIDE_CAMERA_NEAR_CLIP = 0.01f;
 bool sViewpointOverrideMouseCaptured = true;
 bool sViewpointOverrideCtrlWasDown = false;
 bool sViewpointOverrideWasActive = false;
@@ -160,6 +162,31 @@ LLViewerObject* findViewpointOverrideMesh()
     }
 
     return nullptr;
+}
+
+LLQuaternion getViewpointOverrideLookBasisRotation()
+{
+    if (gAgentAvatarp.isNull() || !gAgentAvatarp->isValid())
+    {
+        return LLQuaternion::DEFAULT;
+    }
+
+    if (gAgentAvatarp->mChestp)
+    {
+        return gAgentAvatarp->mChestp->getWorldRotation();
+    }
+
+    if (gAgentAvatarp->mPelvisp)
+    {
+        return gAgentAvatarp->mPelvisp->getWorldRotation();
+    }
+
+    if (gAgentAvatarp->mRoot)
+    {
+        return gAgentAvatarp->mRoot->getWorldRotation();
+    }
+
+    return LLQuaternion::DEFAULT;
 }
 
 void applyViewpointOverrideMouseCapture(bool captured)
@@ -296,7 +323,7 @@ void LLAgentCamera::init()
 
     LLViewerCamera::getInstance()->setView(DEFAULT_FIELD_OF_VIEW);
     // Leave at 0.1 meters until we have real near clip management
-    LLViewerCamera::getInstance()->setNear(0.01f);
+    LLViewerCamera::getInstance()->setNear(DEFAULT_CAMERA_NEAR_CLIP);
     LLViewerCamera::getInstance()->setFar(mDrawDistance);           // if you want to change camera settings, do so in camera.h
     LLViewerCamera::getInstance()->setAspect( gViewerWindow->getWorldViewAspectRatio() );       // default, overridden in LLViewerWindow::reshape
     LLViewerCamera::getInstance()->setViewHeightInPixels(768);          // default, overridden in LLViewerWindow::reshape
@@ -1361,10 +1388,10 @@ void LLAgentCamera::updateLookAt(const S32 mouse_x, const S32 mouse_y)
             }
         }
 
-        const LLQuaternion root_rot = gAgentAvatarp->mRoot->getWorldRotation();
-        LLVector3 headLookAxis = LLVector3::x_axis * root_rot;
-        const LLVector3 up_axis = LLVector3::z_axis * root_rot;
-        LLVector3 left_axis = LLVector3::y_axis * root_rot;
+        const LLQuaternion look_basis_rot = getViewpointOverrideLookBasisRotation();
+        LLVector3 headLookAxis = LLVector3::x_axis * look_basis_rot;
+        const LLVector3 up_axis = LLVector3::z_axis * look_basis_rot;
+        LLVector3 left_axis = LLVector3::y_axis * look_basis_rot;
 
         const LLQuaternion yaw_rot(sViewpointOverrideHeadYaw, up_axis);
         headLookAxis = headLookAxis * yaw_rot;
@@ -1375,7 +1402,7 @@ void LLAgentCamera::updateLookAt(const S32 mouse_x, const S32 mouse_y)
         headLookAxis.normalize();
 
         setLookAt(LOOKAT_TARGET_MOUSELOOK, gAgentAvatarp, headLookAxis);
-        last_at_axis = root_at;
+        last_at_axis = LLVector3::x_axis * look_basis_rot;
         return;
     }
 
@@ -1773,6 +1800,8 @@ void LLAgentCamera::updateCamera()
 
     LLViewerObject* viewpoint_override_mesh = findViewpointOverrideMesh();
     const bool viewpoint_override_active = (viewpoint_override_mesh != nullptr);
+    LLViewerCamera::getInstance()->setNear(
+        viewpoint_override_active ? VIEWPOINT_OVERRIDE_CAMERA_NEAR_CLIP : DEFAULT_CAMERA_NEAR_CLIP);
     mCameraPositionAgent = gAgent.getPosAgentFromGlobal(camera_pos_global);
 
     if (gAgentAvatarp.notNull() && gAgentAvatarp->isValid())
@@ -2659,6 +2688,11 @@ F32 LLAgentCamera::getCameraMinOffGround()
     }
 
     return 0.5f;
+}
+
+F32 LLAgentCamera::getPreferredNearClip() const
+{
+    return findViewpointOverrideMesh() ? VIEWPOINT_OVERRIDE_CAMERA_NEAR_CLIP : DEFAULT_CAMERA_NEAR_CLIP;
 }
 
 

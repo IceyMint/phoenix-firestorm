@@ -204,8 +204,24 @@ bool LLHeadRotMotion::onUpdate(F32 time, U8* joint_mask)
 {
     LL_PROFILE_ZONE_SCOPED_CATEGORY_AVATAR;
     LLQuaternion    targetHeadRotWorld;
+    const bool      use_viewpoint_override_head_rot = useViewpointOverrideHeadRot(mCharacter);
     LLQuaternion    currentRootRotWorld = mRootJoint->getWorldRotation();
     LLQuaternion    currentInvRootRotWorld = ~currentRootRotWorld;
+    LLQuaternion    currentBasisRotWorld = currentRootRotWorld;
+
+    if (use_viewpoint_override_head_rot)
+    {
+        if (mTorsoJoint)
+        {
+            currentBasisRotWorld = mTorsoJoint->getWorldRotation();
+        }
+        else if (mPelvisJoint)
+        {
+            currentBasisRotWorld = mPelvisJoint->getWorldRotation();
+        }
+    }
+
+    LLQuaternion    currentInvBasisRotWorld = ~currentBasisRotWorld;
 
     F32 head_slerp_amt = LLSmoothInterpolation::getInterpolant(HEAD_LOOKAT_LAG_HALF_LIFE);
     F32 torso_slerp_amt = LLSmoothInterpolation::getInterpolant(TORSO_LOOKAT_LAG_HALF_LIFE);
@@ -222,11 +238,13 @@ bool LLHeadRotMotion::onUpdate(F32 time, U8* joint_mask)
 
         if (lookatDistance < MIN_HEAD_LOOKAT_DISTANCE)
         {
-            targetHeadRotWorld = mPelvisJoint->getWorldRotation();
+            targetHeadRotWorld = use_viewpoint_override_head_rot && mTorsoJoint
+                ? mTorsoJoint->getWorldRotation()
+                : mPelvisJoint->getWorldRotation();
         }
         else
         {
-            LLVector3 root_up = LLVector3(0.f, 0.f, 1.f) * currentRootRotWorld;
+            LLVector3 root_up = LLVector3(0.f, 0.f, 1.f) * currentBasisRotWorld;
             LLVector3 left(root_up % headLookAt);
             // if look_at has zero length, fail
             // if look_at and skyward are parallel, fail
@@ -235,7 +253,7 @@ bool LLHeadRotMotion::onUpdate(F32 time, U8* joint_mask)
 
             if (left.magVecSquared() < 0.15f)
             {
-                LLVector3 root_at = LLVector3(1.f, 0.f, 0.f) * currentRootRotWorld;
+                LLVector3 root_at = LLVector3(1.f, 0.f, 0.f) * currentBasisRotWorld;
                 root_at.mV[VZ] = 0.f;
                 root_at.normVec();
 
@@ -254,17 +272,26 @@ bool LLHeadRotMotion::onUpdate(F32 time, U8* joint_mask)
     }
     else
     {
-        targetHeadRotWorld = currentRootRotWorld;
+        targetHeadRotWorld = use_viewpoint_override_head_rot ? currentBasisRotWorld : currentRootRotWorld;
     }
 
-    LLQuaternion head_rot_local = targetHeadRotWorld * currentInvRootRotWorld;
+    LLQuaternion head_rot_local = targetHeadRotWorld *
+        (use_viewpoint_override_head_rot ? currentInvBasisRotWorld : currentInvRootRotWorld);
     head_rot_local.constrain(HEAD_ROTATION_CONSTRAINT);
 
     // set final torso rotation
     // Set torso target rotation such that it lags behind the head rotation
     // by a fixed amount.
-    LLQuaternion torso_rot_local = nlerp(TORSO_LAG, LLQuaternion::DEFAULT, head_rot_local );
-    mTorsoState->setRotation( nlerp(torso_slerp_amt, mTorsoState->getRotation(), torso_rot_local) );
+    if (use_viewpoint_override_head_rot)
+    {
+        // Keep torso on its animation pose while in viewpoint override first-person mode.
+        mTorsoState->setRotation(LLQuaternion::DEFAULT);
+    }
+    else
+    {
+        LLQuaternion torso_rot_local = nlerp(TORSO_LAG, LLQuaternion::DEFAULT, head_rot_local );
+        mTorsoState->setRotation( nlerp(torso_slerp_amt, mTorsoState->getRotation(), torso_rot_local) );
+    }
 
     head_rot_local = nlerp(head_slerp_amt, mLastHeadRot, head_rot_local);
     mLastHeadRot = head_rot_local;
@@ -272,8 +299,11 @@ bool LLHeadRotMotion::onUpdate(F32 time, U8* joint_mask)
     // Set the head rotation.
     if(mNeckState->getJoint() && mNeckState->getJoint()->getParent())
     {
-        LLQuaternion torsoRotLocal =  mNeckState->getJoint()->getParent()->getWorldRotation() * currentInvRootRotWorld;
-        head_rot_local = head_rot_local * ~torsoRotLocal;
+        if (!use_viewpoint_override_head_rot)
+        {
+            LLQuaternion torsoRotLocal =  mNeckState->getJoint()->getParent()->getWorldRotation() * currentInvRootRotWorld;
+            head_rot_local = head_rot_local * ~torsoRotLocal;
+        }
         mNeckState->setRotation( nlerp(NECK_LAG, LLQuaternion::DEFAULT, head_rot_local) );
         mHeadState->setRotation( nlerp(1.f - NECK_LAG, LLQuaternion::DEFAULT, head_rot_local));
     }

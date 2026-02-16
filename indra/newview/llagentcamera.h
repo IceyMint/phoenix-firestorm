@@ -110,6 +110,7 @@ public:
     ECameraMode     getCameraMode() const           { return mCameraMode; }
     ECameraMode     getLastCameraMode() const       { return mLastCameraMode; }
     void            updateCamera();                 // Call once per frame to update camera location/orientation
+    F32             getPreferredNearClip() const;   // Near clip based on current camera override mode
     void            resetCamera();                  // Slam camera into its default position
     void            updateLastCamera();             // Set last camera to current camera
 
