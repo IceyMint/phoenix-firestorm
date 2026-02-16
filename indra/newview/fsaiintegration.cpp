@@ -18,6 +18,8 @@
 #include "llviewerobjectlist.h"
 #include "llfloaterreg.h"
 #include "llvoavatarself.h"
+#include "llpathfindingmanager.h"
+#include "llpathinglib.h"
 #include "llstring.h"
 #include "llviewermenu.h"
 #include "llhudeffectlookat.h"
@@ -33,11 +35,229 @@
 #include <sstream>
 #include <algorithm>
 #include <functional>
+#include <cmath>
+#include <limits>
 #include <map>
 #include <memory>
 
 // Forward declarations
 void near_sit_down_point(bool success, void*);
+
+namespace
+{
+const F32 kDefaultMoveStandoffMeters = 0.9f;
+const F32 kMinMoveStandoffMeters = 0.4f;
+const F32 kMaxMoveStandoffMeters = 2.5f;
+const F32 kMoveClampDistanceMeters = 100.0f;
+const F64 kPathProbeRayHeightMeters = 6.0;
+const F64 kPersonSnapRadiusMeters = 2.5;
+const F32 kMoveAutopilotStopDistanceMeters = 0.5f;
+const F32 kMoveAutopilotRotationThreshold = 0.03f;
+
+struct MoveWaypointCallbackData
+{
+    U64 plan_id;
+    LLVector3d final_target;
+};
+
+U64 g_move_plan_generation = 0;
+
+F32 clamp_move_standoff(F32 raw_standoff)
+{
+    if (raw_standoff < kMinMoveStandoffMeters)
+    {
+        return kMinMoveStandoffMeters;
+    }
+    if (raw_standoff > kMaxMoveStandoffMeters)
+    {
+        return kMaxMoveStandoffMeters;
+    }
+    return raw_standoff;
+}
+
+bool parse_standoff_parameter(const std::map<std::string, std::string>& parameters, F32& out_standoff)
+{
+    auto it = parameters.find("standoff");
+    if (it == parameters.end())
+    {
+        return false;
+    }
+    try
+    {
+        out_standoff = clamp_move_standoff(std::stof(it->second));
+        return true;
+    }
+    catch (...)
+    {
+        return false;
+    }
+}
+
+bool resolve_avatar_position(const LLUUID& avatar_id, LLVector3d& avatar_pos)
+{
+    if (avatar_id.isNull())
+    {
+        return false;
+    }
+
+    uuid_vec_t avatar_ids;
+    std::vector<LLVector3d> positions;
+    LLWorld::instance().getAvatars(&avatar_ids, &positions, gAgent.getPositionGlobal(), 100.0f);
+
+    for (size_t i = 0; i < avatar_ids.size() && i < positions.size(); ++i)
+    {
+        if (avatar_ids[i] == avatar_id)
+        {
+            avatar_pos = positions[i];
+            return true;
+        }
+    }
+    return false;
+}
+
+bool find_closest_avatar_to_point(const LLVector3d& point, F64 max_distance, LLUUID& avatar_id, LLVector3d& avatar_pos)
+{
+    avatar_id = LLUUID::null;
+    const LLUUID self_id = gAgent.getID();
+
+    uuid_vec_t avatar_ids;
+    std::vector<LLVector3d> positions;
+    LLWorld::instance().getAvatars(&avatar_ids, &positions, point, static_cast<F32>(max_distance));
+
+    F64 best = max_distance + 1.0;
+    for (size_t i = 0; i < avatar_ids.size() && i < positions.size(); ++i)
+    {
+        if (!self_id.isNull() && avatar_ids[i] == self_id)
+        {
+            continue;
+        }
+        const F64 distance = dist_vec(point, positions[i]);
+        if (distance < best)
+        {
+            best = distance;
+            avatar_id = avatar_ids[i];
+            avatar_pos = positions[i];
+        }
+    }
+    return !avatar_id.isNull();
+}
+
+bool is_pathfinding_ready()
+{
+    LLPathfindingManager* manager = LLPathfindingManager::getInstance();
+    if (!manager || !manager->isPathfindingEnabledForCurrentRegion())
+    {
+        return false;
+    }
+    LLPathingLib* pathing = LLPathingLib::getInstance();
+    return (pathing != nullptr) && pathing->isFunctional();
+}
+
+bool probe_path_exists(const LLVector3d& from_global, const LLVector3d& to_global)
+{
+    LLPathingLib* pathing = LLPathingLib::getInstance();
+    if (!pathing)
+    {
+        return false;
+    }
+
+    // LLPathingLib does not expose waypoint extraction here; use this as a route-validity probe.
+    LLPathingLib::PathingPacket packet;
+    LLVector3 from_top((F32)from_global.mdV[0], (F32)from_global.mdV[1], (F32)(from_global.mdV[2] + kPathProbeRayHeightMeters));
+    LLVector3 from_bottom((F32)from_global.mdV[0], (F32)from_global.mdV[1], (F32)(from_global.mdV[2] - kPathProbeRayHeightMeters));
+    LLVector3 to_top((F32)to_global.mdV[0], (F32)to_global.mdV[1], (F32)(to_global.mdV[2] + kPathProbeRayHeightMeters));
+    LLVector3 to_bottom((F32)to_global.mdV[0], (F32)to_global.mdV[1], (F32)(to_global.mdV[2] - kPathProbeRayHeightMeters));
+    packet.mStartPointA = from_top;
+    packet.mEndPointA = from_bottom;
+    packet.mStartPointB = to_top;
+    packet.mEndPointB = to_bottom;
+    packet.mHasPointA = true;
+    packet.mHasPointB = true;
+    packet.mCharacterWidth = 1.0;
+    packet.mCharacterType = LLPathingLib::LLPL_CHARACTER_TYPE_NONE;
+    return pathing->generatePath(packet) == LLPathingLib::LLPL_PATH_GENERATED_OK;
+}
+
+bool find_probe_waypoint(const LLVector3d& start, const LLVector3d& goal, LLVector3d& waypoint_out)
+{
+    static const F32 kRadii[] = {2.0f, 3.5f, 5.0f, 7.0f};
+    static const int kSteps = 12;
+    static const F64 kTwoPi = 6.28318530717958647692;
+
+    F64 best_score = std::numeric_limits<F64>::max();
+    bool found = false;
+
+    for (F32 radius : kRadii)
+    {
+        for (int i = 0; i < kSteps; ++i)
+        {
+            const F64 theta = (kTwoPi * i) / static_cast<F64>(kSteps);
+            LLVector3d candidate(
+                goal.mdV[0] + std::cos(theta) * radius,
+                goal.mdV[1] + std::sin(theta) * radius,
+                goal.mdV[2]
+            );
+
+            if (!probe_path_exists(start, candidate))
+            {
+                continue;
+            }
+            if (!probe_path_exists(candidate, goal))
+            {
+                continue;
+            }
+
+            const F64 score = dist_vec(start, candidate) + dist_vec(candidate, goal);
+            if (score < best_score)
+            {
+                best_score = score;
+                waypoint_out = candidate;
+                found = true;
+            }
+        }
+    }
+    return found;
+}
+
+void ai_move_waypoint_callback(bool success, void* user_data)
+{
+    MoveWaypointCallbackData* cb_data = static_cast<MoveWaypointCallbackData*>(user_data);
+    if (!cb_data)
+    {
+        return;
+    }
+
+    const U64 callback_plan_id = cb_data->plan_id;
+    const LLVector3d final_target = cb_data->final_target;
+    delete cb_data;
+
+    if (callback_plan_id != g_move_plan_generation)
+    {
+        return; // stale plan
+    }
+
+    if (!success)
+    {
+        LL_WARNS("AI") << "[AI] Waypoint leg did not complete; skipping final leg" << LL_ENDL;
+        return;
+    }
+
+    gAgent.startAutoPilotGlobal(
+        final_target,
+        "AI Movement Final",
+        NULL,
+        NULL,
+        NULL,
+        kMoveAutopilotStopDistanceMeters,
+        kMoveAutopilotRotationThreshold,
+        false
+    );
+
+    LL_INFOS("AI") << "[AI] Waypoint reached; final leg started to ("
+                   << final_target.mdV[0] << ", " << final_target.mdV[1] << ", " << final_target.mdV[2] << ")"
+                   << LL_ENDL;
+}
+}
 
 FSAIIntegration::FSAIIntegration()
     : mAIBridge(std::make_unique<AIProcessBridge>())
@@ -586,7 +806,9 @@ void FSAIIntegration::initializeCommandHandlers()
         });
         
         mAIBridge->registerCommandHandler("MOVE", [this](const AICommandData& cmd) {
-            handleAIMovementOutput(cmd.x, cmd.y, cmd.z);
+            F32 desired_standoff = kDefaultMoveStandoffMeters;
+            parse_standoff_parameter(cmd.parameters, desired_standoff);
+            handleAIMovementOutput(cmd.x, cmd.y, cmd.z, cmd.target_uuid.c_str(), desired_standoff);
         });
         
         mAIBridge->registerCommandHandler("TOUCH", [this](const AICommandData& cmd) {
@@ -647,9 +869,12 @@ void FSAIIntegration::handleAIEmoteOutput(const char* content, S32 channel)
     FSNearbyChat::sendChatFromViewer(wtext, wtext, CHAT_TYPE_NORMAL, true, channel);
 }
 
-void FSAIIntegration::handleAIMovementOutput(float x, float y, float z)
+void FSAIIntegration::handleAIMovementOutput(float x, float y, float z, const char* target_uuid, float desired_standoff)
 {
-    LL_INFOS("AI") << "[AI] Movement command: (" << x << ", " << y << ", " << z << ")" << LL_ENDL;
+    const F32 standoff = clamp_move_standoff(desired_standoff);
+    LL_INFOS("AI") << "[AI] Movement command: (" << x << ", " << y << ", " << z << ")"
+                   << " target_uuid=" << (target_uuid ? target_uuid : "")
+                   << " standoff=" << standoff << LL_ENDL;
     
     // Validate agent avatar
     if (!isAgentAvatarValid()) {
@@ -665,7 +890,7 @@ void FSAIIntegration::handleAIMovementOutput(float x, float y, float z)
     }
     LLVector3d target_pos(x, y, z);
     // If AI sends local region coordinates (0-256), convert to global
-    if (x < 256 && y < 256)
+    if (x >= 0.f && y >= 0.f && x < 256.f && y < 256.f)
     {
         LLVector3 region_pos(x, y, z);
         target_pos = region->getPosGlobalFromRegion(region_pos);
@@ -676,7 +901,6 @@ void FSAIIntegration::handleAIMovementOutput(float x, float y, float z)
         
     }
     
-    // Validate target position (basic range check)
     LLVector3d agent_pos = gAgent.getPositionGlobal();
     F64 distance = dist_vec(agent_pos, target_pos);
     
@@ -685,17 +909,114 @@ void FSAIIntegration::handleAIMovementOutput(float x, float y, float z)
         // Clamp to maximum distance
         LLVector3d direction = target_pos - agent_pos;
         direction.normalize();
-        target_pos = agent_pos + (direction * 100.0); // Max 100m movement
+        target_pos = agent_pos + (direction * kMoveClampDistanceMeters);
     }
-    
-    // Stop any current autopilot
+
+    // Every MOVE invalidates any prior two-hop callback plan.
+    const U64 plan_id = ++g_move_plan_generation;
+
+    // Person-aware movement: use follow pilot with standoff to avoid bumping avatars.
+    LLUUID person_target_id;
+    LLVector3d person_target_pos;
+    bool has_person_target = false;
+
+    if (target_uuid && *target_uuid)
+    {
+        LLUUID requested_uuid(target_uuid);
+        if (!requested_uuid.isNull() && resolve_avatar_position(requested_uuid, person_target_pos))
+        {
+            person_target_id = requested_uuid;
+            has_person_target = true;
+        }
+    }
+
+    if (!has_person_target)
+    {
+        has_person_target = find_closest_avatar_to_point(target_pos, kPersonSnapRadiusMeters, person_target_id, person_target_pos);
+    }
+
+    if (has_person_target)
+    {
+        const F64 avatar_distance = dist_vec(agent_pos, person_target_pos);
+        if (avatar_distance <= standoff)
+        {
+            gAgent.stopAutoPilot();
+            LL_INFOS("AI") << "[AI] Already within standoff of avatar target; no MOVE needed" << LL_ENDL;
+            return;
+        }
+        gAgent.stopAutoPilot();
+        gAgent.startFollowPilot(person_target_id, false, standoff);
+        LL_INFOS("AI") << "[AI] Person-aware movement initiated via follow pilot to " << person_target_id.asString()
+                       << " with standoff " << standoff << "m" << LL_ENDL;
+        return;
+    }
+
+    // Non-avatar movement target.
+    if (distance <= kMoveAutopilotStopDistanceMeters)
+    {
+        gAgent.stopAutoPilot();
+        LL_INFOS("AI") << "[AI] Target already within " << kMoveAutopilotStopDistanceMeters << "m; no MOVE needed" << LL_ENDL;
+        return;
+    }
+
+    bool direct_path_available = false;
+    bool waypoint_planned = false;
+    LLVector3d waypoint_target;
+    const bool pathfinding_ready = is_pathfinding_ready();
+    if (pathfinding_ready)
+    {
+        direct_path_available = probe_path_exists(agent_pos, target_pos);
+        if (!direct_path_available)
+        {
+            waypoint_planned = find_probe_waypoint(agent_pos, target_pos, waypoint_target);
+        }
+        LL_INFOS("AI") << "[AI] Path probe result: direct=" << (direct_path_available ? "yes" : "no")
+                       << " waypoint=" << (waypoint_planned ? "yes" : "no") << LL_ENDL;
+    }
+    else
+    {
+        LL_INFOS("AI") << "[AI] Pathfinding unavailable for current region; using direct autopilot fallback" << LL_ENDL;
+    }
+
     gAgent.stopAutoPilot();
-    
-    // Start autopilot movement with AI-specific settings
-    gAgent.startAutoPilotGlobal(target_pos, "AI Movement", NULL, NULL, NULL, 0.5f, 0.03f, false);
-    
-    LL_INFOS("AI") << "[AI] Movement initiated to (" << target_pos.mdV[0] << ", " 
-                   << target_pos.mdV[1] << ", " << target_pos.mdV[2] << ")" << LL_ENDL;
+
+    if (waypoint_planned)
+    {
+        MoveWaypointCallbackData* cb_data = new MoveWaypointCallbackData();
+        cb_data->plan_id = plan_id;
+        cb_data->final_target = target_pos;
+        gAgent.startAutoPilotGlobal(
+            waypoint_target,
+            "AI Movement Waypoint",
+            NULL,
+            ai_move_waypoint_callback,
+            cb_data,
+            kMoveAutopilotStopDistanceMeters,
+            kMoveAutopilotRotationThreshold,
+            false
+        );
+
+        LL_INFOS("AI") << "[AI] Two-hop movement: waypoint (" << waypoint_target.mdV[0] << ", "
+                       << waypoint_target.mdV[1] << ", " << waypoint_target.mdV[2] << ")"
+                       << " then goal (" << target_pos.mdV[0] << ", " << target_pos.mdV[1] << ", " << target_pos.mdV[2] << ")"
+                       << LL_ENDL;
+        return;
+    }
+
+    gAgent.startAutoPilotGlobal(
+        target_pos,
+        "AI Movement",
+        NULL,
+        NULL,
+        NULL,
+        kMoveAutopilotStopDistanceMeters,
+        kMoveAutopilotRotationThreshold,
+        false
+    );
+
+    LL_INFOS("AI") << "[AI] Movement initiated to (" << target_pos.mdV[0] << ", "
+                   << target_pos.mdV[1] << ", " << target_pos.mdV[2] << ")"
+                   << (direct_path_available ? " [direct-path ok]" : "") << LL_ENDL;
 }
 
 void FSAIIntegration::handleAITouchOutput(const char* object_uuid)

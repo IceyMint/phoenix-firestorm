@@ -6,6 +6,7 @@
 #include "llchat.h"
 #include <vector>
 #include <string>
+#include <map>
 #include <memory>
 
 // Forward declarations
@@ -187,7 +188,7 @@ private:
     // Static command handler functions (called by C bridge)
     static void handleAIChatOutput(const char* content, S32 channel = 0);
     static void handleAIEmoteOutput(const char* content, S32 channel = 0);
-    static void handleAIMovementOutput(float x, float y, float z);
+    static void handleAIMovementOutput(float x, float y, float z, const char* target_uuid = nullptr, float desired_standoff = 0.9f);
     static void handleAITouchOutput(const char* object_uuid);
     static void handleAISitOutput(const char* object_uuid);
     static void handleAIStandOutput();
