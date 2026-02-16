@@ -59,6 +59,9 @@ const F64 kPathProbeRayHeightMeters = 6.0;
 const F64 kPersonSnapRadiusMeters = 2.5;
 const F32 kMoveAutopilotStopDistanceMeters = 0.5f;
 const F32 kMoveAutopilotRotationThreshold = 0.03f;
+const F32 kFaceTargetMinDistanceMeters = 0.05f;
+const F32 kFaceTargetStopDistanceMeters = 0.05f;
+const F32 kFaceTargetRotationThreshold = 0.03f;
 const F64 kCustomProbeAvatarRadiusMeters = 0.45;
 const F64 kCustomProbeFootClearanceMeters = 0.20;
 const F64 kCustomProbeChestHeightMeters = 0.75;
@@ -77,10 +80,14 @@ const F32 kNearbyObjectsMaxVerticalDeltaMeters = 2.5f;
 const S32 kNearbyObjectsCandidateLimitMin = 60;
 const S32 kNearbyObjectsCandidateLimitMax = 150;
 const F64 kNearbyObjectsCandidateCoverageFraction = 0.60;
-const S32 kNearbyObjectsMaxOutput = 15;
-const S32 kNearbyObjectsReachabilityBudgetPerUpdate = 6;
-const F64 kNearbyObjectsReachabilityCacheTtlSeconds = 3.0;
+const S32 kNearbyObjectsMaxOutput = 25;
+const S32 kNearbyObjectsReachabilityBudgetPerUpdate = 8;
+const F64 kNearbyObjectsReachabilityCacheTtlSeconds = 4.0;
 const F64 kNearbyObjectsReachabilityCacheAgentQuantizeScale = 2.0;
+const F32 kNearbyObjectsAutoReachableDistanceMeters = 3.5f;
+const F32 kNearbyObjectsClusterRadiusMeters = 1.4f;
+const S32 kNearbyObjectsClusterMinNeighbors = 3;
+const F32 kNearbyObjectsClusterAutoReachableDistanceMeters = 6.0f;
 
 struct MoveWaypointCallbackData
 {
@@ -247,6 +254,28 @@ bool parse_standoff_parameter(const std::map<std::string, std::string>& paramete
     try
     {
         out_standoff = clamp_move_standoff(std::stof(it->second));
+        return true;
+    }
+    catch (...)
+    {
+        return false;
+    }
+}
+
+bool parse_coordinate_parameter(const std::map<std::string, std::string>& parameters, const char* key, F32& out_value)
+{
+    if (!key)
+    {
+        return false;
+    }
+    auto it = parameters.find(key);
+    if (it == parameters.end())
+    {
+        return false;
+    }
+    try
+    {
+        out_value = std::stof(it->second);
         return true;
     }
     catch (...)
@@ -2422,6 +2451,7 @@ void FSAIIntegration::gatherNearbyObjects(std::vector<std::pair<std::string, std
 
         LLVector3d objectPos = objectp->getPositionGlobal();
         const F32 distance = static_cast<F32>(dist_vec(agentPos, objectPos));
+
         if (distance > kNearbyObjectsMaxDistanceMeters)
         {
             continue;
@@ -2469,6 +2499,34 @@ void FSAIIntegration::gatherNearbyObjects(std::vector<std::pair<std::string, std
         candidates.resize(adaptive_candidate_limit);
     }
 
+    std::set<LLUUID> dense_cluster_ids;
+    for (size_t i = 0; i < candidates.size(); ++i)
+    {
+        S32 neighbors = 0;
+        const LLVector3d& pivot = candidates[i].pos;
+        for (size_t j = 0; j < candidates.size(); ++j)
+        {
+            if (i == j)
+            {
+                continue;
+            }
+            const LLVector3d& other = candidates[j].pos;
+            if (std::fabs(other.mdV[VZ] - pivot.mdV[VZ]) > 1.0)
+            {
+                continue;
+            }
+            if (dist_vec(pivot, other) <= kNearbyObjectsClusterRadiusMeters)
+            {
+                ++neighbors;
+                if (neighbors >= kNearbyObjectsClusterMinNeighbors)
+                {
+                    dense_cluster_ids.insert(candidates[i].object_id);
+                    break;
+                }
+            }
+        }
+    }
+
     std::map<LLUUID, size_t> candidate_index_by_id;
     for (size_t i = 0; i < candidates.size(); ++i)
     {
@@ -2507,8 +2565,22 @@ void FSAIIntegration::gatherNearbyObjects(std::vector<std::pair<std::string, std
     std::map<LLUUID, bool> reachable_by_id;
     std::set<LLUUID> uncached_ids;
     S32 cache_hits = 0;
+    S32 auto_reachable_hits = 0;
     for (const NearbyObjectCandidate& candidate : candidates)
     {
+        // Fast indoor heuristic: very close + LOS objects are treated as reachable.
+        F32 auto_reachable_distance = kNearbyObjectsAutoReachableDistanceMeters;
+        if (dense_cluster_ids.find(candidate.object_id) != dense_cluster_ids.end())
+        {
+            auto_reachable_distance = kNearbyObjectsClusterAutoReachableDistanceMeters;
+        }
+        if (candidate.distance <= auto_reachable_distance)
+        {
+            reachable_by_id[candidate.object_id] = true;
+            ++auto_reachable_hits;
+            continue;
+        }
+
         bool reachable = false;
         bool stale_cached = false;
         if (get_cached_object_reachability(candidate.object_id, agent_key, reachable, true, &stale_cached))
@@ -2580,21 +2652,46 @@ void FSAIIntegration::gatherNearbyObjects(std::vector<std::pair<std::string, std
         }
     }
 
-    S32 reachable_count = 0;
-    for (const NearbyObjectCandidate& candidate : candidates)
+    auto append_candidate = [&](const NearbyObjectCandidate& candidate, bool reachable)
     {
-        auto reachable_it = reachable_by_id.find(candidate.object_id);
-        if (reachable_it == reachable_by_id.end() || !reachable_it->second)
-        {
-            continue;
-        }
-
-        ++reachable_count;
         std::string pos_str = "(" + std::to_string(candidate.pos.mdV[0]) + ", " +
                               std::to_string(candidate.pos.mdV[1]) + ", " +
                               std::to_string(candidate.pos.mdV[2]) + ")";
+        std::string display_name = candidate.name;
+        if (!reachable)
+        {
+            display_name += " (unreachable)";
+        }
         std::string uuid_str = candidate.object_id.asString();
-        objects_str.emplace_back(candidate.name + "|" + uuid_str, pos_str);
+        objects_str.emplace_back(display_name + "|" + uuid_str, pos_str);
+    };
+
+    S32 reachable_count = 0;
+    S32 unknown_count = 0;
+    S32 blocked_count = 0;
+    S32 output_unreachable_count = 0;
+
+    // Testing mode: include both reachable and unreachable candidates in distance order.
+    for (const NearbyObjectCandidate& candidate : candidates)
+    {
+        auto reachable_it = reachable_by_id.find(candidate.object_id);
+        if (reachable_it == reachable_by_id.end())
+        {
+            ++unknown_count;
+            ++output_unreachable_count;
+            append_candidate(candidate, false);
+        }
+        else if (!reachable_it->second)
+        {
+            ++blocked_count;
+            ++output_unreachable_count;
+            append_candidate(candidate, false);
+        }
+        else
+        {
+            ++reachable_count;
+            append_candidate(candidate, true);
+        }
         if (static_cast<S32>(objects_str.size()) >= kNearbyObjectsMaxOutput)
         {
             break;
@@ -2607,12 +2704,17 @@ void FSAIIntegration::gatherNearbyObjects(std::vector<std::pair<std::string, std
                     << " in_los=" << in_los
                     << " candidates=" << candidates.size()
                     << " candidate_limit=" << adaptive_candidate_limit
+                    << " dense_clusters=" << dense_cluster_ids.size()
                     << " rr_queue=" << g_nearby_object_round_robin_order.size()
                     << " rr_cursor=" << g_nearby_object_round_robin_cursor
                     << " path_checks=" << path_checks
                     << " cache_hits=" << cache_hits
+                    << " auto_reachable=" << auto_reachable_hits
                     << " remaining_uncached=" << uncached_ids.size()
                     << " reachable=" << reachable_count
+                    << " unknown=" << unknown_count
+                    << " blocked=" << blocked_count
+                    << " output_unreachable=" << output_unreachable_count
                     << " output=" << objects_str.size()
                     << LL_ENDL;
 }
@@ -2684,6 +2786,67 @@ void FSAIIntegration::initializeCommandHandlers()
         mAIBridge->registerCommandHandler("LOOK_AT", [this](const AICommandData& cmd) {
             handleAILookAtOutput(cmd.x, cmd.y, cmd.z);
         });
+
+        auto face_target_handler = [this](const AICommandData& cmd) {
+            std::string source = "coordinates";
+            LLVector3d target_global(cmd.x, cmd.y, cmd.z);
+            bool has_target = false;
+
+            if (!cmd.target_uuid.empty())
+            {
+                LLUUID target_id(cmd.target_uuid);
+                if (!target_id.isNull())
+                {
+                    if (LLViewerObject* target_object = gObjectList.findObject(target_id))
+                    {
+                        target_global = target_object->getPositionGlobal();
+                        has_target = true;
+                        source = "uuid";
+                    }
+                    else
+                    {
+                        LL_WARNS("AI") << "[AI] FACE_TARGET target UUID not found: " << target_id.asString()
+                                       << " (will try coordinates)" << LL_ENDL;
+                    }
+                }
+            }
+
+            F32 px = cmd.x;
+            F32 py = cmd.y;
+            F32 pz = cmd.z;
+            const bool has_param_x = parse_coordinate_parameter(cmd.parameters, "x", px);
+            const bool has_param_y = parse_coordinate_parameter(cmd.parameters, "y", py);
+            const bool has_param_z = parse_coordinate_parameter(cmd.parameters, "z", pz);
+            const bool has_param_coords = has_param_x || has_param_y || has_param_z;
+            const bool has_structured_coords =
+                (std::fabs(cmd.x) > 0.0001f) || (std::fabs(cmd.y) > 0.0001f) || (std::fabs(cmd.z) > 0.0001f);
+
+            if (!has_target && (has_param_coords || has_structured_coords))
+            {
+                target_global = LLVector3d(px, py, pz);
+                has_target = true;
+                source = has_param_coords ? "parameters" : "structured";
+            }
+
+            if (!has_target)
+            {
+                LL_WARNS("AI") << "[AI] FACE_TARGET ignored: command needs target_uuid or x/y/z coordinates"
+                               << LL_ENDL;
+                return;
+            }
+
+            LL_INFOS("AI") << "[AI] FACE_TARGET resolved via " << source
+                           << " to (" << target_global.mdV[0] << ", " << target_global.mdV[1] << ", "
+                           << target_global.mdV[2] << ")" << LL_ENDL;
+            handleAIFaceTargetOutput(
+                cmd.target_uuid.empty() ? nullptr : cmd.target_uuid.c_str(),
+                static_cast<F32>(target_global.mdV[0]),
+                static_cast<F32>(target_global.mdV[1]),
+                static_cast<F32>(target_global.mdV[2]));
+        };
+        mAIBridge->registerCommandHandler("FACE_TARGET", face_target_handler);
+        mAIBridge->registerCommandHandler("FaceTarget", face_target_handler);
+        mAIBridge->registerCommandHandler("FACETARGET", face_target_handler);
         
         mAIBridge->registerCommandHandler("FOLLOW", [this](const AICommandData& cmd) {
             handle_AIFollowOutput(cmd.target_uuid.c_str());
@@ -3263,6 +3426,49 @@ void FSAIIntegration::handleAILookAtOutput(float x, float y, float z)
     
     LL_INFOS("AI") << "[AI] Look At initiated towards (" << look_at_global.mdV[0] << ", " 
                    << look_at_global.mdV[1] << ", " << look_at_global.mdV[2] << ")" << LL_ENDL;
+}
+
+void FSAIIntegration::handleAIFaceTargetOutput(const char* target_uuid, float x, float y, float z)
+{
+    LL_INFOS("AI") << "[AI] FACE_TARGET command: target_uuid=" << (target_uuid ? target_uuid : "")
+                   << " position=(" << x << ", " << y << ", " << z << ")" << LL_ENDL;
+
+    if (!isAgentAvatarValid())
+    {
+        LL_WARNS("AI") << "[AI] Cannot FACE_TARGET - agent avatar not valid" << LL_ENDL;
+        return;
+    }
+
+    const LLVector3d agent_pos = gAgent.getPositionGlobal();
+    const LLVector3d target_global(x, y, z);
+    LLVector3 to_target = gAgent.getPosAgentFromGlobal(target_global) - gAgent.getPositionAgent();
+    to_target.mV[VZ] = 0.f;
+    const F32 planar_distance = to_target.length();
+    if (planar_distance < kFaceTargetMinDistanceMeters)
+    {
+        LL_WARNS("AI") << "[AI] FACE_TARGET ignored: target is too close to determine heading (distance="
+                       << planar_distance << "m)" << LL_ENDL;
+        return;
+    }
+    to_target.normalize();
+
+    const F32 yaw_radians = std::atan2(to_target.mV[VY], to_target.mV[VX]);
+    LLQuaternion target_rotation(yaw_radians, LLVector3::z_axis);
+
+    // Rotate in place: autopilot target is current position with explicit facing.
+    gAgent.stopAutoPilot();
+    gAgent.startAutoPilotGlobal(
+        agent_pos,
+        "AI Face Target",
+        &target_rotation,
+        NULL,
+        NULL,
+        kFaceTargetStopDistanceMeters,
+        kFaceTargetRotationThreshold,
+        false);
+
+    LL_INFOS("AI") << "[AI] FACE_TARGET rotation started (yaw=" << yaw_radians
+                   << " rad, distance=" << planar_distance << "m)" << LL_ENDL;
 }
 
 void FSAIIntegration::handle_AIFollowOutput(const char* target_uuid)
