@@ -46,6 +46,11 @@
 
 #include "nd/ndexceptions.h" // <FS:ND/> For nd::exceptions::xran
 
+namespace
+{
+constexpr const char* VIEWPOINT_OVERRIDE_DISABLE_HEAD_ANIMS_KEY = "FSViewpointOverrideDisableHeadAnims";
+}
+
 //-----------------------------------------------------------------------------
 // Static Definitions
 //-----------------------------------------------------------------------------
@@ -740,21 +745,55 @@ void LLKeyframeMotion::applyKeyframes(F32 time)
 {
     // <FS:Ansariel> [FS AOM] Option to disable head/neck/torso animations locally
     static LLCachedControl<bool> enable_head_anims(gSavedSettings, "AOMLocalHeadAnims");
+    const bool disable_head_anims = !enable_head_anims;
+    bool disable_viewpoint_override_head_anims = false;
+
+    if (const bool* viewpoint_override_disable_head_anims =
+            static_cast<const bool*>(mCharacter->getAnimationData(VIEWPOINT_OVERRIDE_DISABLE_HEAD_ANIMS_KEY)))
+    {
+        disable_viewpoint_override_head_anims = *viewpoint_override_disable_head_anims;
+    }
     // </FS:Ansariel>
 
     llassert_always (mJointMotionList->getNumJointMotions() <= mJointStates.size());
     for (U32 i=0; i<mJointMotionList->getNumJointMotions(); i++)
     {
         // <FS:Miku> [FS AOM] Option to disable head/neck/torso animations locally
-        if (!enable_head_anims)
+        if (disable_head_anims || disable_viewpoint_override_head_anims)
         {
             LLJoint* joint = mJointStates[i]->getJoint();
             if (joint)
             {
                 std::string joint_name = joint->getName();
-                if (joint_name == "mHead" || joint_name == "mNeck" || joint_name == "mSkull" ||
-                    joint_name == "mTorso" || joint_name == "mChest")
+                const bool suppress_viewpoint_head =
+                    disable_viewpoint_override_head_anims &&
+                    (joint_name == "mHead" || joint_name == "mNeck" || joint_name == "mSkull");
+                const bool suppress_aom_local =
+                    disable_head_anims &&
+                    (joint_name == "mHead" || joint_name == "mNeck" || joint_name == "mSkull" ||
+                     joint_name == "mTorso" || joint_name == "mChest");
+
+                if (suppress_viewpoint_head || suppress_aom_local)
                 {
+                    // Keep suppressed joints neutral for this motion, otherwise stale
+                    // per-joint state from previous frames can still override head look.
+                    LLJointState* joint_state = mJointStates[i];
+                    if (joint_state)
+                    {
+                        const U32 usage = joint_state->getUsage();
+                        if (usage & LLJointState::ROT)
+                        {
+                            joint_state->setRotation(LLQuaternion::DEFAULT);
+                        }
+                        if (usage & LLJointState::POS)
+                        {
+                            joint_state->setPosition(LLVector3::zero);
+                        }
+                        if (usage & LLJointState::SCALE)
+                        {
+                            joint_state->setScale(LLVector3(1.f, 1.f, 1.f));
+                        }
+                    }
                     continue;
                 }
             }
@@ -2634,4 +2673,3 @@ LLKeyframeMotion::JointConstraint::~JointConstraint()
 }
 
 // End
-

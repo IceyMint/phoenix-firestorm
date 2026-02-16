@@ -79,9 +79,9 @@ public:
     virtual F32 getMinPixelArea() { return MIN_REQUIRED_PIXEL_AREA_HEAD_ROT; }
 
     // motions must report their priority
-    virtual LLJoint::JointPriority getPriority() { return LLJoint::MEDIUM_PRIORITY; }
+    virtual LLJoint::JointPriority getPriority();
 
-    virtual LLMotionBlendType getBlendType() { return NORMAL_BLEND; }
+    virtual LLMotionBlendType getBlendType();
 
     // run-time (post constructor) initialization,
     // called after parameters have been set
@@ -213,4 +213,3 @@ public:
 };
 
 #endif // LL_LLHEADROTMOTION_H
-

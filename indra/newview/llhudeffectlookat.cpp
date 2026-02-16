@@ -66,6 +66,23 @@ const F32 MAX_SENDS_PER_SEC = 4.f;
 const F32 MIN_DELTAPOS_FOR_UPDATE_SQUARED = 0.05f * 0.05f;
 const F32 MIN_TARGET_OFFSET_SQUARED = 0.0001f;
 
+namespace
+{
+constexpr const char* VIEWPOINT_OVERRIDE_DISABLE_HEAD_ANIMS_KEY = "FSViewpointOverrideDisableHeadAnims";
+
+bool useViewpointOverrideLookAt(LLVOAvatar* source_avatar)
+{
+    if (!source_avatar || !source_avatar->isSelf())
+    {
+        return false;
+    }
+
+    const bool* viewpoint_override_first_person = static_cast<const bool*>(
+        source_avatar->getAnimationData(VIEWPOINT_OVERRIDE_DISABLE_HEAD_ANIMS_KEY));
+    return viewpoint_override_first_person && *viewpoint_override_first_person;
+}
+} // namespace
+
 
 // can't use actual F32_MAX, because we add this to the current frametime
 const F32 MAX_TIMEOUT = F32_MAX / 2.f;
@@ -794,17 +811,19 @@ void LLHUDEffectLookAt::update()
         if (calcTargetPosition())
         {
             static LLCachedControl<bool> disable_look_at(gSavedSettings, "DisableLookAtAnimation", true);
-            LLMotion* head_motion = ((LLVOAvatar*)(LLViewerObject*)mSourceObject)->findMotion(ANIM_AGENT_HEAD_ROT);
-            if (disable_look_at())
+            LLVOAvatar* source_avatar = (LLVOAvatar*)(LLViewerObject*)mSourceObject;
+            const bool disable_look_at_for_viewer = disable_look_at() && !useViewpointOverrideLookAt(source_avatar);
+            LLMotion* head_motion = source_avatar->findMotion(ANIM_AGENT_HEAD_ROT);
+            if (disable_look_at_for_viewer)
             {
                 if (head_motion)
                 {
-                    ((LLVOAvatar*)(LLViewerObject*)mSourceObject)->stopMotion(ANIM_AGENT_HEAD_ROT);
+                    source_avatar->stopMotion(ANIM_AGENT_HEAD_ROT);
                 }
             }
             else if (!head_motion || head_motion->isStopped())
             {
-                ((LLVOAvatar*)(LLViewerObject*)mSourceObject)->startMotion(ANIM_AGENT_HEAD_ROT);
+                source_avatar->startMotion(ANIM_AGENT_HEAD_ROT);
             }
         }
     }
@@ -910,7 +929,7 @@ bool LLHUDEffectLookAt::calcTargetPosition()
         return false;
 
     static LLCachedControl<bool> disable_look_at(gSavedSettings, "DisableLookAtAnimation", true);
-    if (disable_look_at())
+    if (disable_look_at() && !useViewpointOverrideLookAt(source_avatar))
     {
         source_avatar->removeAnimationData("LookAtPoint");
     }

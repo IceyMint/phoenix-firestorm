@@ -36,6 +36,23 @@
 #include "v3dmath.h"
 #include "llcriticaldamp.h"
 
+namespace
+{
+constexpr const char* VIEWPOINT_OVERRIDE_DISABLE_HEAD_ANIMS_KEY = "FSViewpointOverrideDisableHeadAnims";
+
+bool useViewpointOverrideHeadRot(LLCharacter* character)
+{
+    if (!character)
+    {
+        return false;
+    }
+
+    const bool* viewpoint_override_disable_head_anims = static_cast<const bool*>(
+        character->getAnimationData(VIEWPOINT_OVERRIDE_DISABLE_HEAD_ANIMS_KEY));
+    return viewpoint_override_disable_head_anims && *viewpoint_override_disable_head_anims;
+}
+} // namespace
+
 //-----------------------------------------------------------------------------
 // Constants
 //-----------------------------------------------------------------------------
@@ -87,6 +104,16 @@ LLHeadRotMotion::LLHeadRotMotion(const LLUUID &id) :
 //-----------------------------------------------------------------------------
 LLHeadRotMotion::~LLHeadRotMotion()
 {
+}
+
+LLJoint::JointPriority LLHeadRotMotion::getPriority()
+{
+    return useViewpointOverrideHeadRot(mCharacter) ? LLJoint::HIGHEST_PRIORITY : LLJoint::MEDIUM_PRIORITY;
+}
+
+LLMotion::LLMotionBlendType LLHeadRotMotion::getBlendType()
+{
+    return useViewpointOverrideHeadRot(mCharacter) ? ADDITIVE_BLEND : NORMAL_BLEND;
 }
 
 //-----------------------------------------------------------------------------
@@ -575,4 +602,3 @@ void LLEyeMotion::onDeactivate()
 }
 
 // End
-
