@@ -44,6 +44,7 @@
 #include <memory>
 #include <tuple>
 #include <chrono>
+#include <set>
 
 // Forward declarations
 void near_sit_down_point(bool success, void*);
@@ -71,6 +72,15 @@ const F64 kObjectApproachStandOffMidMeters = 0.55;
 const F64 kObjectApproachStandOffMaxMeters = 0.90;
 const F32 kMoveObjectFinalGoalToleranceMeters = 1.25f;
 const U32 kMovePathReplanAttempts = 2;
+const F32 kNearbyObjectsMaxDistanceMeters = 20.0f;
+const F32 kNearbyObjectsMaxVerticalDeltaMeters = 2.5f;
+const S32 kNearbyObjectsCandidateLimitMin = 60;
+const S32 kNearbyObjectsCandidateLimitMax = 150;
+const F64 kNearbyObjectsCandidateCoverageFraction = 0.60;
+const S32 kNearbyObjectsMaxOutput = 15;
+const S32 kNearbyObjectsReachabilityBudgetPerUpdate = 6;
+const F64 kNearbyObjectsReachabilityCacheTtlSeconds = 3.0;
+const F64 kNearbyObjectsReachabilityCacheAgentQuantizeScale = 2.0;
 
 struct MoveWaypointCallbackData
 {
@@ -131,8 +141,18 @@ struct MovePlannerTelemetry
     F64 legacy_ms_total = 0.0;
 };
 
+struct ObjectReachabilityCacheEntry
+{
+    std::tuple<S32, S32, S32> agent_key;
+    bool reachable = false;
+    std::chrono::steady_clock::time_point stamp;
+};
+
 U64 g_move_plan_generation = 0;
 MovePlannerTelemetry g_move_planner_telemetry;
+std::map<LLUUID, ObjectReachabilityCacheEntry> g_object_reachability_cache;
+std::vector<LLUUID> g_nearby_object_round_robin_order;
+size_t g_nearby_object_round_robin_cursor = 0;
 
 void gather_broad_phase_obstacles(
     const LLVector3d& start,
@@ -143,6 +163,7 @@ bool is_custom_node_walkable(
     const std::vector<BroadPhaseObstacle>& obstacles,
     F64 pelvis_to_foot,
     std::map<std::tuple<S32, S32, S32>, bool>& node_cache);
+std::tuple<S32, S32, S32> quantized_point_key(const LLVector3d& point_global, F64 scale = 2.0);
 
 F64 duration_ms(const std::chrono::steady_clock::time_point& start,
                 const std::chrono::steady_clock::time_point& end)
@@ -373,6 +394,140 @@ bool has_clear_line_of_sight_to_avatar(const LLVector3d& from_global, const LLVe
     const bool foot_blocked = raycast_hits_static_world(from_foot, to_foot);
     const bool chest_blocked = raycast_hits_static_world(from_chest, to_chest);
     return !(foot_blocked || chest_blocked);
+}
+
+bool raycast_hits_static_world_except_object(
+    const LLVector3d& start_global,
+    const LLVector3d& end_global,
+    LLViewerObject* target_object)
+{
+    if (!target_object)
+    {
+        return raycast_hits_static_world(start_global, end_global);
+    }
+
+    LLVector3 start_agent = global_to_agent_vec(start_global);
+    LLVector3 end_agent = global_to_agent_vec(end_global);
+    LLVector4a start4;
+    LLVector4a end4;
+    LLVector4a intersection;
+    start4.load3(start_agent.mV);
+    end4.load3(end_agent.mV);
+
+    S32 face_hit = -1;
+    LLViewerObject* hit = gPipeline.lineSegmentIntersectInWorld(
+        start4,
+        end4,
+        true,
+        false,
+        true,
+        false,
+        &face_hit,
+        nullptr,
+        nullptr,
+        &intersection,
+        nullptr,
+        nullptr,
+        nullptr);
+    if (!hit)
+    {
+        return false;
+    }
+    if (hit->isAvatar() || hit->isAttachment())
+    {
+        return false;
+    }
+
+    LLViewerObject* target_root = target_object->getRootEdit();
+    LLViewerObject* hit_root = hit->getRootEdit();
+    if (hit == target_object || hit == target_root || hit_root == target_object || hit_root == target_root)
+    {
+        return false;
+    }
+
+    return true;
+}
+
+bool has_clear_line_of_sight_to_object(const LLVector3d& from_global, LLViewerObject* objectp)
+{
+    if (!objectp || objectp->isDead())
+    {
+        return false;
+    }
+
+    const F64 pelvis_to_foot = agent_pelvis_to_foot_meters();
+    LLVector3d from_foot = from_global;
+    from_foot.mdV[VZ] = from_global.mdV[VZ] - pelvis_to_foot + kCustomProbeFootClearanceMeters;
+
+    LLVector3d from_chest = from_global;
+    from_chest.mdV[VZ] = from_global.mdV[VZ] + kCustomProbeChestHeightMeters;
+
+    const LLBBox bbox_agent = objectp->getBoundingBoxAgent().getAxisAligned();
+    const LLVector3 min_agent = bbox_agent.getMinAgent();
+    const LLVector3 max_agent = bbox_agent.getMaxAgent();
+    const LLVector3d min_global = gAgent.getPosGlobalFromAgent(min_agent);
+    const LLVector3d max_global = gAgent.getPosGlobalFromAgent(max_agent);
+    const F64 min_z = llmin(min_global.mdV[VZ], max_global.mdV[VZ]);
+    const F64 max_z = llmax(min_global.mdV[VZ], max_global.mdV[VZ]);
+
+    LLVector3d to_center = objectp->getPositionGlobal();
+    LLVector3d to_upper = to_center;
+    to_center.mdV[VZ] = min_z + 0.20;
+    to_upper.mdV[VZ] = llmax(min_z + 0.40, max_z - 0.15);
+    if (to_upper.mdV[VZ] < to_center.mdV[VZ])
+    {
+        to_upper.mdV[VZ] = to_center.mdV[VZ];
+    }
+
+    const bool lower_blocked = raycast_hits_static_world_except_object(from_foot, to_center, objectp);
+    const bool upper_blocked = raycast_hits_static_world_except_object(from_chest, to_upper, objectp);
+    return !(lower_blocked && upper_blocked);
+}
+
+std::tuple<S32, S32, S32> nearby_objects_agent_cache_key(const LLVector3d& agent_global)
+{
+    return quantized_point_key(agent_global, kNearbyObjectsReachabilityCacheAgentQuantizeScale);
+}
+
+bool get_cached_object_reachability(
+    const LLUUID& object_id,
+    const std::tuple<S32, S32, S32>& agent_key,
+    bool& reachable_out,
+    bool allow_stale = false,
+    bool* stale_out = nullptr)
+{
+    auto it = g_object_reachability_cache.find(object_id);
+    if (it == g_object_reachability_cache.end())
+    {
+        return false;
+    }
+
+    const F64 age_seconds = duration_ms(it->second.stamp, std::chrono::steady_clock::now()) / 1000.0;
+    const bool stale = (age_seconds > kNearbyObjectsReachabilityCacheTtlSeconds) ||
+                       (it->second.agent_key != agent_key);
+    if (stale && !allow_stale)
+    {
+        return false;
+    }
+
+    if (stale_out)
+    {
+        *stale_out = stale;
+    }
+    reachable_out = it->second.reachable;
+    return true;
+}
+
+void put_cached_object_reachability(
+    const LLUUID& object_id,
+    const std::tuple<S32, S32, S32>& agent_key,
+    bool reachable)
+{
+    ObjectReachabilityCacheEntry entry;
+    entry.agent_key = agent_key;
+    entry.reachable = reachable;
+    entry.stamp = std::chrono::steady_clock::now();
+    g_object_reachability_cache[object_id] = entry;
 }
 
 LLVector3d compute_avatar_approach_goal(const LLVector3d& from_global, const LLVector3d& avatar_global, F32 standoff)
@@ -610,7 +765,7 @@ bool is_point_near_broad_phase(const LLVector3d& point_global, const std::vector
     return false;
 }
 
-std::tuple<S32, S32, S32> quantized_point_key(const LLVector3d& point_global, F64 scale = 2.0)
+std::tuple<S32, S32, S32> quantized_point_key(const LLVector3d& point_global, F64 scale)
 {
     return std::make_tuple(
         static_cast<S32>(std::llround(point_global.mdV[VX] * scale)),
@@ -1185,7 +1340,12 @@ bool plan_probe_route(const LLVector3d& start, const LLVector3d& goal, std::vect
     return true;
 }
 
-bool plan_custom_clearance_route(const LLVector3d& start, const LLVector3d& goal, std::vector<LLVector3d>& waypoints_out, bool& direct_out)
+bool plan_custom_clearance_route(
+    const LLVector3d& start,
+    const LLVector3d& goal,
+    std::vector<LLVector3d>& waypoints_out,
+    bool& direct_out,
+    bool log_diagnostics = true)
 {
     waypoints_out.clear();
     direct_out = false;
@@ -1215,9 +1375,12 @@ bool plan_custom_clearance_route(const LLVector3d& start, const LLVector3d& goal
     {
         direct_out = true;
         waypoints_out.push_back(goal);
-        LL_INFOS("AI") << "[AI] Custom planner: direct clearance route succeeded; single-leg route"
-                       << " obstacles=" << obstacles.size()
-                       << LL_ENDL;
+        if (log_diagnostics)
+        {
+            LL_INFOS("AI") << "[AI] Custom planner: direct clearance route succeeded; single-leg route"
+                           << " obstacles=" << obstacles.size()
+                           << LL_ENDL;
+        }
         return true;
     }
 
@@ -1262,10 +1425,13 @@ bool plan_custom_clearance_route(const LLVector3d& start, const LLVector3d& goal
 
     if (walkable_nodes.size() < 2)
     {
-        LL_INFOS("AI") << "[AI] Custom planner: no walkable nodes after clearance filtering"
-                       << " candidates=" << nodes.size()
-                       << " rejected=" << rejected_nodes
-                       << LL_ENDL;
+        if (log_diagnostics)
+        {
+            LL_INFOS("AI") << "[AI] Custom planner: no walkable nodes after clearance filtering"
+                           << " candidates=" << nodes.size()
+                           << " rejected=" << rejected_nodes
+                           << LL_ENDL;
+        }
         return false;
     }
 
@@ -1322,14 +1488,17 @@ bool plan_custom_clearance_route(const LLVector3d& start, const LLVector3d& goal
     std::vector<int> path = astar_path(adjacency, walkable_nodes, start_idx, goal_idx);
     if (path.size() < 2)
     {
-        LL_INFOS("AI") << "[AI] Custom planner: no A* route"
-                       << " nodes=" << walkable_nodes.size()
-                       << " obstacles=" << obstacles.size()
-                       << " rejected_nodes=" << rejected_nodes
-                       << " edge_tests=" << edge_tests
-                       << " edge_cache_hits=" << edge_hits
-                       << " edge_successes=" << edge_successes
-                       << LL_ENDL;
+        if (log_diagnostics)
+        {
+            LL_INFOS("AI") << "[AI] Custom planner: no A* route"
+                           << " nodes=" << walkable_nodes.size()
+                           << " obstacles=" << obstacles.size()
+                           << " rejected_nodes=" << rejected_nodes
+                           << " edge_tests=" << edge_tests
+                           << " edge_cache_hits=" << edge_hits
+                           << " edge_successes=" << edge_successes
+                           << LL_ENDL;
+        }
         return false;
     }
 
@@ -1363,9 +1532,12 @@ bool plan_custom_clearance_route(const LLVector3d& start, const LLVector3d& goal
 
     if (waypoints_out.empty())
     {
-        LL_INFOS("AI") << "[AI] Custom planner: compressed route had no waypoints"
-                       << " path_nodes=" << path.size()
-                       << LL_ENDL;
+        if (log_diagnostics)
+        {
+            LL_INFOS("AI") << "[AI] Custom planner: compressed route had no waypoints"
+                           << " path_nodes=" << path.size()
+                           << LL_ENDL;
+        }
         return false;
     }
     if (dist_vec(waypoints_out.back(), goal) > 0.5)
@@ -1373,16 +1545,19 @@ bool plan_custom_clearance_route(const LLVector3d& start, const LLVector3d& goal
         waypoints_out.push_back(goal);
     }
 
-    LL_INFOS("AI") << "[AI] Custom planner: route ready"
-                   << " obstacles=" << obstacles.size()
-                   << " nodes=" << walkable_nodes.size()
-                   << " rejected_nodes=" << rejected_nodes
-                   << " path_nodes=" << path.size()
-                   << " waypoints=" << waypoints_out.size()
-                   << " edge_tests=" << edge_tests
-                   << " edge_cache_hits=" << edge_hits
-                   << " edge_successes=" << edge_successes
-                   << LL_ENDL;
+    if (log_diagnostics)
+    {
+        LL_INFOS("AI") << "[AI] Custom planner: route ready"
+                       << " obstacles=" << obstacles.size()
+                       << " nodes=" << walkable_nodes.size()
+                       << " rejected_nodes=" << rejected_nodes
+                       << " path_nodes=" << path.size()
+                       << " waypoints=" << waypoints_out.size()
+                       << " edge_tests=" << edge_tests
+                       << " edge_cache_hits=" << edge_hits
+                       << " edge_successes=" << edge_successes
+                       << LL_ENDL;
+    }
     return true;
 }
 
@@ -2185,6 +2360,8 @@ void FSAIIntegration::gatherNearbyAgents(std::vector<std::pair<std::string, std:
 
 void FSAIIntegration::gatherNearbyObjects(std::vector<std::pair<std::string, std::string>>& objects_str)
 {
+    objects_str.clear();
+
     // Get nearby objects from area search if available
     FSAreaSearch* areaSearch = LLFloaterReg::findTypedInstance<FSAreaSearch>("area_search");
     if (!areaSearch || areaSearch->mObjectDetails.empty())
@@ -2192,41 +2369,252 @@ void FSAIIntegration::gatherNearbyObjects(std::vector<std::pair<std::string, std
         return;
     }
 
-    LLVector3d agentPos    = gAgent.getPositionGlobal();
-    const F32  maxDistance = 10.0f;
+    const LLVector3d agentPos = gAgent.getPositionGlobal();
+    const auto agent_key = nearby_objects_agent_cache_key(agentPos);
 
-    for (const auto& [objectId, props] : areaSearch->mObjectDetails)
+    // Keep cache bounded if object UUID churn is high.
+    if (g_object_reachability_cache.size() > 2048)
     {
-        if (!props.listed)
-            continue;
-
-        LLViewerObject* objectp = gObjectList.findObject(objectId);
-        if (!objectp || objectp->isDead() || objectp->getRegion() != gAgent.getRegion() || objectp->isAttachment())
-            continue;
-
-        LLVector3d objectPos = objectp->getPositionGlobal();
-        F32        distance  = (F32)dist_vec(agentPos, objectPos);
-
-        // LL_INFOS("AI") << "[AI] Found object: " << props.name << " at distance: " << distance << "m" << LL_ENDL;
-
-        if (distance <= maxDistance)
+        const auto now = std::chrono::steady_clock::now();
+        for (auto it = g_object_reachability_cache.begin(); it != g_object_reachability_cache.end();)
         {
-            std::string objectName = props.name.empty() ? "Unknown Object" : props.name;
-            std::string pos_str    = "(" + std::to_string(objectPos.mdV[0]) + ", " + std::to_string(objectPos.mdV[1]) + ", " +
-                                  std::to_string(objectPos.mdV[2]) + ")";
-            std::string uuid_str = objectId.asString();                     // Add UUID like agents do
-            objects_str.emplace_back(objectName + "|" + uuid_str, pos_str); // Include UUID in name field
+            const F64 age_seconds = duration_ms(it->second.stamp, now) / 1000.0;
+            if (age_seconds > (kNearbyObjectsReachabilityCacheTtlSeconds * 4.0))
+            {
+                it = g_object_reachability_cache.erase(it);
+            }
+            else
+            {
+                ++it;
+            }
         }
     }
 
-    // Sort by distance (closest first)
-    LLVector3d agentPos_final = agentPos; // Capture for lambda
-    std::sort(objects_str.begin(), objects_str.end(), 
-        [agentPos_final](const auto& a, const auto& b) {
-            // Simple distance comparison by parsing position strings
-            // This is approximate sorting - exact distances would require parsing
-            return a.first < b.first; // Fallback to name sorting
+    struct NearbyObjectCandidate
+    {
+        LLUUID object_id;
+        std::string name;
+        LLVector3d pos;
+        F32 distance = 0.0f;
+    };
+
+    std::vector<NearbyObjectCandidate> candidates;
+    candidates.reserve(128);
+
+    S32 scanned = 0;
+    S32 in_distance = 0;
+    S32 same_floor = 0;
+    S32 in_los = 0;
+
+    for (const auto& [objectId, props] : areaSearch->mObjectDetails)
+    {
+        ++scanned;
+        if (!props.listed)
+        {
+            continue;
+        }
+
+        LLViewerObject* objectp = gObjectList.findObject(objectId);
+        if (!objectp || objectp->isDead() || objectp->getRegion() != gAgent.getRegion() || objectp->isAttachment())
+        {
+            continue;
+        }
+
+        LLVector3d objectPos = objectp->getPositionGlobal();
+        const F32 distance = static_cast<F32>(dist_vec(agentPos, objectPos));
+        if (distance > kNearbyObjectsMaxDistanceMeters)
+        {
+            continue;
+        }
+        ++in_distance;
+
+        if (std::fabs(objectPos.mdV[VZ] - agentPos.mdV[VZ]) > kNearbyObjectsMaxVerticalDeltaMeters)
+        {
+            continue;
+        }
+        ++same_floor;
+
+        if (!has_clear_line_of_sight_to_object(agentPos, objectp))
+        {
+            continue;
+        }
+        ++in_los;
+
+        NearbyObjectCandidate candidate;
+        candidate.object_id = objectId;
+        candidate.name = props.name.empty() ? "Unknown Object" : props.name;
+        candidate.pos = objectPos;
+        candidate.distance = distance;
+        candidates.push_back(candidate);
+    }
+
+    std::sort(candidates.begin(), candidates.end(),
+        [](const NearbyObjectCandidate& a, const NearbyObjectCandidate& b)
+        {
+            if (a.distance != b.distance)
+            {
+                return a.distance < b.distance;
+            }
+            return a.object_id < b.object_id;
         });
+
+    const S32 adaptive_candidate_limit = llclamp(
+        llmax(
+            kNearbyObjectsCandidateLimitMin,
+            static_cast<S32>(std::ceil(static_cast<F64>(candidates.size()) * kNearbyObjectsCandidateCoverageFraction))),
+        kNearbyObjectsCandidateLimitMin,
+        kNearbyObjectsCandidateLimitMax);
+    if (static_cast<S32>(candidates.size()) > adaptive_candidate_limit)
+    {
+        candidates.resize(adaptive_candidate_limit);
+    }
+
+    std::map<LLUUID, size_t> candidate_index_by_id;
+    for (size_t i = 0; i < candidates.size(); ++i)
+    {
+        candidate_index_by_id[candidates[i].object_id] = i;
+    }
+
+    std::vector<LLUUID> updated_rr_order;
+    updated_rr_order.reserve(candidates.size());
+    std::set<LLUUID> rr_members;
+    for (const LLUUID& object_id : g_nearby_object_round_robin_order)
+    {
+        if (candidate_index_by_id.find(object_id) == candidate_index_by_id.end())
+        {
+            continue;
+        }
+        updated_rr_order.push_back(object_id);
+        rr_members.insert(object_id);
+    }
+    for (const NearbyObjectCandidate& candidate : candidates)
+    {
+        if (rr_members.insert(candidate.object_id).second)
+        {
+            updated_rr_order.push_back(candidate.object_id);
+        }
+    }
+    g_nearby_object_round_robin_order.swap(updated_rr_order);
+    if (g_nearby_object_round_robin_order.empty())
+    {
+        g_nearby_object_round_robin_cursor = 0;
+    }
+    else if (g_nearby_object_round_robin_cursor >= g_nearby_object_round_robin_order.size())
+    {
+        g_nearby_object_round_robin_cursor %= g_nearby_object_round_robin_order.size();
+    }
+
+    std::map<LLUUID, bool> reachable_by_id;
+    std::set<LLUUID> uncached_ids;
+    S32 cache_hits = 0;
+    for (const NearbyObjectCandidate& candidate : candidates)
+    {
+        bool reachable = false;
+        bool stale_cached = false;
+        if (get_cached_object_reachability(candidate.object_id, agent_key, reachable, true, &stale_cached))
+        {
+            ++cache_hits;
+            reachable_by_id[candidate.object_id] = reachable;
+            if (stale_cached)
+            {
+                // Keep display stable while stale entries are refreshed by the round-robin budget.
+                uncached_ids.insert(candidate.object_id);
+            }
+        }
+        else
+        {
+            uncached_ids.insert(candidate.object_id);
+        }
+    }
+
+    S32 path_checks = 0;
+    if (!uncached_ids.empty() && !g_nearby_object_round_robin_order.empty())
+    {
+        const size_t rr_count = g_nearby_object_round_robin_order.size();
+        size_t visited = 0;
+        while (visited < rr_count && path_checks < kNearbyObjectsReachabilityBudgetPerUpdate)
+        {
+            const size_t rr_idx = (g_nearby_object_round_robin_cursor + visited) % rr_count;
+            const LLUUID object_id = g_nearby_object_round_robin_order[rr_idx];
+            ++visited;
+            if (uncached_ids.find(object_id) == uncached_ids.end())
+            {
+                continue;
+            }
+
+            auto candidate_it = candidate_index_by_id.find(object_id);
+            if (candidate_it == candidate_index_by_id.end())
+            {
+                continue;
+            }
+
+            const NearbyObjectCandidate& candidate = candidates[candidate_it->second];
+            bool reachable = false;
+            LLViewerObject* objectp = gObjectList.findObject(candidate.object_id);
+            if (objectp && !objectp->isDead() && objectp->getRegion() == gAgent.getRegion())
+            {
+                LLVector3d approach_goal = candidate.pos;
+                if (!compute_object_approach_goal(agentPos, objectp, approach_goal))
+                {
+                    approach_goal = candidate.pos;
+                }
+
+                reachable = has_direct_clearance_route(agentPos, approach_goal);
+                if (!reachable)
+                {
+                    std::vector<LLVector3d> waypoints;
+                    bool direct_out = false;
+                    reachable = plan_custom_clearance_route(agentPos, approach_goal, waypoints, direct_out, false);
+                }
+            }
+
+            put_cached_object_reachability(candidate.object_id, agent_key, reachable);
+            reachable_by_id[candidate.object_id] = reachable;
+            uncached_ids.erase(candidate.object_id);
+            ++path_checks;
+        }
+
+        if (rr_count > 0)
+        {
+            g_nearby_object_round_robin_cursor = (g_nearby_object_round_robin_cursor + visited) % rr_count;
+        }
+    }
+
+    S32 reachable_count = 0;
+    for (const NearbyObjectCandidate& candidate : candidates)
+    {
+        auto reachable_it = reachable_by_id.find(candidate.object_id);
+        if (reachable_it == reachable_by_id.end() || !reachable_it->second)
+        {
+            continue;
+        }
+
+        ++reachable_count;
+        std::string pos_str = "(" + std::to_string(candidate.pos.mdV[0]) + ", " +
+                              std::to_string(candidate.pos.mdV[1]) + ", " +
+                              std::to_string(candidate.pos.mdV[2]) + ")";
+        std::string uuid_str = candidate.object_id.asString();
+        objects_str.emplace_back(candidate.name + "|" + uuid_str, pos_str);
+        if (static_cast<S32>(objects_str.size()) >= kNearbyObjectsMaxOutput)
+        {
+            break;
+        }
+    }
+
+    LL_DEBUGS("AI") << "[AI] Nearby object filter: scanned=" << scanned
+                    << " in_distance=" << in_distance
+                    << " same_floor=" << same_floor
+                    << " in_los=" << in_los
+                    << " candidates=" << candidates.size()
+                    << " candidate_limit=" << adaptive_candidate_limit
+                    << " rr_queue=" << g_nearby_object_round_robin_order.size()
+                    << " rr_cursor=" << g_nearby_object_round_robin_cursor
+                    << " path_checks=" << path_checks
+                    << " cache_hits=" << cache_hits
+                    << " remaining_uncached=" << uncached_ids.size()
+                    << " reachable=" << reachable_count
+                    << " output=" << objects_str.size()
+                    << LL_ENDL;
 }
 
 std::string FSAIIntegration::getCurrentLocation()
