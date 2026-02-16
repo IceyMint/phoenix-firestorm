@@ -192,6 +192,7 @@ private:
     static void handleAISitOutput(const char* object_uuid);
     static void handleAIStandOutput();
     static void handleAILookAtOutput(float x, float y, float z);
+    static void handleAIFaceTargetOutput(const char* target_uuid, float x, float y, float z);
     static void handle_AIFollowOutput(const char* target_uuid);
 
 private:
