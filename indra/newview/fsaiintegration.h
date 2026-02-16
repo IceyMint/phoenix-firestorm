@@ -6,7 +6,6 @@
 #include "llchat.h"
 #include <vector>
 #include <string>
-#include <map>
 #include <memory>
 
 // Forward declarations

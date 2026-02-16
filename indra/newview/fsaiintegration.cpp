@@ -37,6 +37,7 @@
 #include <functional>
 #include <cmath>
 #include <limits>
+#include <queue>
 #include <map>
 #include <memory>
 
@@ -57,7 +58,8 @@ const F32 kMoveAutopilotRotationThreshold = 0.03f;
 struct MoveWaypointCallbackData
 {
     U64 plan_id;
-    LLVector3d final_target;
+    std::vector<LLVector3d> waypoints;
+    size_t next_index;
 };
 
 U64 g_move_plan_generation = 0;
@@ -178,45 +180,294 @@ bool probe_path_exists(const LLVector3d& from_global, const LLVector3d& to_globa
     return pathing->generatePath(packet) == LLPathingLib::LLPL_PATH_GENERATED_OK;
 }
 
-bool find_probe_waypoint(const LLVector3d& start, const LLVector3d& goal, LLVector3d& waypoint_out)
+void add_unique_node(std::vector<LLVector3d>& nodes, const LLVector3d& candidate, F64 min_spacing = 0.9)
 {
-    static const F32 kRadii[] = {2.0f, 3.5f, 5.0f, 7.0f};
-    static const int kSteps = 12;
-    static const F64 kTwoPi = 6.28318530717958647692;
-
-    F64 best_score = std::numeric_limits<F64>::max();
-    bool found = false;
-
-    for (F32 radius : kRadii)
+    for (const LLVector3d& existing : nodes)
     {
-        for (int i = 0; i < kSteps; ++i)
+        if (dist_vec(existing, candidate) < min_spacing)
         {
-            const F64 theta = (kTwoPi * i) / static_cast<F64>(kSteps);
-            LLVector3d candidate(
-                goal.mdV[0] + std::cos(theta) * radius,
-                goal.mdV[1] + std::sin(theta) * radius,
-                goal.mdV[2]
-            );
+            return;
+        }
+    }
+    nodes.push_back(candidate);
+}
 
-            if (!probe_path_exists(start, candidate))
-            {
-                continue;
-            }
-            if (!probe_path_exists(candidate, goal))
-            {
-                continue;
-            }
+std::vector<LLVector3d> build_probe_nodes(const LLVector3d& start, const LLVector3d& goal)
+{
+    std::vector<LLVector3d> nodes;
+    nodes.reserve(96);
+    add_unique_node(nodes, start, 0.01);
+    add_unique_node(nodes, goal, 0.01);
 
-            const F64 score = dist_vec(start, candidate) + dist_vec(candidate, goal);
-            if (score < best_score)
+    static const F64 kTwoPi = 6.28318530717958647692;
+    static const F32 kRingRadii[] = {2.0f, 4.0f, 6.5f};
+    static const int kRingSteps = 10;
+
+    const LLVector3d centers[2] = {start, goal};
+    for (const LLVector3d& center : centers)
+    {
+        for (F32 radius : kRingRadii)
+        {
+            for (int i = 0; i < kRingSteps; ++i)
             {
-                best_score = score;
-                waypoint_out = candidate;
-                found = true;
+                const F64 theta = (kTwoPi * i) / static_cast<F64>(kRingSteps);
+                LLVector3d candidate(
+                    center.mdV[0] + std::cos(theta) * radius,
+                    center.mdV[1] + std::sin(theta) * radius,
+                    center.mdV[2]
+                );
+                add_unique_node(nodes, candidate);
             }
         }
     }
-    return found;
+
+    // Corridor samples between start and goal with lateral offsets.
+    LLVector3d delta = goal - start;
+    LLVector3d dir2d(delta.mdV[0], delta.mdV[1], 0.0);
+    const F64 dir_mag = dir2d.length();
+    if (dir_mag > 0.001)
+    {
+        dir2d.normalize();
+        LLVector3d perp(-dir2d.mdV[1], dir2d.mdV[0], 0.0);
+        static const F32 kTValues[] = {0.2f, 0.35f, 0.5f, 0.65f, 0.8f};
+        static const F32 kOffsets[] = {-5.0f, -2.5f, 0.0f, 2.5f, 5.0f};
+        for (F32 t : kTValues)
+        {
+            LLVector3d center = start + (delta * t);
+            for (F32 offset : kOffsets)
+            {
+                LLVector3d candidate = center + (perp * offset);
+                add_unique_node(nodes, candidate);
+            }
+        }
+    }
+
+    return nodes;
+}
+
+std::vector<int> nearest_neighbor_indices(const std::vector<LLVector3d>& nodes, int index, int k)
+{
+    std::vector<std::pair<F64, int>> distances;
+    distances.reserve(nodes.size() > 0 ? nodes.size() - 1 : 0);
+    for (int j = 0; j < static_cast<int>(nodes.size()); ++j)
+    {
+        if (j == index)
+        {
+            continue;
+        }
+        distances.emplace_back(dist_vec(nodes[index], nodes[j]), j);
+    }
+    std::sort(distances.begin(), distances.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+
+    std::vector<int> out;
+    out.reserve(k);
+    for (int i = 0; i < static_cast<int>(distances.size()) && i < k; ++i)
+    {
+        out.push_back(distances[i].second);
+    }
+    return out;
+}
+
+std::vector<int> astar_path(
+    const std::vector<std::vector<std::pair<int, F64>>>& adjacency,
+    const std::vector<LLVector3d>& nodes,
+    int start_idx,
+    int goal_idx)
+{
+    const size_t count = nodes.size();
+    if (count == 0)
+    {
+        return {};
+    }
+
+    std::vector<F64> g_score(count, std::numeric_limits<F64>::infinity());
+    std::vector<int> came_from(count, -1);
+    std::vector<bool> closed(count, false);
+
+    struct OpenNode
+    {
+        F64 f_score;
+        int node;
+        bool operator<(const OpenNode& other) const { return f_score > other.f_score; }
+    };
+    std::priority_queue<OpenNode> open_set;
+
+    g_score[start_idx] = 0.0;
+    open_set.push({dist_vec(nodes[start_idx], nodes[goal_idx]), start_idx});
+
+    while (!open_set.empty())
+    {
+        const int current = open_set.top().node;
+        open_set.pop();
+        if (closed[current])
+        {
+            continue;
+        }
+        if (current == goal_idx)
+        {
+            std::vector<int> path;
+            int node = goal_idx;
+            while (node != -1)
+            {
+                path.push_back(node);
+                node = came_from[node];
+            }
+            std::reverse(path.begin(), path.end());
+            return path;
+        }
+        closed[current] = true;
+
+        for (const auto& edge : adjacency[current])
+        {
+            const int neighbor = edge.first;
+            const F64 cost = edge.second;
+            if (closed[neighbor])
+            {
+                continue;
+            }
+            const F64 tentative = g_score[current] + cost;
+            if (tentative >= g_score[neighbor])
+            {
+                continue;
+            }
+            came_from[neighbor] = current;
+            g_score[neighbor] = tentative;
+            const F64 f = tentative + dist_vec(nodes[neighbor], nodes[goal_idx]);
+            open_set.push({f, neighbor});
+        }
+    }
+
+    return {};
+}
+
+bool plan_probe_route(const LLVector3d& start, const LLVector3d& goal, std::vector<LLVector3d>& waypoints_out, bool& direct_out)
+{
+    waypoints_out.clear();
+    direct_out = false;
+
+    if (probe_path_exists(start, goal))
+    {
+        direct_out = true;
+        waypoints_out.push_back(goal);
+        return true;
+    }
+
+    std::vector<LLVector3d> nodes = build_probe_nodes(start, goal);
+    if (nodes.size() < 2)
+    {
+        return false;
+    }
+
+    const int start_idx = 0;
+    const int goal_idx = 1;
+    const int kNeighbors = 10;
+    std::vector<std::vector<std::pair<int, F64>>> adjacency(nodes.size());
+    std::map<U64, bool> edge_probe_cache;
+    auto edge_key = [](int a, int b) -> U64 {
+        const U64 lo = static_cast<U64>(std::min(a, b));
+        const U64 hi = static_cast<U64>(std::max(a, b));
+        return (lo << 32) | hi;
+    };
+    auto probe_edge = [&](int a, int b) -> bool {
+        const U64 key = edge_key(a, b);
+        auto it = edge_probe_cache.find(key);
+        if (it != edge_probe_cache.end())
+        {
+            return it->second;
+        }
+        const bool ok = probe_path_exists(nodes[a], nodes[b]);
+        edge_probe_cache[key] = ok;
+        return ok;
+    };
+
+    for (int i = 0; i < static_cast<int>(nodes.size()); ++i)
+    {
+        std::vector<int> neighbors = nearest_neighbor_indices(nodes, i, kNeighbors);
+        for (int j : neighbors)
+        {
+            if (i >= j)
+            {
+                continue;
+            }
+            if (!probe_edge(i, j))
+            {
+                continue;
+            }
+            const F64 cost = dist_vec(nodes[i], nodes[j]);
+            adjacency[i].push_back({j, cost});
+            adjacency[j].push_back({i, cost});
+        }
+    }
+
+    std::vector<int> path = astar_path(adjacency, nodes, start_idx, goal_idx);
+    if (path.size() < 2)
+    {
+        return false;
+    }
+
+    // Compress path by skipping waypoints when direct probe is valid.
+    std::vector<int> compressed;
+    compressed.push_back(path.front());
+    size_t cursor = 0;
+    while (cursor < path.size() - 1)
+    {
+        size_t best_next = cursor + 1;
+        for (size_t j = path.size() - 1; j > cursor; --j)
+        {
+            if (probe_edge(path[cursor], path[j]))
+            {
+                best_next = j;
+                break;
+            }
+        }
+        compressed.push_back(path[best_next]);
+        cursor = best_next;
+    }
+
+    for (size_t i = 1; i < compressed.size(); ++i)
+    {
+        const LLVector3d& wp = nodes[compressed[i]];
+        if (!waypoints_out.empty() && dist_vec(waypoints_out.back(), wp) < 0.5)
+        {
+            continue;
+        }
+        waypoints_out.push_back(wp);
+    }
+
+    if (waypoints_out.empty())
+    {
+        return false;
+    }
+    if (dist_vec(waypoints_out.back(), goal) > 0.5)
+    {
+        waypoints_out.push_back(goal);
+    }
+
+    return true;
+}
+
+void ai_move_waypoint_callback(bool success, void* user_data);
+
+void start_move_path_plan(U64 plan_id, const std::vector<LLVector3d>& waypoints)
+{
+    if (waypoints.empty())
+    {
+        return;
+    }
+    MoveWaypointCallbackData* cb_data = new MoveWaypointCallbackData();
+    cb_data->plan_id = plan_id;
+    cb_data->waypoints = waypoints;
+    cb_data->next_index = 1;
+    gAgent.startAutoPilotGlobal(
+        waypoints[0],
+        "AI Movement Waypoint",
+        NULL,
+        ai_move_waypoint_callback,
+        cb_data,
+        kMoveAutopilotStopDistanceMeters,
+        kMoveAutopilotRotationThreshold,
+        false
+    );
 }
 
 void ai_move_waypoint_callback(bool success, void* user_data)
@@ -228,7 +479,8 @@ void ai_move_waypoint_callback(bool success, void* user_data)
     }
 
     const U64 callback_plan_id = cb_data->plan_id;
-    const LLVector3d final_target = cb_data->final_target;
+    const std::vector<LLVector3d> waypoints = cb_data->waypoints;
+    const size_t next_index = cb_data->next_index;
     delete cb_data;
 
     if (callback_plan_id != g_move_plan_generation)
@@ -242,19 +494,31 @@ void ai_move_waypoint_callback(bool success, void* user_data)
         return;
     }
 
+    if (next_index >= waypoints.size())
+    {
+        LL_INFOS("AI") << "[AI] Multi-waypoint movement plan completed" << LL_ENDL;
+        return;
+    }
+
+    MoveWaypointCallbackData* next_cb = new MoveWaypointCallbackData();
+    next_cb->plan_id = callback_plan_id;
+    next_cb->waypoints = waypoints;
+    next_cb->next_index = next_index + 1;
+
+    const LLVector3d& next_target = waypoints[next_index];
     gAgent.startAutoPilotGlobal(
-        final_target,
-        "AI Movement Final",
+        next_target,
+        "AI Movement Waypoint",
         NULL,
-        NULL,
-        NULL,
+        ai_move_waypoint_callback,
+        next_cb,
         kMoveAutopilotStopDistanceMeters,
         kMoveAutopilotRotationThreshold,
         false
     );
 
-    LL_INFOS("AI") << "[AI] Waypoint reached; final leg started to ("
-                   << final_target.mdV[0] << ", " << final_target.mdV[1] << ", " << final_target.mdV[2] << ")"
+    LL_INFOS("AI") << "[AI] Waypoint leg " << (next_index + 1) << "/" << waypoints.size()
+                   << " started to (" << next_target.mdV[0] << ", " << next_target.mdV[1] << ", " << next_target.mdV[2] << ")"
                    << LL_ENDL;
 }
 }
@@ -912,7 +1176,7 @@ void FSAIIntegration::handleAIMovementOutput(float x, float y, float z, const ch
         target_pos = agent_pos + (direction * kMoveClampDistanceMeters);
     }
 
-    // Every MOVE invalidates any prior two-hop callback plan.
+    // Every MOVE invalidates any prior multi-waypoint callback plan.
     const U64 plan_id = ++g_move_plan_generation;
 
     // Person-aware movement: use follow pilot with standoff to avoid bumping avatars.
@@ -960,18 +1224,14 @@ void FSAIIntegration::handleAIMovementOutput(float x, float y, float z, const ch
     }
 
     bool direct_path_available = false;
-    bool waypoint_planned = false;
-    LLVector3d waypoint_target;
+    std::vector<LLVector3d> planned_waypoints;
     const bool pathfinding_ready = is_pathfinding_ready();
     if (pathfinding_ready)
     {
-        direct_path_available = probe_path_exists(agent_pos, target_pos);
-        if (!direct_path_available)
-        {
-            waypoint_planned = find_probe_waypoint(agent_pos, target_pos, waypoint_target);
-        }
+        const bool planned = plan_probe_route(agent_pos, target_pos, planned_waypoints, direct_path_available);
         LL_INFOS("AI") << "[AI] Path probe result: direct=" << (direct_path_available ? "yes" : "no")
-                       << " waypoint=" << (waypoint_planned ? "yes" : "no") << LL_ENDL;
+                       << " planned_waypoints=" << planned_waypoints.size()
+                       << " planned=" << (planned ? "yes" : "no") << LL_ENDL;
     }
     else
     {
@@ -980,26 +1240,13 @@ void FSAIIntegration::handleAIMovementOutput(float x, float y, float z, const ch
 
     gAgent.stopAutoPilot();
 
-    if (waypoint_planned)
+    if (!planned_waypoints.empty())
     {
-        MoveWaypointCallbackData* cb_data = new MoveWaypointCallbackData();
-        cb_data->plan_id = plan_id;
-        cb_data->final_target = target_pos;
-        gAgent.startAutoPilotGlobal(
-            waypoint_target,
-            "AI Movement Waypoint",
-            NULL,
-            ai_move_waypoint_callback,
-            cb_data,
-            kMoveAutopilotStopDistanceMeters,
-            kMoveAutopilotRotationThreshold,
-            false
-        );
-
-        LL_INFOS("AI") << "[AI] Two-hop movement: waypoint (" << waypoint_target.mdV[0] << ", "
-                       << waypoint_target.mdV[1] << ", " << waypoint_target.mdV[2] << ")"
-                       << " then goal (" << target_pos.mdV[0] << ", " << target_pos.mdV[1] << ", " << target_pos.mdV[2] << ")"
-                       << LL_ENDL;
+        start_move_path_plan(plan_id, planned_waypoints);
+        const LLVector3d& first_leg = planned_waypoints.front();
+        LL_INFOS("AI") << "[AI] Multi-waypoint movement started with " << planned_waypoints.size()
+                       << " leg(s). First leg target: ("
+                       << first_leg.mdV[0] << ", " << first_leg.mdV[1] << ", " << first_leg.mdV[2] << ")" << LL_ENDL;
         return;
     }
 
