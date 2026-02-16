@@ -499,8 +499,13 @@ bool AIProcessBridge::sendMessage(const AIMessage& message) {
         return false;
     }
     
-    LL_INFOS("AIProcessBridge") << "📨 Sending message (type: '" << message.type 
-             << "', id: '" << message.id << "')" << LL_ENDL;
+    if (message.type == "environment_update") {
+        LL_DEBUGS("AIProcessBridge") << "📨 Sending message (type: '" << message.type
+                 << "', id: '" << message.id << "')" << LL_ENDL;
+    } else {
+        LL_INFOS("AIProcessBridge") << "📨 Sending message (type: '" << message.type
+                 << "', id: '" << message.id << "')" << LL_ENDL;
+    }
     
     queueOutgoingMessage(message);
     return true;
@@ -532,13 +537,23 @@ bool AIProcessBridge::sendChatMessage(const std::string& text, const std::string
 void AIProcessBridge::queueOutgoingMessage(const AIMessage& message) {
     std::lock_guard<std::mutex> lock(outgoing_mutex_);
     
-    LL_INFOS("AIProcessBridge") << "📥 Queuing outgoing message (type: '" << message.type 
-             << "', id: '" << message.id << "'). Queue was: " << outgoing_messages_.size() << LL_ENDL;
+    if (message.type == "environment_update") {
+        LL_DEBUGS("AIProcessBridge") << "📥 Queuing outgoing message (type: '" << message.type
+                 << "', id: '" << message.id << "'). Queue was: " << outgoing_messages_.size() << LL_ENDL;
+    } else {
+        LL_INFOS("AIProcessBridge") << "📥 Queuing outgoing message (type: '" << message.type
+                 << "', id: '" << message.id << "'). Queue was: " << outgoing_messages_.size() << LL_ENDL;
+    }
     
     outgoing_messages_.push(message);
     
-    LL_INFOS("AIProcessBridge") << "📊 Outgoing queue now has " << outgoing_messages_.size() 
-             << " messages. Notifying writer thread..." << LL_ENDL;
+    if (message.type == "environment_update") {
+        LL_DEBUGS("AIProcessBridge") << "📊 Outgoing queue now has " << outgoing_messages_.size()
+                 << " messages. Notifying writer thread..." << LL_ENDL;
+    } else {
+        LL_INFOS("AIProcessBridge") << "📊 Outgoing queue now has " << outgoing_messages_.size()
+                 << " messages. Notifying writer thread..." << LL_ENDL;
+    }
     
     outgoing_cv_.notify_one();
     
@@ -836,16 +851,22 @@ void AIProcessBridge::messageWriterThread() {
             AIMessage message = outgoing_messages_.front();
             outgoing_messages_.pop();
             
-            LL_INFOS("AIProcessBridge") << "📤 Dequeued message for sending (type: '" << message.type 
-                     << "', id: '" << message.id << "'). Queue remaining: " 
-                     << outgoing_messages_.size() << LL_ENDL;
+            if (message.type == "environment_update") {
+                LL_DEBUGS("AIProcessBridge") << "📤 Dequeued message for sending (type: '" << message.type
+                         << "', id: '" << message.id << "'). Queue remaining: "
+                         << outgoing_messages_.size() << LL_ENDL;
+            } else {
+                LL_INFOS("AIProcessBridge") << "📤 Dequeued message for sending (type: '" << message.type
+                         << "', id: '" << message.id << "'). Queue remaining: "
+                         << outgoing_messages_.size() << LL_ENDL;
+            }
             
             lock.unlock();
             
             std::string json_msg = message.toJSON() + "\n";
             
-            LL_INFOS("AIProcessBridge") << "📡 Sending " << json_msg.length() 
-                     << " bytes to socket " << client_socket_ << ": '" << json_msg.substr(0, json_msg.length()-1) << "'" << LL_ENDL;
+            // LL_INFOS("AIProcessBridge") << "📡 Sending " << json_msg.length()
+            //          << " bytes to socket " << client_socket_ << ": '" << json_msg.substr(0, json_msg.length()-1) << "'" << LL_ENDL;
             
             int bytes_sent = send(client_socket_, json_msg.c_str(), static_cast<int>(json_msg.length()), 0);
             
@@ -902,9 +923,15 @@ void AIProcessBridge::messageWriterThread() {
             } else {
                 total_bytes_sent += bytes_sent;
                 message_count++;
-                LL_INFOS("AIProcessBridge") << "✅ Message sent successfully (" << bytes_sent 
-                         << " bytes, total: " << total_bytes_sent << " bytes, " 
-                         << message_count << " messages)" << LL_ENDL;
+                if (message.type == "environment_update") {
+                    LL_DEBUGS("AIProcessBridge") << "✅ Message sent successfully (" << bytes_sent
+                             << " bytes, total: " << total_bytes_sent << " bytes, "
+                             << message_count << " messages)" << LL_ENDL;
+                } else {
+                    LL_INFOS("AIProcessBridge") << "✅ Message sent successfully (" << bytes_sent
+                             << " bytes, total: " << total_bytes_sent << " bytes, "
+                             << message_count << " messages)" << LL_ENDL;
+                }
             }
             
             lock.lock();
