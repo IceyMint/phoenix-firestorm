@@ -20,6 +20,8 @@
 #include "llvoavatarself.h"
 #include "llpathfindingmanager.h"
 #include "llpathinglib.h"
+#include "pipeline.h"
+#include "llcallbacklist.h"
 #include "llstring.h"
 #include "llviewermenu.h"
 #include "llhudeffectlookat.h"
@@ -40,6 +42,8 @@
 #include <queue>
 #include <map>
 #include <memory>
+#include <tuple>
+#include <chrono>
 
 // Forward declarations
 void near_sit_down_point(bool success, void*);
@@ -54,15 +58,150 @@ const F64 kPathProbeRayHeightMeters = 6.0;
 const F64 kPersonSnapRadiusMeters = 2.5;
 const F32 kMoveAutopilotStopDistanceMeters = 0.5f;
 const F32 kMoveAutopilotRotationThreshold = 0.03f;
+const F64 kCustomProbeAvatarRadiusMeters = 0.45;
+const F64 kCustomProbeFootClearanceMeters = 0.20;
+const F64 kCustomProbeChestHeightMeters = 0.75;
+const F64 kCustomNodeSpacingMeters = 0.80;
+const F64 kCustomEdgeSampleMeters = 1.20;
+const F32 kCustomBroadPhaseExpandMeters = 0.60f;
+const F32 kCustomBroadPhaseCorridorHalfWidthMeters = 8.0f;
+const F32 kCustomBroadPhaseVerticalMarginMeters = 2.5f;
+const F64 kObjectApproachStandOffMinMeters = 0.30;
+const F64 kObjectApproachStandOffMidMeters = 0.55;
+const F64 kObjectApproachStandOffMaxMeters = 0.90;
+const F32 kMoveObjectFinalGoalToleranceMeters = 1.25f;
+const U32 kMovePathReplanAttempts = 2;
 
 struct MoveWaypointCallbackData
 {
     U64 plan_id;
     std::vector<LLVector3d> waypoints;
     size_t next_index;
+    LLVector3d final_goal;
+    F32 final_goal_tolerance;
+    U32 replans_remaining;
+    LLUUID follow_target_id;
+    F32 follow_standoff;
+};
+
+struct BroadPhaseObstacle
+{
+    LLBBox bbox_agent;
+    LLVector3 center_agent;
+    F32 radius_2d;
+    F32 min_z;
+    F32 max_z;
+};
+
+enum class MovePlanSource
+{
+    CUSTOM,
+    LEGACY,
+    FALLBACK_DIRECT
+};
+
+struct MovePlannerTelemetry
+{
+    U64 move_requests_total = 0;
+    U64 non_avatar_plan_requests = 0;
+    U64 person_follow_requests = 0;
+    U64 skipped_close_target = 0;
+
+    U64 custom_attempts = 0;
+    U64 custom_success = 0;
+    U64 legacy_attempts = 0;
+    U64 legacy_success = 0;
+    U64 fallback_direct = 0;
+    U64 avatar_los_direct_follow = 0;
+    U64 avatar_hybrid_path_attempts = 0;
+    U64 avatar_hybrid_path_success = 0;
+    U64 avatar_hybrid_follow_switch = 0;
+    U64 avatar_hybrid_follow_fallback = 0;
+    U64 blocked_abort_non_avatar = 0;
+    U64 blocked_abort_avatar = 0;
+
+    U64 waypoint_plan_starts = 0;
+    U64 waypoint_plan_completions = 0;
+    U64 waypoint_leg_failures = 0;
+    U64 replans_attempted = 0;
+    U64 replans_succeeded = 0;
+    U64 replans_failed = 0;
+
+    F64 custom_ms_total = 0.0;
+    F64 legacy_ms_total = 0.0;
 };
 
 U64 g_move_plan_generation = 0;
+MovePlannerTelemetry g_move_planner_telemetry;
+
+void gather_broad_phase_obstacles(
+    const LLVector3d& start,
+    const LLVector3d& goal,
+    std::vector<BroadPhaseObstacle>& obstacles_out);
+bool is_custom_node_walkable(
+    const LLVector3d& node_global,
+    const std::vector<BroadPhaseObstacle>& obstacles,
+    F64 pelvis_to_foot,
+    std::map<std::tuple<S32, S32, S32>, bool>& node_cache);
+
+F64 duration_ms(const std::chrono::steady_clock::time_point& start,
+                const std::chrono::steady_clock::time_point& end)
+{
+    return std::chrono::duration_cast<std::chrono::duration<F64, std::milli>>(end - start).count();
+}
+
+const char* move_plan_source_to_text(MovePlanSource source)
+{
+    switch (source)
+    {
+    case MovePlanSource::CUSTOM:
+        return "custom";
+    case MovePlanSource::LEGACY:
+        return "legacy";
+    case MovePlanSource::FALLBACK_DIRECT:
+        return "fallback_direct";
+    default:
+        return "unknown";
+    }
+}
+
+void maybe_log_move_planner_summary(const char* context)
+{
+    if ((g_move_planner_telemetry.move_requests_total % 10) != 0)
+    {
+        return;
+    }
+
+    const F64 avg_custom_ms = (g_move_planner_telemetry.custom_attempts > 0)
+        ? (g_move_planner_telemetry.custom_ms_total / static_cast<F64>(g_move_planner_telemetry.custom_attempts))
+        : 0.0;
+    const F64 avg_legacy_ms = (g_move_planner_telemetry.legacy_attempts > 0)
+        ? (g_move_planner_telemetry.legacy_ms_total / static_cast<F64>(g_move_planner_telemetry.legacy_attempts))
+        : 0.0;
+
+    LL_INFOS("AI") << "[AI] Move planner summary (" << context << "):"
+                   << " move_requests=" << g_move_planner_telemetry.move_requests_total
+                   << " non_avatar_plan_requests=" << g_move_planner_telemetry.non_avatar_plan_requests
+                   << " person_follow_requests=" << g_move_planner_telemetry.person_follow_requests
+                   << " skipped_close_target=" << g_move_planner_telemetry.skipped_close_target
+                   << " custom=" << g_move_planner_telemetry.custom_success << "/" << g_move_planner_telemetry.custom_attempts
+                   << " legacy=" << g_move_planner_telemetry.legacy_success << "/" << g_move_planner_telemetry.legacy_attempts
+                   << " fallback_direct=" << g_move_planner_telemetry.fallback_direct
+                   << " avatar_los_follow=" << g_move_planner_telemetry.avatar_los_direct_follow
+                   << " avatar_path=" << g_move_planner_telemetry.avatar_hybrid_path_success << "/" << g_move_planner_telemetry.avatar_hybrid_path_attempts
+                   << " avatar_follow_switch=" << g_move_planner_telemetry.avatar_hybrid_follow_switch
+                   << " avatar_follow_fallback=" << g_move_planner_telemetry.avatar_hybrid_follow_fallback
+                   << " blocked_abort_non_avatar=" << g_move_planner_telemetry.blocked_abort_non_avatar
+                   << " blocked_abort_avatar=" << g_move_planner_telemetry.blocked_abort_avatar
+                   << " waypoint_plans=" << g_move_planner_telemetry.waypoint_plan_starts
+                   << " completed=" << g_move_planner_telemetry.waypoint_plan_completions
+                   << " leg_failures=" << g_move_planner_telemetry.waypoint_leg_failures
+                   << " replans=" << g_move_planner_telemetry.replans_succeeded << "/" << g_move_planner_telemetry.replans_attempted
+                   << " replans_failed=" << g_move_planner_telemetry.replans_failed
+                   << " avg_custom_ms=" << avg_custom_ms
+                   << " avg_legacy_ms=" << avg_legacy_ms
+                   << LL_ENDL;
+}
 
 F32 clamp_move_standoff(F32 raw_standoff)
 {
@@ -144,15 +283,585 @@ bool find_closest_avatar_to_point(const LLVector3d& point, F64 max_distance, LLU
     return !avatar_id.isNull();
 }
 
-bool is_pathfinding_ready()
+const char* bool_to_text(bool value)
 {
-    LLPathfindingManager* manager = LLPathfindingManager::getInstance();
-    if (!manager || !manager->isPathfindingEnabledForCurrentRegion())
+    return value ? "yes" : "no";
+}
+
+LLVector3 global_to_agent_vec(const LLVector3d& global_pos)
+{
+    return gAgent.getPosAgentFromGlobal(global_pos);
+}
+
+F32 dist_sq_to_segment_2d(const LLVector3& point, const LLVector3& seg_start, const LLVector3& seg_end)
+{
+    const LLVector3 seg(seg_end.mV[VX] - seg_start.mV[VX], seg_end.mV[VY] - seg_start.mV[VY], 0.0f);
+    const LLVector3 from_start(point.mV[VX] - seg_start.mV[VX], point.mV[VY] - seg_start.mV[VY], 0.0f);
+    const F32 seg_len_sq = (seg.mV[VX] * seg.mV[VX]) + (seg.mV[VY] * seg.mV[VY]);
+
+    F32 t = 0.0f;
+    if (seg_len_sq > 0.0001f)
+    {
+        t = ((from_start.mV[VX] * seg.mV[VX]) + (from_start.mV[VY] * seg.mV[VY])) / seg_len_sq;
+        t = llclamp(t, 0.0f, 1.0f);
+    }
+
+    const F32 closest_x = seg_start.mV[VX] + seg.mV[VX] * t;
+    const F32 closest_y = seg_start.mV[VY] + seg.mV[VY] * t;
+    const F32 dx = point.mV[VX] - closest_x;
+    const F32 dy = point.mV[VY] - closest_y;
+    return (dx * dx) + (dy * dy);
+}
+
+bool raycast_hits_static_world(const LLVector3d& start_global, const LLVector3d& end_global)
+{
+    LLVector3 start_agent = global_to_agent_vec(start_global);
+    LLVector3 end_agent = global_to_agent_vec(end_global);
+    LLVector4a start4;
+    LLVector4a end4;
+    LLVector4a intersection;
+    start4.load3(start_agent.mV);
+    end4.load3(end_agent.mV);
+
+    S32 face_hit = -1;
+    LLViewerObject* hit = gPipeline.lineSegmentIntersectInWorld(
+        start4,
+        end4,
+        true,
+        false,
+        true,
+        false,
+        &face_hit,
+        nullptr,
+        nullptr,
+        &intersection,
+        nullptr,
+        nullptr,
+        nullptr);
+    if (!hit)
     {
         return false;
     }
+    if (hit->isAvatar() || hit->isAttachment())
+    {
+        return false;
+    }
+    return true;
+}
+
+F64 agent_pelvis_to_foot_meters()
+{
+    return (gAgentAvatarp != nullptr)
+        ? llmax(static_cast<F64>(gAgentAvatarp->getPelvisToFoot()), 0.65)
+        : 1.0;
+}
+
+bool has_clear_line_of_sight_to_avatar(const LLVector3d& from_global, const LLVector3d& avatar_global)
+{
+    const F64 pelvis_to_foot = agent_pelvis_to_foot_meters();
+
+    LLVector3d from_foot = from_global;
+    LLVector3d to_foot = avatar_global;
+    from_foot.mdV[VZ] = from_global.mdV[VZ] - pelvis_to_foot + kCustomProbeFootClearanceMeters;
+    to_foot.mdV[VZ] = avatar_global.mdV[VZ] - pelvis_to_foot + kCustomProbeFootClearanceMeters;
+
+    LLVector3d from_chest = from_global;
+    LLVector3d to_chest = avatar_global;
+    from_chest.mdV[VZ] = from_global.mdV[VZ] + kCustomProbeChestHeightMeters;
+    to_chest.mdV[VZ] = avatar_global.mdV[VZ] + kCustomProbeChestHeightMeters;
+
+    const bool foot_blocked = raycast_hits_static_world(from_foot, to_foot);
+    const bool chest_blocked = raycast_hits_static_world(from_chest, to_chest);
+    return !(foot_blocked || chest_blocked);
+}
+
+LLVector3d compute_avatar_approach_goal(const LLVector3d& from_global, const LLVector3d& avatar_global, F32 standoff)
+{
+    LLVector3d delta = avatar_global - from_global;
+    LLVector3d dir2d(delta.mdV[VX], delta.mdV[VY], 0.0);
+    const F64 dist2d = dir2d.length();
+    if (dist2d < 0.001)
+    {
+        return avatar_global;
+    }
+
+    dir2d.normalize();
+    const F64 desired_range = llmax(static_cast<F64>(standoff) + 0.8, 1.25);
+    LLVector3d goal(
+        avatar_global.mdV[VX] - (dir2d.mdV[VX] * desired_range),
+        avatar_global.mdV[VY] - (dir2d.mdV[VY] * desired_range),
+        avatar_global.mdV[VZ]
+    );
+    return goal;
+}
+
+bool compute_object_approach_goal(const LLVector3d& from_global, const LLViewerObject* objectp, LLVector3d& goal_out)
+{
+    if (!objectp || objectp->isDead() || objectp->isAvatar() || objectp->isAttachment())
+    {
+        return false;
+    }
+
+    LLViewerRegion* agent_region = gAgent.getRegion();
+    if (!agent_region || objectp->getRegion() != agent_region)
+    {
+        return false;
+    }
+
+    const LLVector3d object_pos = objectp->getPositionGlobal();
+    std::vector<BroadPhaseObstacle> obstacles;
+    gather_broad_phase_obstacles(from_global, object_pos, obstacles);
+    std::map<std::tuple<S32, S32, S32>, bool> node_cache;
+    const F64 pelvis_to_foot = agent_pelvis_to_foot_meters();
+
+    const LLBBox bbox_agent = objectp->getBoundingBoxAgent().getAxisAligned();
+    const LLVector3 min_agent = bbox_agent.getMinAgent();
+    const LLVector3 max_agent = bbox_agent.getMaxAgent();
+    const LLVector3 center_agent = (min_agent + max_agent) * 0.5f;
+    const F64 half_x = llmax<F64>((max_agent.mV[VX] - min_agent.mV[VX]) * 0.5, 0.10);
+    const F64 half_y = llmax<F64>((max_agent.mV[VY] - min_agent.mV[VY]) * 0.5, 0.10);
+
+    LLVector3 from_agent = global_to_agent_vec(from_global);
+    LLVector3d preferred_dir(
+        static_cast<F64>(from_agent.mV[VX] - center_agent.mV[VX]),
+        static_cast<F64>(from_agent.mV[VY] - center_agent.mV[VY]),
+        0.0);
+    if (preferred_dir.length() < 0.001)
+    {
+        preferred_dir.setVec(1.0, 0.0, 0.0);
+    }
+    preferred_dir.normalize();
+
+    static const F64 kPi = 3.14159265358979323846;
+    static const F64 kAngleOffsets[] = {
+        0.0,
+        (20.0 * kPi) / 180.0, -(20.0 * kPi) / 180.0,
+        (45.0 * kPi) / 180.0, -(45.0 * kPi) / 180.0,
+        (70.0 * kPi) / 180.0, -(70.0 * kPi) / 180.0,
+        (110.0 * kPi) / 180.0, -(110.0 * kPi) / 180.0,
+        (160.0 * kPi) / 180.0, -(160.0 * kPi) / 180.0
+    };
+    static const F64 kStandOffs[] = {
+        kObjectApproachStandOffMinMeters,
+        kObjectApproachStandOffMidMeters,
+        kObjectApproachStandOffMaxMeters
+    };
+
+    const F64 base_angle = std::atan2(preferred_dir.mdV[VY], preferred_dir.mdV[VX]);
+
+    bool found = false;
+    LLVector3d best_goal;
+    F64 best_center_distance = std::numeric_limits<F64>::max();
+    F64 best_agent_distance = std::numeric_limits<F64>::max();
+
+    for (F64 stand_off : kStandOffs)
+    {
+        for (F64 angle_offset : kAngleOffsets)
+        {
+            const F64 theta = base_angle + angle_offset;
+            const F64 dir_x = std::cos(theta);
+            const F64 dir_y = std::sin(theta);
+
+            const F64 tx = (std::fabs(dir_x) > 0.001) ? (half_x / std::fabs(dir_x)) : std::numeric_limits<F64>::max();
+            const F64 ty = (std::fabs(dir_y) > 0.001) ? (half_y / std::fabs(dir_y)) : std::numeric_limits<F64>::max();
+            const F64 boundary_t = llmin(tx, ty);
+            if (!std::isfinite(boundary_t))
+            {
+                continue;
+            }
+
+            LLVector3 candidate_agent(
+                center_agent.mV[VX] + static_cast<F32>((boundary_t + stand_off) * dir_x),
+                center_agent.mV[VY] + static_cast<F32>((boundary_t + stand_off) * dir_y),
+                center_agent.mV[VZ]);
+            LLVector3d candidate_global = gAgent.getPosGlobalFromAgent(candidate_agent);
+            candidate_global.mdV[VZ] = object_pos.mdV[VZ];
+
+            if (!is_custom_node_walkable(candidate_global, obstacles, pelvis_to_foot, node_cache))
+            {
+                continue;
+            }
+
+            const F64 center_distance = dist_vec(candidate_global, object_pos);
+            const F64 agent_distance = dist_vec(candidate_global, from_global);
+            const bool is_better =
+                !found ||
+                (center_distance < best_center_distance - 0.05) ||
+                ((std::fabs(center_distance - best_center_distance) <= 0.05) && (agent_distance < best_agent_distance));
+            if (!is_better)
+            {
+                continue;
+            }
+
+            found = true;
+            best_goal = candidate_global;
+            best_center_distance = center_distance;
+            best_agent_distance = agent_distance;
+        }
+    }
+
+    if (!found)
+    {
+        return false;
+    }
+
+    goal_out = best_goal;
+    return true;
+}
+
+void gather_broad_phase_obstacles(
+    const LLVector3d& start,
+    const LLVector3d& goal,
+    std::vector<BroadPhaseObstacle>& obstacles_out)
+{
+    obstacles_out.clear();
+    LLViewerRegion* agent_region = gAgent.getRegion();
+    if (!agent_region)
+    {
+        return;
+    }
+
+    const LLVector3d plan_center_global = (start + goal) * 0.5;
+    const LLVector3 plan_center_agent = global_to_agent_vec(plan_center_global);
+    const F32 plan_radius = llmax(static_cast<F32>(dist_vec(start, goal) * 0.5), 12.0f) + 10.0f;
+    const F32 plan_min_z = static_cast<F32>(llmin(start.mdV[VZ], goal.mdV[VZ]) - kCustomBroadPhaseVerticalMarginMeters);
+    const F32 plan_max_z = static_cast<F32>(llmax(start.mdV[VZ], goal.mdV[VZ]) + kCustomBroadPhaseVerticalMarginMeters);
+    const LLVector3 start_agent = global_to_agent_vec(start);
+    const LLVector3 goal_agent = global_to_agent_vec(goal);
+    const F32 corridor_half_width = kCustomBroadPhaseCorridorHalfWidthMeters;
+
+    obstacles_out.reserve(256);
+    const S32 object_count = gObjectList.getNumObjects();
+    for (S32 i = 0; i < object_count; ++i)
+    {
+        LLViewerObject* objectp = gObjectList.getObject(i);
+        if (!objectp || objectp->isDead() || objectp->isAvatar() || objectp->isAttachment())
+        {
+            continue;
+        }
+        if (objectp->getRegion() != agent_region)
+        {
+            continue;
+        }
+
+        LLBBox bbox_agent = objectp->getBoundingBoxAgent().getAxisAligned();
+        bbox_agent.expand(kCustomBroadPhaseExpandMeters);
+        const LLVector3 min_agent = bbox_agent.getMinAgent();
+        const LLVector3 max_agent = bbox_agent.getMaxAgent();
+        const LLVector3 center_agent = (min_agent + max_agent) * 0.5f;
+        const F32 half_x = (max_agent.mV[VX] - min_agent.mV[VX]) * 0.5f;
+        const F32 half_y = (max_agent.mV[VY] - min_agent.mV[VY]) * 0.5f;
+        const F32 radius_2d = std::sqrt((half_x * half_x) + (half_y * half_y));
+
+        const F32 dx = center_agent.mV[VX] - plan_center_agent.mV[VX];
+        const F32 dy = center_agent.mV[VY] - plan_center_agent.mV[VY];
+        const F32 max_xy = plan_radius + radius_2d;
+        if ((dx * dx) + (dy * dy) > (max_xy * max_xy))
+        {
+            continue;
+        }
+
+        const F32 corridor_limit = corridor_half_width + radius_2d;
+        const F32 dist_sq_to_path = dist_sq_to_segment_2d(center_agent, start_agent, goal_agent);
+        if (dist_sq_to_path > (corridor_limit * corridor_limit))
+        {
+            continue;
+        }
+
+        const LLVector3d min_global = gAgent.getPosGlobalFromAgent(min_agent);
+        const LLVector3d max_global = gAgent.getPosGlobalFromAgent(max_agent);
+        const F32 min_z = static_cast<F32>(llmin(min_global.mdV[VZ], max_global.mdV[VZ]));
+        const F32 max_z = static_cast<F32>(llmax(min_global.mdV[VZ], max_global.mdV[VZ]));
+        if (max_z < plan_min_z || min_z > plan_max_z)
+        {
+            continue;
+        }
+
+        BroadPhaseObstacle obstacle;
+        obstacle.bbox_agent = bbox_agent;
+        obstacle.center_agent = center_agent;
+        obstacle.radius_2d = radius_2d;
+        obstacle.min_z = min_z;
+        obstacle.max_z = max_z;
+        obstacles_out.push_back(obstacle);
+    }
+}
+
+bool is_point_near_broad_phase(const LLVector3d& point_global, const std::vector<BroadPhaseObstacle>& obstacles)
+{
+    const LLVector3 point_agent = global_to_agent_vec(point_global);
+    for (const BroadPhaseObstacle& obstacle : obstacles)
+    {
+        const F32 dz = static_cast<F32>(point_global.mdV[VZ]) - ((obstacle.min_z + obstacle.max_z) * 0.5f);
+        const F32 hz = (obstacle.max_z - obstacle.min_z) * 0.5f + kCustomBroadPhaseVerticalMarginMeters;
+        if (std::fabs(dz) > hz)
+        {
+            continue;
+        }
+        const F32 dx = point_agent.mV[VX] - obstacle.center_agent.mV[VX];
+        const F32 dy = point_agent.mV[VY] - obstacle.center_agent.mV[VY];
+        const F32 max_xy = obstacle.radius_2d + 1.0f;
+        if ((dx * dx) + (dy * dy) > (max_xy * max_xy))
+        {
+            continue;
+        }
+        return true;
+    }
+    return false;
+}
+
+std::tuple<S32, S32, S32> quantized_point_key(const LLVector3d& point_global, F64 scale = 2.0)
+{
+    return std::make_tuple(
+        static_cast<S32>(std::llround(point_global.mdV[VX] * scale)),
+        static_cast<S32>(std::llround(point_global.mdV[VY] * scale)),
+        static_cast<S32>(std::llround(point_global.mdV[VZ] * scale)));
+}
+
+bool is_custom_node_walkable(
+    const LLVector3d& node_global,
+    const std::vector<BroadPhaseObstacle>& obstacles,
+    F64 pelvis_to_foot,
+    std::map<std::tuple<S32, S32, S32>, bool>& node_cache)
+{
+    const auto key = quantized_point_key(node_global);
+    auto cache_it = node_cache.find(key);
+    if (cache_it != node_cache.end())
+    {
+        return cache_it->second;
+    }
+
+    bool walkable = true;
+    LLViewerRegion* agent_region = gAgent.getRegion();
+    if (!agent_region || LLWorld::getInstance()->getRegionFromPosGlobal(node_global) != agent_region)
+    {
+        walkable = false;
+    }
+
+    if (walkable)
+    {
+        const F64 foot_z = node_global.mdV[VZ] - pelvis_to_foot + kCustomProbeFootClearanceMeters;
+        const F64 chest_z = node_global.mdV[VZ] + kCustomProbeChestHeightMeters;
+
+        const F64 land_z = static_cast<F64>(LLWorld::getInstance()->resolveLandHeightGlobal(node_global));
+        if ((foot_z - land_z) > 3.5)
+        {
+            LLVector3d floor_probe_a = node_global;
+            LLVector3d floor_probe_b = node_global;
+            floor_probe_a.mdV[VZ] = foot_z + 0.20;
+            floor_probe_b.mdV[VZ] = foot_z - 3.50;
+            if (!raycast_hits_static_world(floor_probe_a, floor_probe_b))
+            {
+                walkable = false;
+            }
+        }
+
+        if (walkable)
+        {
+            static const F64 kTwoPi = 6.28318530717958647692;
+            static const int kRingSteps = 8;
+
+            LLVector3d sample = node_global;
+            sample.mdV[VZ] = foot_z;
+            const bool center_near_obstacle = is_point_near_broad_phase(sample, obstacles);
+            if (center_near_obstacle)
+            {
+                LLVector3d center_foot = sample;
+                LLVector3d center_chest = sample;
+                center_chest.mdV[VZ] = chest_z;
+                if (raycast_hits_static_world(center_foot, center_chest))
+                {
+                    walkable = false;
+                }
+            }
+
+            for (int i = 0; walkable && i < kRingSteps; ++i)
+            {
+                const F64 theta = (kTwoPi * i) / static_cast<F64>(kRingSteps);
+                const F64 dx = std::cos(theta) * kCustomProbeAvatarRadiusMeters;
+                const F64 dy = std::sin(theta) * kCustomProbeAvatarRadiusMeters;
+                LLVector3d sample_point(node_global.mdV[VX] + dx, node_global.mdV[VY] + dy, node_global.mdV[VZ]);
+                LLVector3d foot_point = sample_point;
+                LLVector3d chest_point = sample_point;
+                foot_point.mdV[VZ] = foot_z;
+                chest_point.mdV[VZ] = chest_z;
+
+                if (!is_point_near_broad_phase(foot_point, obstacles) &&
+                    !is_point_near_broad_phase(chest_point, obstacles))
+                {
+                    continue;
+                }
+                if (raycast_hits_static_world(foot_point, chest_point))
+                {
+                    walkable = false;
+                }
+            }
+        }
+    }
+
+    node_cache[key] = walkable;
+    return walkable;
+}
+
+bool is_custom_segment_walkable(
+    const LLVector3d& a,
+    const LLVector3d& b,
+    const std::vector<BroadPhaseObstacle>& obstacles,
+    F64 pelvis_to_foot,
+    std::map<std::tuple<S32, S32, S32>, bool>& node_cache)
+{
+    const F64 length = dist_vec(a, b);
+    if (length < 0.05)
+    {
+        return true;
+    }
+
+    LLVector3d dir = b - a;
+    LLVector3d dir2d(dir.mdV[VX], dir.mdV[VY], 0.0);
+    const F64 dir_len = dir2d.length();
+    LLVector3d perp(0.0, 0.0, 0.0);
+    if (dir_len > 0.0001)
+    {
+        dir2d.normalize();
+        perp.setVec(-dir2d.mdV[VY], dir2d.mdV[VX], 0.0);
+    }
+
+    static const F64 kOffsets[] = {0.0, kCustomProbeAvatarRadiusMeters * 0.9, -kCustomProbeAvatarRadiusMeters * 0.9};
+    for (F64 lateral : kOffsets)
+    {
+        LLVector3d lateral_offset = perp * lateral;
+        LLVector3d foot_a = a + lateral_offset;
+        LLVector3d foot_b = b + lateral_offset;
+        LLVector3d chest_a = a + lateral_offset;
+        LLVector3d chest_b = b + lateral_offset;
+
+        foot_a.mdV[VZ] = a.mdV[VZ] - pelvis_to_foot + kCustomProbeFootClearanceMeters;
+        foot_b.mdV[VZ] = b.mdV[VZ] - pelvis_to_foot + kCustomProbeFootClearanceMeters;
+        chest_a.mdV[VZ] = a.mdV[VZ] + kCustomProbeChestHeightMeters;
+        chest_b.mdV[VZ] = b.mdV[VZ] + kCustomProbeChestHeightMeters;
+
+        const bool foot_blocked = raycast_hits_static_world(foot_a, foot_b);
+        const bool chest_blocked = raycast_hits_static_world(chest_a, chest_b);
+        if (foot_blocked || chest_blocked)
+        {
+            return false;
+        }
+    }
+
+    const F64 sample_step = kCustomEdgeSampleMeters;
+    const S32 sample_count = llclamp(static_cast<S32>(std::ceil(length / sample_step)), 1, 96);
+    for (S32 i = 1; i < sample_count; ++i)
+    {
+        const F64 t = static_cast<F64>(i) / static_cast<F64>(sample_count);
+        const LLVector3d sample = a + ((b - a) * t);
+        if (!is_custom_node_walkable(sample, obstacles, pelvis_to_foot, node_cache))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool has_direct_clearance_route(const LLVector3d& start, const LLVector3d& goal)
+{
+    LLViewerRegion* agent_region = gAgent.getRegion();
+    if (!agent_region)
+    {
+        return false;
+    }
+
+    std::vector<BroadPhaseObstacle> obstacles;
+    gather_broad_phase_obstacles(start, goal, obstacles);
+    std::map<std::tuple<S32, S32, S32>, bool> node_cache;
+    const F64 pelvis_to_foot = agent_pelvis_to_foot_meters();
+    return is_custom_segment_walkable(start, goal, obstacles, pelvis_to_foot, node_cache);
+}
+
+void log_pathfinding_diagnostics(const char* context)
+{
+    LLViewerRegion* region = gAgent.getRegion();
+    LLPathfindingManager* manager = LLPathfindingManager::getInstance();
     LLPathingLib* pathing = LLPathingLib::getInstance();
-    return (pathing != nullptr) && pathing->isFunctional();
+
+    if (!region)
+    {
+        LL_INFOS("AI") << "[AI] Pathfinding diag (" << context << "): no current region"
+                       << " manager=" << bool_to_text(manager != nullptr)
+                       << " pathing_lib=" << bool_to_text(pathing != nullptr)
+                       << LL_ENDL;
+        return;
+    }
+
+    const bool caps_received = region->capabilitiesReceived();
+    const bool sim_features_received = region->simulatorFeaturesReceived();
+    const bool dynamic_enabled = region->dynamicPathfindingEnabled();
+    const bool manager_enabled = manager && manager->isPathfindingEnabledForCurrentRegion();
+    const bool pathing_functional = pathing && pathing->isFunctional();
+
+    std::string retrieve_navmesh_cap;
+    std::string navmesh_status_cap;
+    std::string character_props_cap;
+    if (caps_received)
+    {
+        retrieve_navmesh_cap = region->getCapability("RetrieveNavMeshSrc");
+        navmesh_status_cap = region->getCapability("NavMeshGenerationStatus");
+        character_props_cap = region->getCapability("CharacterProperties");
+    }
+
+    std::string reason = "ready";
+    if (!manager)
+    {
+        reason = "missing_llpathfindingmanager";
+    }
+    else if (!caps_received)
+    {
+        reason = "region_capabilities_not_received";
+    }
+    else if (!manager_enabled)
+    {
+        reason = "manager_reports_not_enabled_for_region";
+    }
+    else if (!pathing)
+    {
+        reason = "missing_llpathinglib";
+    }
+    else if (!pathing_functional)
+    {
+        reason = "llpathinglib_not_functional";
+    }
+
+    LL_INFOS("AI") << "[AI] Pathfinding diag (" << context << "): "
+                   << "region=\"" << region->getName() << "\" "
+                   << "region_id=" << region->getRegionID().asString() << " "
+                   << "caps_received=" << bool_to_text(caps_received) << " "
+                   << "sim_features_received=" << bool_to_text(sim_features_received) << " "
+                   << "DynamicPathfindingEnabled=" << bool_to_text(dynamic_enabled) << " "
+                   << "RetrieveNavMeshSrc_cap=" << bool_to_text(!retrieve_navmesh_cap.empty()) << " "
+                   << "NavMeshGenerationStatus_cap=" << bool_to_text(!navmesh_status_cap.empty()) << " "
+                   << "CharacterProperties_cap=" << bool_to_text(!character_props_cap.empty()) << " "
+                   << "manager_present=" << bool_to_text(manager != nullptr) << " "
+                   << "manager_enabled=" << bool_to_text(manager_enabled) << " "
+                   << "pathinglib_present=" << bool_to_text(pathing != nullptr) << " "
+                   << "pathinglib_functional=" << bool_to_text(pathing_functional) << " "
+                   << "reason=" << reason
+                   << LL_ENDL;
+}
+
+bool is_pathfinding_ready()
+{
+    LLPathfindingManager* manager = LLPathfindingManager::getInstance();
+    const bool manager_enabled = manager && manager->isPathfindingEnabledForCurrentRegion();
+    LLPathingLib* pathing = LLPathingLib::getInstance();
+    const bool pathing_functional = (pathing != nullptr) && pathing->isFunctional();
+    const bool ready = manager_enabled && pathing_functional;
+
+    log_pathfinding_diagnostics("is_pathfinding_ready");
+
+    if (!ready)
+    {
+        return false;
+    }
+    return true;
 }
 
 bool probe_path_exists(const LLVector3d& from_global, const LLVector3d& to_global)
@@ -349,6 +1058,7 @@ bool plan_probe_route(const LLVector3d& start, const LLVector3d& goal, std::vect
     {
         direct_out = true;
         waypoints_out.push_back(goal);
+        LL_INFOS("AI") << "[AI] Path planner: direct path probe succeeded; single-leg route" << LL_ENDL;
         return true;
     }
 
@@ -363,6 +1073,9 @@ bool plan_probe_route(const LLVector3d& start, const LLVector3d& goal, std::vect
     const int kNeighbors = 10;
     std::vector<std::vector<std::pair<int, F64>>> adjacency(nodes.size());
     std::map<U64, bool> edge_probe_cache;
+    size_t edge_probe_calls = 0;
+    size_t edge_probe_hits = 0;
+    size_t edge_probe_successes = 0;
     auto edge_key = [](int a, int b) -> U64 {
         const U64 lo = static_cast<U64>(std::min(a, b));
         const U64 hi = static_cast<U64>(std::max(a, b));
@@ -373,10 +1086,16 @@ bool plan_probe_route(const LLVector3d& start, const LLVector3d& goal, std::vect
         auto it = edge_probe_cache.find(key);
         if (it != edge_probe_cache.end())
         {
+            ++edge_probe_hits;
             return it->second;
         }
+        ++edge_probe_calls;
         const bool ok = probe_path_exists(nodes[a], nodes[b]);
         edge_probe_cache[key] = ok;
+        if (ok)
+        {
+            ++edge_probe_successes;
+        }
         return ok;
     };
 
@@ -402,6 +1121,11 @@ bool plan_probe_route(const LLVector3d& start, const LLVector3d& goal, std::vect
     std::vector<int> path = astar_path(adjacency, nodes, start_idx, goal_idx);
     if (path.size() < 2)
     {
+        LL_INFOS("AI") << "[AI] Path planner: no A* route. nodes=" << nodes.size()
+                       << " edge_probes=" << edge_probe_calls
+                       << " edge_cache_hits=" << edge_probe_hits
+                       << " edge_successes=" << edge_probe_successes
+                       << LL_ENDL;
         return false;
     }
 
@@ -436,6 +1160,12 @@ bool plan_probe_route(const LLVector3d& start, const LLVector3d& goal, std::vect
 
     if (waypoints_out.empty())
     {
+        LL_INFOS("AI") << "[AI] Path planner: compressed route had no usable waypoints"
+                       << " path_nodes=" << path.size()
+                       << " edge_probes=" << edge_probe_calls
+                       << " edge_cache_hits=" << edge_probe_hits
+                       << " edge_successes=" << edge_probe_successes
+                       << LL_ENDL;
         return false;
     }
     if (dist_vec(waypoints_out.back(), goal) > 0.5)
@@ -443,21 +1173,244 @@ bool plan_probe_route(const LLVector3d& start, const LLVector3d& goal, std::vect
         waypoints_out.push_back(goal);
     }
 
+    LL_INFOS("AI") << "[AI] Path planner: route ready"
+                   << " nodes=" << nodes.size()
+                   << " path_nodes=" << path.size()
+                   << " waypoints=" << waypoints_out.size()
+                   << " edge_probes=" << edge_probe_calls
+                   << " edge_cache_hits=" << edge_probe_hits
+                   << " edge_successes=" << edge_probe_successes
+                   << LL_ENDL;
+
+    return true;
+}
+
+bool plan_custom_clearance_route(const LLVector3d& start, const LLVector3d& goal, std::vector<LLVector3d>& waypoints_out, bool& direct_out)
+{
+    waypoints_out.clear();
+    direct_out = false;
+
+    LLViewerRegion* agent_region = gAgent.getRegion();
+    if (!agent_region)
+    {
+        return false;
+    }
+
+    const F64 pelvis_to_foot = (gAgentAvatarp != nullptr)
+        ? llmax(static_cast<F64>(gAgentAvatarp->getPelvisToFoot()), 0.65)
+        : 1.0;
+
+    std::vector<BroadPhaseObstacle> obstacles;
+    gather_broad_phase_obstacles(start, goal, obstacles);
+
+    std::map<std::tuple<S32, S32, S32>, bool> node_cache;
+    auto node_walkable = [&](const LLVector3d& node) -> bool {
+        return is_custom_node_walkable(node, obstacles, pelvis_to_foot, node_cache);
+    };
+    auto segment_walkable = [&](const LLVector3d& a, const LLVector3d& b) -> bool {
+        return is_custom_segment_walkable(a, b, obstacles, pelvis_to_foot, node_cache);
+    };
+
+    if (segment_walkable(start, goal))
+    {
+        direct_out = true;
+        waypoints_out.push_back(goal);
+        LL_INFOS("AI") << "[AI] Custom planner: direct clearance route succeeded; single-leg route"
+                       << " obstacles=" << obstacles.size()
+                       << LL_ENDL;
+        return true;
+    }
+
+    std::vector<LLVector3d> nodes = build_probe_nodes(start, goal);
+
+    // Add denser corridor samples so hallways survive coarse mesh/object metadata.
+    LLVector3d delta = goal - start;
+    LLVector3d dir2d(delta.mdV[VX], delta.mdV[VY], 0.0);
+    const F64 dir_mag = dir2d.length();
+    if (dir_mag > 0.001)
+    {
+        dir2d.normalize();
+        LLVector3d perp(-dir2d.mdV[VY], dir2d.mdV[VX], 0.0);
+        static const F32 kTValues[] = {0.1f, 0.2f, 0.3f, 0.4f, 0.5f, 0.6f, 0.7f, 0.8f, 0.9f};
+        static const F32 kOffsets[] = {-8.0f, -6.0f, -4.0f, -2.0f, 0.0f, 2.0f, 4.0f, 6.0f, 8.0f};
+        for (F32 t : kTValues)
+        {
+            LLVector3d center = start + (delta * t);
+            for (F32 offset : kOffsets)
+            {
+                LLVector3d candidate = center + (perp * offset);
+                add_unique_node(nodes, candidate, kCustomNodeSpacingMeters);
+            }
+        }
+    }
+
+    std::vector<LLVector3d> walkable_nodes;
+    walkable_nodes.reserve(nodes.size());
+    size_t rejected_nodes = 0;
+    for (size_t i = 0; i < nodes.size(); ++i)
+    {
+        const LLVector3d& candidate = nodes[i];
+        if ((i < 2) || node_walkable(candidate))
+        {
+            add_unique_node(walkable_nodes, candidate, (i < 2) ? 0.01 : kCustomNodeSpacingMeters);
+        }
+        else
+        {
+            ++rejected_nodes;
+        }
+    }
+
+    if (walkable_nodes.size() < 2)
+    {
+        LL_INFOS("AI") << "[AI] Custom planner: no walkable nodes after clearance filtering"
+                       << " candidates=" << nodes.size()
+                       << " rejected=" << rejected_nodes
+                       << LL_ENDL;
+        return false;
+    }
+
+    const int start_idx = 0;
+    const int goal_idx = 1;
+    const int kNeighbors = 12;
+    std::vector<std::vector<std::pair<int, F64>>> adjacency(walkable_nodes.size());
+    std::map<U64, bool> edge_cache;
+    size_t edge_tests = 0;
+    size_t edge_hits = 0;
+    size_t edge_successes = 0;
+    auto edge_key = [](int a, int b) -> U64 {
+        const U64 lo = static_cast<U64>(std::min(a, b));
+        const U64 hi = static_cast<U64>(std::max(a, b));
+        return (lo << 32) | hi;
+    };
+    auto probe_edge = [&](int a, int b) -> bool {
+        const U64 key = edge_key(a, b);
+        auto it = edge_cache.find(key);
+        if (it != edge_cache.end())
+        {
+            ++edge_hits;
+            return it->second;
+        }
+        ++edge_tests;
+        const bool ok = segment_walkable(walkable_nodes[a], walkable_nodes[b]);
+        edge_cache[key] = ok;
+        if (ok)
+        {
+            ++edge_successes;
+        }
+        return ok;
+    };
+
+    for (int i = 0; i < static_cast<int>(walkable_nodes.size()); ++i)
+    {
+        std::vector<int> neighbors = nearest_neighbor_indices(walkable_nodes, i, kNeighbors);
+        for (int j : neighbors)
+        {
+            if (i >= j)
+            {
+                continue;
+            }
+            if (!probe_edge(i, j))
+            {
+                continue;
+            }
+            const F64 cost = dist_vec(walkable_nodes[i], walkable_nodes[j]);
+            adjacency[i].push_back({j, cost});
+            adjacency[j].push_back({i, cost});
+        }
+    }
+
+    std::vector<int> path = astar_path(adjacency, walkable_nodes, start_idx, goal_idx);
+    if (path.size() < 2)
+    {
+        LL_INFOS("AI") << "[AI] Custom planner: no A* route"
+                       << " nodes=" << walkable_nodes.size()
+                       << " obstacles=" << obstacles.size()
+                       << " rejected_nodes=" << rejected_nodes
+                       << " edge_tests=" << edge_tests
+                       << " edge_cache_hits=" << edge_hits
+                       << " edge_successes=" << edge_successes
+                       << LL_ENDL;
+        return false;
+    }
+
+    std::vector<int> compressed;
+    compressed.push_back(path.front());
+    size_t cursor = 0;
+    while (cursor < path.size() - 1)
+    {
+        size_t best_next = cursor + 1;
+        for (size_t j = path.size() - 1; j > cursor; --j)
+        {
+            if (probe_edge(path[cursor], path[j]))
+            {
+                best_next = j;
+                break;
+            }
+        }
+        compressed.push_back(path[best_next]);
+        cursor = best_next;
+    }
+
+    for (size_t i = 1; i < compressed.size(); ++i)
+    {
+        const LLVector3d& wp = walkable_nodes[compressed[i]];
+        if (!waypoints_out.empty() && dist_vec(waypoints_out.back(), wp) < 0.5)
+        {
+            continue;
+        }
+        waypoints_out.push_back(wp);
+    }
+
+    if (waypoints_out.empty())
+    {
+        LL_INFOS("AI") << "[AI] Custom planner: compressed route had no waypoints"
+                       << " path_nodes=" << path.size()
+                       << LL_ENDL;
+        return false;
+    }
+    if (dist_vec(waypoints_out.back(), goal) > 0.5)
+    {
+        waypoints_out.push_back(goal);
+    }
+
+    LL_INFOS("AI") << "[AI] Custom planner: route ready"
+                   << " obstacles=" << obstacles.size()
+                   << " nodes=" << walkable_nodes.size()
+                   << " rejected_nodes=" << rejected_nodes
+                   << " path_nodes=" << path.size()
+                   << " waypoints=" << waypoints_out.size()
+                   << " edge_tests=" << edge_tests
+                   << " edge_cache_hits=" << edge_hits
+                   << " edge_successes=" << edge_successes
+                   << LL_ENDL;
     return true;
 }
 
 void ai_move_waypoint_callback(bool success, void* user_data);
 
-void start_move_path_plan(U64 plan_id, const std::vector<LLVector3d>& waypoints)
+void start_move_path_plan(
+    U64 plan_id,
+    const std::vector<LLVector3d>& waypoints,
+    U32 replans_remaining = kMovePathReplanAttempts,
+    const LLVector3d* final_goal_override = nullptr,
+    const LLUUID* follow_target_id_override = nullptr,
+    F32 follow_standoff = kDefaultMoveStandoffMeters,
+    F32 final_goal_tolerance = kMoveAutopilotStopDistanceMeters)
 {
     if (waypoints.empty())
     {
         return;
     }
+    ++g_move_planner_telemetry.waypoint_plan_starts;
     MoveWaypointCallbackData* cb_data = new MoveWaypointCallbackData();
     cb_data->plan_id = plan_id;
     cb_data->waypoints = waypoints;
     cb_data->next_index = 1;
+    cb_data->final_goal = final_goal_override ? *final_goal_override : waypoints.back();
+    cb_data->final_goal_tolerance = llmax(final_goal_tolerance, kMoveAutopilotStopDistanceMeters);
+    cb_data->replans_remaining = replans_remaining;
+    cb_data->follow_target_id = follow_target_id_override ? *follow_target_id_override : LLUUID::null;
+    cb_data->follow_standoff = clamp_move_standoff(follow_standoff);
     gAgent.startAutoPilotGlobal(
         waypoints[0],
         "AI Movement Waypoint",
@@ -481,6 +1434,11 @@ void ai_move_waypoint_callback(bool success, void* user_data)
     const U64 callback_plan_id = cb_data->plan_id;
     const std::vector<LLVector3d> waypoints = cb_data->waypoints;
     const size_t next_index = cb_data->next_index;
+    const LLVector3d final_goal = cb_data->final_goal;
+    const F32 final_goal_tolerance = cb_data->final_goal_tolerance;
+    const U32 replans_remaining = cb_data->replans_remaining;
+    const LLUUID follow_target_id = cb_data->follow_target_id;
+    const F32 follow_standoff = cb_data->follow_standoff;
     delete cb_data;
 
     if (callback_plan_id != g_move_plan_generation)
@@ -488,15 +1446,243 @@ void ai_move_waypoint_callback(bool success, void* user_data)
         return; // stale plan
     }
 
+    // Avatar-targeted plans switch to follow-pilot as soon as LoS (or standoff) is good enough.
+    if (!follow_target_id.isNull())
+    {
+        LLVector3d avatar_pos;
+        if (resolve_avatar_position(follow_target_id, avatar_pos))
+        {
+            const LLVector3d current_pos = gAgent.getPositionGlobal();
+            const F64 avatar_distance = dist_vec(current_pos, avatar_pos);
+            const bool los_clear = has_clear_line_of_sight_to_avatar(current_pos, avatar_pos);
+            if (avatar_distance <= follow_standoff || los_clear)
+            {
+                ++g_move_planner_telemetry.person_follow_requests;
+                ++g_move_planner_telemetry.avatar_hybrid_follow_switch;
+                gAgent.stopAutoPilot();
+                const U64 follow_plan_id = callback_plan_id;
+                doOnIdleOneTime([follow_target_id, follow_standoff, follow_plan_id]()
+                {
+                    if (follow_plan_id != g_move_plan_generation)
+                    {
+                        return;
+                    }
+                    gAgent.startFollowPilot(follow_target_id, false, follow_standoff);
+                });
+                LL_INFOS("AI") << "[AI] Avatar LoS/standoff reached during waypoint plan; switching to follow pilot target="
+                               << follow_target_id.asString()
+                               << " dist=" << avatar_distance
+                               << " los=" << (los_clear ? "yes" : "no")
+                               << LL_ENDL;
+                maybe_log_move_planner_summary("ai_move_waypoint_callback");
+                return;
+            }
+        }
+    }
+
     if (!success)
     {
-        LL_WARNS("AI") << "[AI] Waypoint leg did not complete; skipping final leg" << LL_ENDL;
+        ++g_move_planner_telemetry.waypoint_leg_failures;
+        const LLVector3d current_pos = gAgent.getPositionGlobal();
+        const F64 dist_to_final = dist_vec(current_pos, final_goal);
+        if (follow_target_id.isNull() && dist_to_final <= final_goal_tolerance)
+        {
+            ++g_move_planner_telemetry.waypoint_plan_completions;
+            LL_INFOS("AI") << "[AI] Waypoint leg reported failure, but final goal tolerance met; accepting completion"
+                           << " dist_to_final=" << dist_to_final
+                           << " tolerance=" << final_goal_tolerance
+                           << LL_ENDL;
+            maybe_log_move_planner_summary("ai_move_waypoint_callback");
+            return;
+        }
+
+        if (replans_remaining > 0)
+        {
+            ++g_move_planner_telemetry.replans_attempted;
+            std::vector<LLVector3d> replanned_waypoints;
+            bool direct_path = false;
+            LLVector3d replan_goal = final_goal;
+            if (!follow_target_id.isNull())
+            {
+                LLVector3d avatar_pos;
+                if (resolve_avatar_position(follow_target_id, avatar_pos))
+                {
+                    replan_goal = compute_avatar_approach_goal(current_pos, avatar_pos, follow_standoff);
+                }
+            }
+            bool replanned = plan_custom_clearance_route(current_pos, replan_goal, replanned_waypoints, direct_path);
+            if (!replanned && is_pathfinding_ready())
+            {
+                replanned = plan_probe_route(current_pos, replan_goal, replanned_waypoints, direct_path);
+            }
+
+            if (replanned && !replanned_waypoints.empty())
+            {
+                ++g_move_planner_telemetry.replans_succeeded;
+                const U64 new_plan_id = ++g_move_plan_generation;
+                const std::vector<LLVector3d> replanned_copy = replanned_waypoints;
+                const LLVector3d replan_goal_copy = replan_goal;
+                const LLUUID follow_target_copy = follow_target_id;
+                doOnIdleOneTime([new_plan_id, replanned_copy, replans_remaining, replan_goal_copy, follow_target_copy, follow_standoff, final_goal_tolerance]()
+                {
+                    if (new_plan_id != g_move_plan_generation)
+                    {
+                        return;
+                    }
+                    start_move_path_plan(
+                        new_plan_id,
+                        replanned_copy,
+                        replans_remaining - 1,
+                        &replan_goal_copy,
+                        follow_target_copy.isNull() ? nullptr : &follow_target_copy,
+                        follow_standoff,
+                        final_goal_tolerance);
+                });
+                LL_INFOS("AI") << "[AI] Waypoint leg failed; replanned route to goal ("
+                               << replan_goal.mdV[0] << ", " << replan_goal.mdV[1] << ", " << replan_goal.mdV[2]
+                               << ") remaining_replans=" << (replans_remaining - 1)
+                               << LL_ENDL;
+                return;
+            }
+            ++g_move_planner_telemetry.replans_failed;
+        }
+
+        if (!follow_target_id.isNull())
+        {
+            LLVector3d avatar_pos;
+            const LLVector3d current_pos = gAgent.getPositionGlobal();
+            const bool can_resolve = resolve_avatar_position(follow_target_id, avatar_pos);
+            const bool los_clear = can_resolve && has_clear_line_of_sight_to_avatar(current_pos, avatar_pos);
+            const F64 avatar_distance = can_resolve ? dist_vec(current_pos, avatar_pos) : std::numeric_limits<F64>::max();
+
+            if (can_resolve && (avatar_distance <= follow_standoff || los_clear))
+            {
+                ++g_move_planner_telemetry.person_follow_requests;
+                ++g_move_planner_telemetry.avatar_hybrid_follow_fallback;
+                gAgent.stopAutoPilot();
+                const U64 follow_plan_id = callback_plan_id;
+                doOnIdleOneTime([follow_target_id, follow_standoff, follow_plan_id]()
+                {
+                    if (follow_plan_id != g_move_plan_generation)
+                    {
+                        return;
+                    }
+                    gAgent.startFollowPilot(follow_target_id, false, follow_standoff);
+                });
+                LL_WARNS("AI") << "[AI] Waypoint leg failed with no replan, but direct avatar follow is clear; switching to follow pilot target="
+                               << follow_target_id.asString()
+                               << " dist=" << avatar_distance
+                               << " los=" << (los_clear ? "yes" : "no")
+                               << LL_ENDL;
+                maybe_log_move_planner_summary("ai_move_waypoint_callback");
+                return;
+            }
+
+            ++g_move_planner_telemetry.blocked_abort_avatar;
+            gAgent.stopAutoPilot();
+            LL_WARNS("AI") << "[AI] Waypoint leg failed with no replan and avatar LoS blocked; aborting MOVE target="
+                           << follow_target_id.asString()
+                           << " can_resolve=" << (can_resolve ? "yes" : "no")
+                           << " dist=" << avatar_distance
+                           << " los=" << (los_clear ? "yes" : "no")
+                           << LL_ENDL;
+            maybe_log_move_planner_summary("ai_move_waypoint_callback");
+            return;
+        }
+
+        LL_WARNS("AI") << "[AI] Waypoint leg did not complete; no replan available" << LL_ENDL;
+        maybe_log_move_planner_summary("ai_move_waypoint_callback");
         return;
     }
 
     if (next_index >= waypoints.size())
     {
+        ++g_move_planner_telemetry.waypoint_plan_completions;
+        if (!follow_target_id.isNull())
+        {
+            LLVector3d current_pos = gAgent.getPositionGlobal();
+            LLVector3d avatar_pos;
+            bool can_resolve = resolve_avatar_position(follow_target_id, avatar_pos);
+            bool los_clear = can_resolve && has_clear_line_of_sight_to_avatar(current_pos, avatar_pos);
+            const F64 avatar_distance = can_resolve ? dist_vec(current_pos, avatar_pos) : std::numeric_limits<F64>::max();
+
+            if (can_resolve && !los_clear && (avatar_distance > follow_standoff) && (replans_remaining > 0))
+            {
+                ++g_move_planner_telemetry.replans_attempted;
+                const LLVector3d replan_goal = compute_avatar_approach_goal(current_pos, avatar_pos, follow_standoff);
+                std::vector<LLVector3d> replanned_waypoints;
+                bool direct_path = false;
+                bool replanned = plan_custom_clearance_route(current_pos, replan_goal, replanned_waypoints, direct_path);
+                if (!replanned && is_pathfinding_ready())
+                {
+                    replanned = plan_probe_route(current_pos, replan_goal, replanned_waypoints, direct_path);
+                }
+                if (replanned && !replanned_waypoints.empty())
+                {
+                    ++g_move_planner_telemetry.replans_succeeded;
+                    const U64 new_plan_id = ++g_move_plan_generation;
+                    const std::vector<LLVector3d> replanned_copy = replanned_waypoints;
+                    const LLVector3d replan_goal_copy = replan_goal;
+                    const LLUUID follow_target_copy = follow_target_id;
+                    doOnIdleOneTime([new_plan_id, replanned_copy, replans_remaining, replan_goal_copy, follow_target_copy, follow_standoff, final_goal_tolerance]()
+                    {
+                        if (new_plan_id != g_move_plan_generation)
+                        {
+                            return;
+                        }
+                        start_move_path_plan(
+                            new_plan_id,
+                            replanned_copy,
+                            replans_remaining - 1,
+                            &replan_goal_copy,
+                            &follow_target_copy,
+                            follow_standoff,
+                            final_goal_tolerance);
+                    });
+                    LL_INFOS("AI") << "[AI] Waypoint plan completed but avatar LoS still blocked; replanning toward updated approach goal"
+                                   << " remaining_replans=" << (replans_remaining - 1)
+                                   << LL_ENDL;
+                    return;
+                }
+                ++g_move_planner_telemetry.replans_failed;
+            }
+
+            if (can_resolve && (avatar_distance <= follow_standoff || los_clear))
+            {
+                ++g_move_planner_telemetry.person_follow_requests;
+                ++g_move_planner_telemetry.avatar_hybrid_follow_switch;
+                gAgent.stopAutoPilot();
+                const U64 follow_plan_id = callback_plan_id;
+                doOnIdleOneTime([follow_target_id, follow_standoff, follow_plan_id]()
+                {
+                    if (follow_plan_id != g_move_plan_generation)
+                    {
+                        return;
+                    }
+                    gAgent.startFollowPilot(follow_target_id, false, follow_standoff);
+                });
+                LL_INFOS("AI") << "[AI] Avatar waypoint approach complete; switching to follow pilot target="
+                               << follow_target_id.asString()
+                               << " dist=" << avatar_distance
+                               << " los=" << (los_clear ? "yes" : "no")
+                               << LL_ENDL;
+                maybe_log_move_planner_summary("ai_move_waypoint_callback");
+                return;
+            }
+
+            ++g_move_planner_telemetry.blocked_abort_avatar;
+            gAgent.stopAutoPilot();
+            LL_WARNS("AI") << "[AI] Avatar waypoint approach complete but follow conditions are not met; aborting MOVE target="
+                           << follow_target_id.asString()
+                           << " can_resolve=" << (can_resolve ? "yes" : "no")
+                           << " dist=" << avatar_distance
+                           << " los=" << (los_clear ? "yes" : "no")
+                           << LL_ENDL;
+            maybe_log_move_planner_summary("ai_move_waypoint_callback");
+            return;
+        }
         LL_INFOS("AI") << "[AI] Multi-waypoint movement plan completed" << LL_ENDL;
+        maybe_log_move_planner_summary("ai_move_waypoint_callback");
         return;
     }
 
@@ -504,22 +1690,42 @@ void ai_move_waypoint_callback(bool success, void* user_data)
     next_cb->plan_id = callback_plan_id;
     next_cb->waypoints = waypoints;
     next_cb->next_index = next_index + 1;
+    next_cb->final_goal = final_goal;
+    next_cb->final_goal_tolerance = final_goal_tolerance;
+    next_cb->replans_remaining = replans_remaining;
+    next_cb->follow_target_id = follow_target_id;
+    next_cb->follow_standoff = follow_standoff;
 
-    const LLVector3d& next_target = waypoints[next_index];
-    gAgent.startAutoPilotGlobal(
-        next_target,
-        "AI Movement Waypoint",
-        NULL,
-        ai_move_waypoint_callback,
-        next_cb,
-        kMoveAutopilotStopDistanceMeters,
-        kMoveAutopilotRotationThreshold,
-        false
-    );
+    const LLVector3d next_target = waypoints[next_index];
+    const size_t leg_index = next_index + 1;
+    const size_t total_legs = waypoints.size();
+    doOnIdleOneTime([next_cb, next_target, leg_index, total_legs]()
+    {
+        if (!next_cb)
+        {
+            return;
+        }
+        if (next_cb->plan_id != g_move_plan_generation)
+        {
+            delete next_cb;
+            return;
+        }
 
-    LL_INFOS("AI") << "[AI] Waypoint leg " << (next_index + 1) << "/" << waypoints.size()
-                   << " started to (" << next_target.mdV[0] << ", " << next_target.mdV[1] << ", " << next_target.mdV[2] << ")"
-                   << LL_ENDL;
+        gAgent.startAutoPilotGlobal(
+            next_target,
+            "AI Movement Waypoint",
+            NULL,
+            ai_move_waypoint_callback,
+            next_cb,
+            kMoveAutopilotStopDistanceMeters,
+            kMoveAutopilotRotationThreshold,
+            false
+        );
+
+        LL_INFOS("AI") << "[AI] Waypoint leg " << leg_index << "/" << total_legs
+                       << " started to (" << next_target.mdV[0] << ", " << next_target.mdV[1] << ", " << next_target.mdV[2] << ")"
+                       << LL_ENDL;
+    });
 }
 }
 
@@ -942,9 +2148,9 @@ void FSAIIntegration::gatherAndSendEnvironmentUpdate()
             AIMessage env_message("environment_update", env_data);
             mAIBridge->sendMessage(env_message);
 
-            LL_INFOS("AI") << "[AI] Environment update sent via TCP: " << agents_str.size() 
-                           << " agents, " << objects_str.size() << " objects in " 
-                           << current_location << LL_ENDL;
+            // LL_INFOS("AI") << "[AI] Environment update sent via TCP: " << agents_str.size()
+            //                << " agents, " << objects_str.size() << " objects in "
+            //                << current_location << LL_ENDL;
         } else {
             LL_WARNS("AI") << "[AI] AI Bridge not available, cannot send environment update" << LL_ENDL;
         }
@@ -1135,6 +2341,7 @@ void FSAIIntegration::handleAIEmoteOutput(const char* content, S32 channel)
 
 void FSAIIntegration::handleAIMovementOutput(float x, float y, float z, const char* target_uuid, float desired_standoff)
 {
+    ++g_move_planner_telemetry.move_requests_total;
     const F32 standoff = clamp_move_standoff(desired_standoff);
     LL_INFOS("AI") << "[AI] Movement command: (" << x << ", " << y << ", " << z << ")"
                    << " target_uuid=" << (target_uuid ? target_uuid : "")
@@ -1179,7 +2386,7 @@ void FSAIIntegration::handleAIMovementOutput(float x, float y, float z, const ch
     // Every MOVE invalidates any prior multi-waypoint callback plan.
     const U64 plan_id = ++g_move_plan_generation;
 
-    // Person-aware movement: use follow pilot with standoff to avoid bumping avatars.
+    // Person-aware movement: use follow pilot only when LoS/standoff is clear, otherwise path to an approach point.
     LLUUID person_target_id;
     LLVector3d person_target_pos;
     bool has_person_target = false;
@@ -1202,53 +2409,295 @@ void FSAIIntegration::handleAIMovementOutput(float x, float y, float z, const ch
     if (has_person_target)
     {
         const F64 avatar_distance = dist_vec(agent_pos, person_target_pos);
-        if (avatar_distance <= standoff)
+        const bool los_clear = has_clear_line_of_sight_to_avatar(agent_pos, person_target_pos);
+
+        if (avatar_distance <= standoff || los_clear)
         {
+            ++g_move_planner_telemetry.person_follow_requests;
+            ++g_move_planner_telemetry.avatar_los_direct_follow;
             gAgent.stopAutoPilot();
-            LL_INFOS("AI") << "[AI] Already within standoff of avatar target; no MOVE needed" << LL_ENDL;
+            gAgent.startFollowPilot(person_target_id, false, standoff);
+            LL_INFOS("AI") << "[AI] Avatar target has direct follow conditions; following target="
+                           << person_target_id.asString()
+                           << " dist=" << avatar_distance
+                           << " los=" << (los_clear ? "yes" : "no")
+                           << LL_ENDL;
+            maybe_log_move_planner_summary("handleAIMovementOutput");
             return;
         }
+
+        ++g_move_planner_telemetry.avatar_hybrid_path_attempts;
+
+        LLVector3d avatar_approach_goal = compute_avatar_approach_goal(agent_pos, person_target_pos, standoff);
+        if (dist_vec(agent_pos, avatar_approach_goal) <= kMoveAutopilotStopDistanceMeters)
+        {
+            LLVector3d current_avatar_pos;
+            const bool can_resolve = resolve_avatar_position(person_target_id, current_avatar_pos);
+            const F64 current_distance = can_resolve ? dist_vec(agent_pos, current_avatar_pos) : std::numeric_limits<F64>::max();
+            const bool current_los = can_resolve && has_clear_line_of_sight_to_avatar(agent_pos, current_avatar_pos);
+            if (can_resolve && (current_distance <= standoff || current_los))
+            {
+                ++g_move_planner_telemetry.person_follow_requests;
+                ++g_move_planner_telemetry.avatar_hybrid_follow_fallback;
+                gAgent.stopAutoPilot();
+                gAgent.startFollowPilot(person_target_id, false, standoff);
+                LL_INFOS("AI") << "[AI] Avatar hybrid approach point already close and follow conditions are clear; using follow pilot target="
+                               << person_target_id.asString()
+                               << " dist=" << current_distance
+                               << " los=" << (current_los ? "yes" : "no")
+                               << LL_ENDL;
+                maybe_log_move_planner_summary("handleAIMovementOutput");
+                return;
+            }
+
+            ++g_move_planner_telemetry.blocked_abort_avatar;
+            gAgent.stopAutoPilot();
+            LL_WARNS("AI") << "[AI] Avatar approach point is close but LoS is blocked; aborting MOVE target="
+                           << person_target_id.asString()
+                           << " can_resolve=" << (can_resolve ? "yes" : "no")
+                           << " dist=" << current_distance
+                           << " los=" << (current_los ? "yes" : "no")
+                           << LL_ENDL;
+            maybe_log_move_planner_summary("handleAIMovementOutput");
+            return;
+        }
+
+        bool avatar_direct_path = false;
+        std::vector<LLVector3d> avatar_waypoints;
+        MovePlanSource avatar_source = MovePlanSource::FALLBACK_DIRECT;
+        F64 custom_ms = 0.0;
+        F64 legacy_ms = 0.0;
+
+        ++g_move_planner_telemetry.custom_attempts;
+        auto custom_start = std::chrono::steady_clock::now();
+        bool planned_avatar_path = plan_custom_clearance_route(agent_pos, avatar_approach_goal, avatar_waypoints, avatar_direct_path);
+        auto custom_end = std::chrono::steady_clock::now();
+        custom_ms = duration_ms(custom_start, custom_end);
+        g_move_planner_telemetry.custom_ms_total += custom_ms;
+        if (planned_avatar_path)
+        {
+            ++g_move_planner_telemetry.custom_success;
+            avatar_source = MovePlanSource::CUSTOM;
+        }
+        else
+        {
+            const bool pathfinding_ready = is_pathfinding_ready();
+            if (pathfinding_ready)
+            {
+                ++g_move_planner_telemetry.legacy_attempts;
+                auto legacy_start = std::chrono::steady_clock::now();
+                planned_avatar_path = plan_probe_route(agent_pos, avatar_approach_goal, avatar_waypoints, avatar_direct_path);
+                auto legacy_end = std::chrono::steady_clock::now();
+                legacy_ms = duration_ms(legacy_start, legacy_end);
+                g_move_planner_telemetry.legacy_ms_total += legacy_ms;
+                if (planned_avatar_path)
+                {
+                    ++g_move_planner_telemetry.legacy_success;
+                    avatar_source = MovePlanSource::LEGACY;
+                }
+            }
+        }
+
+        LL_INFOS("AI") << "[AI] Avatar hybrid planner timing: source=" << move_plan_source_to_text(avatar_source)
+                       << " custom_ms=" << custom_ms
+                       << " legacy_ms=" << legacy_ms
+                       << " waypoints=" << avatar_waypoints.size()
+                       << LL_ENDL;
+
+        if (planned_avatar_path && !avatar_waypoints.empty())
+        {
+            ++g_move_planner_telemetry.avatar_hybrid_path_success;
+            gAgent.stopAutoPilot();
+            start_move_path_plan(
+                plan_id,
+                avatar_waypoints,
+                kMovePathReplanAttempts,
+                &avatar_approach_goal,
+                &person_target_id,
+                standoff);
+            LL_INFOS("AI") << "[AI] Avatar hybrid movement started with " << avatar_waypoints.size()
+                           << " leg(s). Approach goal: ("
+                           << avatar_approach_goal.mdV[0] << ", " << avatar_approach_goal.mdV[1] << ", " << avatar_approach_goal.mdV[2]
+                           << ") target=" << person_target_id.asString()
+                           << LL_ENDL;
+            maybe_log_move_planner_summary("handleAIMovementOutput");
+            return;
+        }
+
+        LLVector3d current_avatar_pos;
+        const bool can_resolve = resolve_avatar_position(person_target_id, current_avatar_pos);
+        const F64 current_distance = can_resolve ? dist_vec(agent_pos, current_avatar_pos) : std::numeric_limits<F64>::max();
+        const bool current_los = can_resolve && has_clear_line_of_sight_to_avatar(agent_pos, current_avatar_pos);
+        if (can_resolve && (current_distance <= standoff || current_los))
+        {
+            ++g_move_planner_telemetry.person_follow_requests;
+            ++g_move_planner_telemetry.avatar_hybrid_follow_fallback;
+            gAgent.stopAutoPilot();
+            gAgent.startFollowPilot(person_target_id, false, standoff);
+            LL_INFOS("AI") << "[AI] Avatar hybrid path unavailable, but follow conditions became clear; using follow pilot target="
+                           << person_target_id.asString()
+                           << " dist=" << current_distance
+                           << " los=" << (current_los ? "yes" : "no")
+                           << LL_ENDL;
+            maybe_log_move_planner_summary("handleAIMovementOutput");
+            return;
+        }
+
+        ++g_move_planner_telemetry.blocked_abort_avatar;
         gAgent.stopAutoPilot();
-        gAgent.startFollowPilot(person_target_id, false, standoff);
-        LL_INFOS("AI") << "[AI] Person-aware movement initiated via follow pilot to " << person_target_id.asString()
-                       << " with standoff " << standoff << "m" << LL_ENDL;
+        LL_WARNS("AI") << "[AI] Avatar hybrid path unavailable and LoS is blocked; aborting MOVE target="
+                       << person_target_id.asString()
+                       << " can_resolve=" << (can_resolve ? "yes" : "no")
+                       << " dist=" << current_distance
+                       << " los=" << (current_los ? "yes" : "no")
+                       << LL_ENDL;
+        maybe_log_move_planner_summary("handleAIMovementOutput");
         return;
+    }
+
+    F32 final_goal_tolerance = kMoveAutopilotStopDistanceMeters;
+
+    // For object UUID targets, move to the closest walkable approach point near object bounds
+    // rather than aiming at object center (which is often obstructed).
+    if (target_uuid && *target_uuid)
+    {
+        const LLUUID requested_uuid(target_uuid);
+        if (!requested_uuid.isNull())
+        {
+            LLViewerObject* object_target = gObjectList.findObject(requested_uuid);
+            if (object_target && !object_target->isDead() && !object_target->isAvatar() && !object_target->isAttachment())
+            {
+                final_goal_tolerance = kMoveObjectFinalGoalToleranceMeters;
+                const LLVector3d object_center = object_target->getPositionGlobal();
+                LLVector3d object_approach_goal;
+                if (compute_object_approach_goal(agent_pos, object_target, object_approach_goal))
+                {
+                    target_pos = object_approach_goal;
+                    distance = dist_vec(agent_pos, target_pos);
+                    LL_INFOS("AI") << "[AI] Object approach goal selected near target="
+                                   << requested_uuid.asString()
+                                   << " center=(" << object_center.mdV[0] << ", " << object_center.mdV[1] << ", " << object_center.mdV[2] << ")"
+                                   << " approach=(" << target_pos.mdV[0] << ", " << target_pos.mdV[1] << ", " << target_pos.mdV[2] << ")"
+                                   << LL_ENDL;
+                }
+                else
+                {
+                    target_pos = object_center;
+                    distance = dist_vec(agent_pos, target_pos);
+                    LL_INFOS("AI") << "[AI] Object approach goal unavailable; using object center target="
+                                   << requested_uuid.asString()
+                                   << LL_ENDL;
+                }
+            }
+        }
     }
 
     // Non-avatar movement target.
     if (distance <= kMoveAutopilotStopDistanceMeters)
     {
+        ++g_move_planner_telemetry.skipped_close_target;
         gAgent.stopAutoPilot();
         LL_INFOS("AI") << "[AI] Target already within " << kMoveAutopilotStopDistanceMeters << "m; no MOVE needed" << LL_ENDL;
+        maybe_log_move_planner_summary("handleAIMovementOutput");
         return;
     }
 
+    ++g_move_planner_telemetry.non_avatar_plan_requests;
     bool direct_path_available = false;
+    bool direct_fallback_allowed = false;
     std::vector<LLVector3d> planned_waypoints;
-    const bool pathfinding_ready = is_pathfinding_ready();
-    if (pathfinding_ready)
+    MovePlanSource selected_source = MovePlanSource::FALLBACK_DIRECT;
+    F64 custom_ms = 0.0;
+    F64 legacy_ms = 0.0;
+
+    ++g_move_planner_telemetry.custom_attempts;
+    auto custom_start = std::chrono::steady_clock::now();
+    bool planned = plan_custom_clearance_route(agent_pos, target_pos, planned_waypoints, direct_path_available);
+    auto custom_end = std::chrono::steady_clock::now();
+    custom_ms = duration_ms(custom_start, custom_end);
+    g_move_planner_telemetry.custom_ms_total += custom_ms;
+    if (planned)
     {
-        const bool planned = plan_probe_route(agent_pos, target_pos, planned_waypoints, direct_path_available);
-        LL_INFOS("AI") << "[AI] Path probe result: direct=" << (direct_path_available ? "yes" : "no")
-                       << " planned_waypoints=" << planned_waypoints.size()
-                       << " planned=" << (planned ? "yes" : "no") << LL_ENDL;
+        ++g_move_planner_telemetry.custom_success;
+        selected_source = MovePlanSource::CUSTOM;
     }
-    else
+    if (!planned)
     {
-        LL_INFOS("AI") << "[AI] Pathfinding unavailable for current region; using direct autopilot fallback" << LL_ENDL;
+        const bool pathfinding_ready = is_pathfinding_ready();
+        if (pathfinding_ready)
+        {
+            ++g_move_planner_telemetry.legacy_attempts;
+            auto legacy_start = std::chrono::steady_clock::now();
+            planned = plan_probe_route(agent_pos, target_pos, planned_waypoints, direct_path_available);
+            auto legacy_end = std::chrono::steady_clock::now();
+            legacy_ms = duration_ms(legacy_start, legacy_end);
+            g_move_planner_telemetry.legacy_ms_total += legacy_ms;
+            if (planned)
+            {
+                ++g_move_planner_telemetry.legacy_success;
+                selected_source = MovePlanSource::LEGACY;
+            }
+            LL_INFOS("AI") << "[AI] Legacy path probe result: direct=" << (direct_path_available ? "yes" : "no")
+                           << " planned_waypoints=" << planned_waypoints.size()
+                           << " planned=" << (planned ? "yes" : "no") << LL_ENDL;
+        }
+        else
+        {
+            LL_INFOS("AI") << "[AI] Legacy pathfinding unavailable; relying on custom planner and strict direct-clearance fallback" << LL_ENDL;
+        }
     }
 
+    LL_INFOS("AI") << "[AI] Move planner timing: source=" << move_plan_source_to_text(selected_source)
+                   << " custom_ms=" << custom_ms
+                   << " legacy_ms=" << legacy_ms
+                   << " waypoints=" << planned_waypoints.size()
+                   << LL_ENDL;
+
+    if (!planned_waypoints.empty())
+    {
+        std::ostringstream route_stream;
+        route_stream << "[AI] Planned waypoint list:";
+        for (size_t i = 0; i < planned_waypoints.size(); ++i)
+        {
+            const LLVector3d& wp = planned_waypoints[i];
+            route_stream << " [" << (i + 1) << "]("
+                         << wp.mdV[0] << "," << wp.mdV[1] << "," << wp.mdV[2] << ")";
+        }
+        LL_INFOS("AI") << route_stream.str() << LL_ENDL;
+    }
     gAgent.stopAutoPilot();
 
     if (!planned_waypoints.empty())
     {
-        start_move_path_plan(plan_id, planned_waypoints);
+        start_move_path_plan(
+            plan_id,
+            planned_waypoints,
+            kMovePathReplanAttempts,
+            &target_pos,
+            nullptr,
+            kDefaultMoveStandoffMeters,
+            final_goal_tolerance);
         const LLVector3d& first_leg = planned_waypoints.front();
         LL_INFOS("AI") << "[AI] Multi-waypoint movement started with " << planned_waypoints.size()
                        << " leg(s). First leg target: ("
                        << first_leg.mdV[0] << ", " << first_leg.mdV[1] << ", " << first_leg.mdV[2] << ")" << LL_ENDL;
+        maybe_log_move_planner_summary("handleAIMovementOutput");
         return;
     }
+
+    direct_fallback_allowed = has_direct_clearance_route(agent_pos, target_pos);
+    if (!direct_fallback_allowed)
+    {
+        ++g_move_planner_telemetry.blocked_abort_non_avatar;
+        LL_WARNS("AI") << "[AI] No waypoint route and direct clearance is blocked; aborting MOVE to ("
+                       << target_pos.mdV[0] << ", " << target_pos.mdV[1] << ", " << target_pos.mdV[2] << ")"
+                       << LL_ENDL;
+        maybe_log_move_planner_summary("handleAIMovementOutput");
+        return;
+    }
+    direct_path_available = true;
+    ++g_move_planner_telemetry.fallback_direct;
+    LL_INFOS("AI") << "[AI] No waypoint route found, but direct clearance is open; using direct autopilot" << LL_ENDL;
 
     gAgent.startAutoPilotGlobal(
         target_pos,
@@ -1264,6 +2713,8 @@ void FSAIIntegration::handleAIMovementOutput(float x, float y, float z, const ch
     LL_INFOS("AI") << "[AI] Movement initiated to (" << target_pos.mdV[0] << ", "
                    << target_pos.mdV[1] << ", " << target_pos.mdV[2] << ")"
                    << (direct_path_available ? " [direct-path ok]" : "") << LL_ENDL;
+
+    maybe_log_move_planner_summary("handleAIMovementOutput");
 }
 
 void FSAIIntegration::handleAITouchOutput(const char* object_uuid)
