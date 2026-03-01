@@ -39,6 +39,8 @@
 namespace
 {
 constexpr const char* VIEWPOINT_OVERRIDE_DISABLE_HEAD_ANIMS_KEY = "FSViewpointOverrideDisableHeadAnims";
+constexpr const char* VIEWPOINT_OVERRIDE_INSTANT_HEAD_ROT_KEY = "FSViewpointOverrideInstantHeadRot";
+constexpr const char* VIEWPOINT_OVERRIDE_HEAD_ROLL_KEY = "FSViewpointOverrideHeadRoll";
 
 bool useViewpointOverrideHeadRot(LLCharacter* character)
 {
@@ -50,6 +52,32 @@ bool useViewpointOverrideHeadRot(LLCharacter* character)
     const bool* viewpoint_override_disable_head_anims = static_cast<const bool*>(
         character->getAnimationData(VIEWPOINT_OVERRIDE_DISABLE_HEAD_ANIMS_KEY));
     return viewpoint_override_disable_head_anims && *viewpoint_override_disable_head_anims;
+}
+
+bool useViewpointOverrideInstantHeadRot(LLCharacter* character)
+{
+    if (!character)
+    {
+        return false;
+    }
+
+    const bool* viewpoint_override_instant_head_rot = static_cast<const bool*>(
+        character->getAnimationData(VIEWPOINT_OVERRIDE_INSTANT_HEAD_ROT_KEY));
+    return viewpoint_override_instant_head_rot && *viewpoint_override_instant_head_rot;
+}
+
+F32 getViewpointOverrideHeadRoll(LLCharacter* character)
+{
+    if (!character)
+    {
+        return 0.f;
+    }
+
+    const F32* viewpoint_override_head_roll = static_cast<const F32*>(
+        character->getAnimationData(VIEWPOINT_OVERRIDE_HEAD_ROLL_KEY));
+    return (viewpoint_override_head_roll && llfinite(*viewpoint_override_head_roll))
+        ? *viewpoint_override_head_roll
+        : 0.f;
 }
 } // namespace
 
@@ -205,6 +233,8 @@ bool LLHeadRotMotion::onUpdate(F32 time, U8* joint_mask)
     LL_PROFILE_ZONE_SCOPED_CATEGORY_AVATAR;
     LLQuaternion    targetHeadRotWorld;
     const bool      use_viewpoint_override_head_rot = useViewpointOverrideHeadRot(mCharacter);
+    const bool      instant_viewpoint_override_head_rot =
+        use_viewpoint_override_head_rot && useViewpointOverrideInstantHeadRot(mCharacter);
     LLQuaternion    currentRootRotWorld = mRootJoint->getWorldRotation();
     LLQuaternion    currentInvRootRotWorld = ~currentRootRotWorld;
     LLQuaternion    currentBasisRotWorld = currentRootRotWorld;
@@ -223,7 +253,6 @@ bool LLHeadRotMotion::onUpdate(F32 time, U8* joint_mask)
 
     LLQuaternion    currentInvBasisRotWorld = ~currentBasisRotWorld;
 
-    F32 head_slerp_amt = LLSmoothInterpolation::getInterpolant(HEAD_LOOKAT_LAG_HALF_LIFE);
     F32 torso_slerp_amt = LLSmoothInterpolation::getInterpolant(TORSO_LOOKAT_LAG_HALF_LIFE);
 
     LLVector3* targetPos = (LLVector3*)mCharacter->getAnimationData("LookAtPoint");
@@ -277,6 +306,20 @@ bool LLHeadRotMotion::onUpdate(F32 time, U8* joint_mask)
 
     LLQuaternion head_rot_local = targetHeadRotWorld *
         (use_viewpoint_override_head_rot ? currentInvBasisRotWorld : currentInvRootRotWorld);
+
+    if (use_viewpoint_override_head_rot)
+    {
+        const F32 head_roll = llclamp(
+            getViewpointOverrideHeadRoll(mCharacter),
+            -HEAD_ROTATION_CONSTRAINT,
+             HEAD_ROTATION_CONSTRAINT);
+        if (head_roll != 0.f)
+        {
+            // Apply roll around the head's local forward axis after look direction is set.
+            head_rot_local = head_rot_local * LLQuaternion(head_roll, LLVector3::x_axis);
+        }
+    }
+
     head_rot_local.constrain(HEAD_ROTATION_CONSTRAINT);
 
     // set final torso rotation
@@ -293,8 +336,16 @@ bool LLHeadRotMotion::onUpdate(F32 time, U8* joint_mask)
         mTorsoState->setRotation( nlerp(torso_slerp_amt, mTorsoState->getRotation(), torso_rot_local) );
     }
 
-    head_rot_local = nlerp(head_slerp_amt, mLastHeadRot, head_rot_local);
-    mLastHeadRot = head_rot_local;
+    if (instant_viewpoint_override_head_rot)
+    {
+        mLastHeadRot = head_rot_local;
+    }
+    else
+    {
+        F32 head_slerp_amt = LLSmoothInterpolation::getInterpolant(HEAD_LOOKAT_LAG_HALF_LIFE);
+        head_rot_local = nlerp(head_slerp_amt, mLastHeadRot, head_rot_local);
+        mLastHeadRot = head_rot_local;
+    }
 
     // Set the head rotation.
     if(mNeckState->getJoint() && mNeckState->getJoint()->getParent())

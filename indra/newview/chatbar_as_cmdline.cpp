@@ -48,6 +48,7 @@
 #include "llfloaterreg.h"
 #include "llinventorymodel.h"
 #include "llnotificationmanager.h"
+#include "llopenxrmanager.h"
 #include "llparcel.h"
 #include "llslurl.h"
 #include "lltooldraganddrop.h"
@@ -775,6 +776,46 @@ bool cmd_line_chat(std::string_view revised_text, EChatType type, bool from_gest
                 bool enabled = FSAIIntegration::getInstance()->toggleLLMChatEnabled();
                 FSCommon::report_to_nearby_chat(
                     enabled ? "Roleplay AI chat output enabled" : "Roleplay AI chat output disabled");
+                return false;
+            }
+            else if (command == "/xr")
+            {
+                std::string xr_arg;
+                const bool has_arg = static_cast<bool>(i >> xr_arg);
+                LLStringUtil::toLower(xr_arg);
+
+                LLOpenXRManager& openxr = LLOpenXRManager::instance();
+                if (!has_arg || xr_arg == "toggle")
+                {
+                    openxr.setMonoEnabled(!openxr.isMonoEnabled());
+                }
+                else if (xr_arg == "on")
+                {
+                    openxr.setMonoEnabled(true);
+                }
+                else if (xr_arg == "off")
+                {
+                    openxr.setMonoEnabled(false);
+                }
+                else if (xr_arg != "status")
+                {
+                    FSCommon::report_to_nearby_chat("Usage: /xr [on|off|toggle|status]");
+                    return false;
+                }
+
+                const bool requested = openxr.isMonoEnabled();
+                const bool running = openxr.isSessionRunning();
+                if (requested)
+                {
+                    FSCommon::report_to_nearby_chat(
+                        running
+                            ? "OpenXR mono: enabled (session running)"
+                            : "OpenXR mono: enabled (waiting for session)");
+                }
+                else
+                {
+                    FSCommon::report_to_nearby_chat("OpenXR mono: disabled");
+                }
                 return false;
             }
 

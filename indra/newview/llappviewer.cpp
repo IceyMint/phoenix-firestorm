@@ -72,6 +72,7 @@
 #include "lltracethreadrecorder.h"
 #include "llviewerwindow.h"
 #include "llviewerdisplay.h"
+#include "llopenxrmanager.h"
 #include "llviewermedia.h"
 #include "llviewerparcelaskplay.h"
 #include "llviewerparcelmedia.h"
@@ -2210,6 +2211,7 @@ bool LLAppViewer::cleanup()
     // Shut down OpenGL
     if( gViewerWindow)
     {
+        LLOpenXRManager::instance().shutdown();
         gViewerWindow->shutdownGL();
 
         // Destroy window, and make sure we're not fullscreen
@@ -6890,4 +6892,3 @@ void LLAppViewer::metricsSend(bool enable_reporting)
     // resolution in time.
     gViewerAssetStats->restart();
 }
-

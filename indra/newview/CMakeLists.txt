@@ -2568,6 +2568,25 @@ target_include_directories(${VIEWER_BINARY_NAME} PRIVATE
 	Z:/source/phoenix-firestorm/indra/newview/python_bridge/include
 )
 
+target_sources(${VIEWER_BINARY_NAME} PRIVATE
+    llopenxrmanager.cpp
+    llopenxrmanager.h
+    )
+
+add_executable(openxr_glreq_probe
+    openxr_glreq_probe.cpp
+    )
+
+target_link_libraries(openxr_glreq_probe
+    ll::openxr
+    )
+
+if (LINUX)
+    target_link_libraries(openxr_glreq_probe
+        "dl"
+        )
+endif (LINUX)
+
 if( TARGET ll::intel_memops )
    target_link_libraries(${VIEWER_BINARY_NAME} ll::intel_memops )
 endif()
@@ -3091,4 +3110,3 @@ if (LL_TESTS)
 endif (LL_TESTS)
 
 check_message_template(${VIEWER_BINARY_NAME})
-

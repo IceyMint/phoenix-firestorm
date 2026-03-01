@@ -82,6 +82,7 @@
 #include "llviewershadermgr.h"
 #include "llviewertexturelist.h"
 #include "llviewerwindow.h"
+#include "llopenxrmanager.h"
 #include "llvoavatarself.h"
 #include "llvograss.h"
 #include "llworld.h"
@@ -251,6 +252,22 @@ void display_update_camera()
 // </FS:CR> Aurora sim
     LLViewerCamera::getInstance()->setFar(final_far);
     LLVOAvatar::sRenderDistance = llclamp(final_far, 16.f, 256.f);
+
+    // When OpenXR mono is active, match the desktop render projection to the
+    // runtime's left-eye vertical FOV to reduce perceived warping in-headset.
+    static bool openxr_fov_override_active = false;
+    F32 openxr_left_eye_fov = 0.f;
+    if (LLOpenXRManager::instance().getLeftEyeVerticalFov(openxr_left_eye_fov))
+    {
+        LLViewerCamera::getInstance()->setViewNoBroadcast(openxr_left_eye_fov);
+        openxr_fov_override_active = true;
+    }
+    else if (openxr_fov_override_active)
+    {
+        LLViewerCamera::getInstance()->setViewNoBroadcast(LLViewerCamera::getInstance()->getDefaultFOV());
+        openxr_fov_override_active = false;
+    }
+
     gViewerWindow->setup3DRender();
 
     if (!gCubeSnapshot)
@@ -1699,6 +1716,12 @@ void swap()
     LLPerfStats::RecordSceneTime T ( LLPerfStats::StatType_t::RENDER_SWAP ); // render time capture - Swap buffer time - can signify excessive data transfer to/from GPU
     LL_PROFILE_ZONE_NAMED_CATEGORY_DISPLAY("Swap");
     LL_PROFILE_GPU_ZONE("swap");
+
+    if (!gSnapshot && !gCubeSnapshot && gViewerWindow)
+    {
+        LLOpenXRManager::instance().submitFrameMono(gViewerWindow->getWorldRenderViewRectRaw());
+    }
+
     if (gDisplaySwapBuffers)
     {
         gViewerWindow->getWindow()->swapBuffers();

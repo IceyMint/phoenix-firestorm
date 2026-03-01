@@ -191,6 +191,14 @@ if (LINUX)
     add_compile_options(-march=pentium4)
   endif (ADDRESS_SIZE EQUAL 32)
 
+  # <FS:Ansariel> AVX/AVX2 support
+  if (USE_AVX_OPTIMIZATION)
+    add_compile_options(-mavx)
+  elseif (USE_AVX2_OPTIMIZATION)
+    add_compile_options(-mavx2)
+  endif (USE_AVX_OPTIMIZATION)
+  # </FS:Ansariel> AVX/AVX2 support
+
   # this stops us requiring a really recent glibc at runtime
   add_compile_options(-fno-stack-protector)
   # linking can be very memory-hungry, especially the final viewer link
@@ -263,5 +271,4 @@ if (LINUX OR DARWIN)
   set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -m${ADDRESS_SIZE}")
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -m${ADDRESS_SIZE}")
 endif (LINUX OR DARWIN)
-
 
