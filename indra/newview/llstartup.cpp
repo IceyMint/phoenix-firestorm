@@ -117,6 +117,7 @@
 #include "llhudeffecttrail.h"
 #include "llhudmanager.h"
 #include "llbufferstream.h" // <FS:PP> For SL Grid Status
+#include "fsaiintegration.h" // <FS:Genesis> AI Integration
 #include "llimage.h"
 #include "llinventorybridge.h"
 #include "llinventorymodel.h"
@@ -3324,6 +3325,10 @@ bool idle_startup()
         // </FS:PP>
 
         LLStartUp::setStartupState( STATE_STARTED );
+        
+        // <FS:Genesis> Notify AI system that login is complete
+        FSAIIntegration::onLoginCompleted();
+        
         do_startup_frame();
 
         // <FS:Ansariel> Draw Distance stepping; originally based on SpeedRez by Henri Beauchamp, licensed under LGPL

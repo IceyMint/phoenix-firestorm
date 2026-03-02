@@ -79,6 +79,7 @@
 #include "lltoolmgr.h"
 #include "llviewercamera.h"
 #include "llviewermediafocus.h"
+#include "llopenxrmanager.h"
 #include "llviewertexturelist.h"
 #include "llviewerobject.h"
 #include "llviewerobjectlist.h"
@@ -307,6 +308,88 @@ static LLStaticHashedString sKern("kern");
 static LLStaticHashedString sKernScale("kern_scale");
 static LLStaticHashedString sSmaaRTMetrics("SMAA_RT_METRICS");
 
+namespace
+{
+constexpr const char* OPENXR_NATIVE_RES_ENV = "FS_OPENXR_NATIVE_RES";
+
+bool is_openxr_native_resolution_requested()
+{
+    std::string value = LLStringUtil::getenv(OPENXR_NATIVE_RES_ENV);
+    if (value.empty())
+    {
+        // Default to native-target rendering while XR is active.
+        return true;
+    }
+
+    bool requested = false;
+    if (LLStringUtil::convertToBOOL(value, requested))
+    {
+        return requested;
+    }
+
+    return true;
+}
+
+bool get_openxr_native_resolution(U32& out_width, U32& out_height)
+{
+    if (!is_openxr_native_resolution_requested() || gCubeSnapshot)
+    {
+        return false;
+    }
+
+    S32 xr_width = 0;
+    S32 xr_height = 0;
+    if (!LLOpenXRManager::instance().getRecommendedRenderSize(xr_width, xr_height))
+    {
+        return false;
+    }
+
+    if (xr_width <= 0 || xr_height <= 0)
+    {
+        return false;
+    }
+
+    out_width = (U32)xr_width;
+    out_height = (U32)xr_height;
+    return true;
+}
+
+void apply_resolution_settings(U32& res_x, U32& res_y)
+{
+    if (res_x == 0 || res_y == 0)
+    {
+        return;
+    }
+
+    U32 res_mod = LLPipeline::RenderResolutionDivisor;
+
+    //<FS:TS> FIRE-7066: RenderResolutionDivisor broken if higher than
+    //      smallest screen dimension
+    if (res_mod >= res_x)
+    {
+        res_mod = res_x - 1;
+    }
+    if (res_mod >= res_y)
+    {
+        res_mod = res_y - 1;
+    }
+    //</FS:TS> FIRE-7066
+
+    if (res_mod > 1 && res_mod < res_x && res_mod < res_y)
+    {
+        res_x /= res_mod;
+        res_y /= res_mod;
+    }
+// [SL:KB] - Patch: Settings-RenderResolutionMultiplier | Checked: Catznip-5.4
+    else if (LLPipeline::RenderResolutionMultiplier > 0.f && LLPipeline::RenderResolutionMultiplier < 1.f)
+    {
+        res_x = (U32)(res_x * LLPipeline::RenderResolutionMultiplier);
+        res_y = (U32)(res_y * LLPipeline::RenderResolutionMultiplier);
+    }
+// [/SL:KB]
+}
+} // namespace
+
 //----------------------------------------
 
 void drawBox(const LLVector4a& c, const LLVector4a& r);
@@ -428,7 +511,8 @@ LLPipeline::LLPipeline() :
     mResetVertexBuffers(false),
     mLastRebuildPool(NULL),
     mLightMask(0),
-    mLightMovingMask(0)
+    mLightMovingMask(0),
+    mXRSubmitSource(nullptr)
 {
     mNoiseMap = 0;
     mTrueNoiseMap = 0;
@@ -807,21 +891,21 @@ void LLPipeline::resizeScreenTexture()
 {
     if (gPipeline.shadersLoaded())
     {
-        GLuint resX = gViewerWindow->getWorldViewWidthRaw();
-        GLuint resY = gViewerWindow->getWorldViewHeightRaw();
+        const LLRect world_render_rect = gViewerWindow->getWorldRenderViewRectRaw();
+        GLuint resX = (GLuint)llmax(world_render_rect.getWidth(), 1);
+        GLuint resY = (GLuint)llmax(world_render_rect.getHeight(), 1);
 
 // [SL:KB] - Patch: Settings-RenderResolutionMultiplier | Checked: Catznip-5.4
         GLuint scaledResX = resX;
         GLuint scaledResY = resY;
-        if ( (RenderResolutionDivisor > 1) && (RenderResolutionDivisor < resX) && (RenderResolutionDivisor < resY) )
+        apply_resolution_settings(scaledResX, scaledResY);
+
+        U32 xr_native_width = 0;
+        U32 xr_native_height = 0;
+        if (get_openxr_native_resolution(xr_native_width, xr_native_height))
         {
-            scaledResX /= RenderResolutionDivisor;
-            scaledResY /= RenderResolutionDivisor;
-        }
-        else if (RenderResolutionMultiplier > 0.f && RenderResolutionMultiplier < 1.f)
-        {
-            scaledResX = (GLuint)(scaledResX * RenderResolutionMultiplier);
-            scaledResY = (GLuint)(scaledResY * RenderResolutionMultiplier);
+            scaledResX = llmax(scaledResX, xr_native_width);
+            scaledResY = llmax(scaledResY, xr_native_height);
         }
 // [/SL:KB]
 
@@ -833,7 +917,7 @@ void LLPipeline::resizeScreenTexture()
             releaseScreenBuffers();
             releaseSunShadowTargets();
             releaseSpotShadowTargets();
-            allocateScreenBuffer(resX,resY);
+            allocateScreenBuffer(resX, resY);
             gResizeScreenTexture = false;
         }
     }
@@ -929,32 +1013,15 @@ bool LLPipeline::allocateScreenBufferInternal(U32 resX, U32 resY)
     mRT->width = resX;
     mRT->height = resY;
 
-    U32 res_mod = RenderResolutionDivisor;
+    apply_resolution_settings(resX, resY);
 
-    //<FS:TS> FIRE-7066: RenderResolutionDivisor broken if higher than
-    //      smallest screen dimension
-    if (res_mod >= resX)
+    U32 xr_native_width = 0;
+    U32 xr_native_height = 0;
+    if (get_openxr_native_resolution(xr_native_width, xr_native_height))
     {
-        res_mod = resX - 1;
+        resX = llmax(resX, xr_native_width);
+        resY = llmax(resY, xr_native_height);
     }
-    if (res_mod >= resY)
-    {
-        res_mod = resY - 1;
-    }
-    //</FS:TS> FIRE-7066
-
-    if (res_mod > 1 && res_mod < resX && res_mod < resY)
-    {
-        resX /= res_mod;
-        resY /= res_mod;
-    }
-// [SL:KB] - Patch: Settings-RenderResolutionMultiplier | Checked: Catznip-5.4
-    else if (RenderResolutionMultiplier > 0.f && RenderResolutionMultiplier < 1.f)
-    {
-        resX = (GLuint)(resX * RenderResolutionMultiplier);
-        resY = (GLuint)(resY * RenderResolutionMultiplier);
-    }
-// [/SL:KB]
 
     S32 shadow_detail = RenderShadowDetail;
     bool ssao = RenderDeferredSSAO;
@@ -8950,6 +9017,8 @@ void LLPipeline::renderFinalize()
     gGLViewport[3] = gViewerWindow->getWorldViewRectRaw().getHeight();
     glViewport(gGLViewport[0], gGLViewport[1], gGLViewport[2], gGLViewport[3]);
 
+    mXRSubmitSource = nullptr;
+
     if((RenderDepthOfFieldInEditMode || !LLToolMgr::getInstance()->inBuildMode()) &&
         RenderDepthOfField &&
         !gCubeSnapshot)
@@ -8996,6 +9065,7 @@ void LLPipeline::renderFinalize()
     };
 
     sourceBuffer = auxActiveBuffer;
+    mXRSubmitSource = sourceBuffer;
     // </FS:Beq>
     if (RenderBufferVisualization > -1)
     {

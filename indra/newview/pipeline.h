@@ -355,6 +355,7 @@ public:
     bool renderVignette(LLRenderTarget* src, LLRenderTarget* dst);
     bool renderSnapshotFrame(LLRenderTarget* src, LLRenderTarget* dst); // <FS:Beq/> Add snapshot frame rendering
     void renderSnapshotGuidesOverlay(); // <FS:Beq/> Add snapshot composition guide rendering
+    const LLRenderTarget* getXRSubmitSource() const { return mXRSubmitSource; }
     void renderDebug();
     void renderPhysicsDisplay();
 
@@ -745,6 +746,7 @@ public:
 
     // currently used render target pack
     RenderTargetPack* mRT;
+    LLRenderTarget* mXRSubmitSource = nullptr;
 
     LLRenderTarget          mSpotShadow[2];
 

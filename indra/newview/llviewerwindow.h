@@ -257,6 +257,7 @@ public:
 
     // 3D world area, in raw unscaled pixels
     LLRect          getWorldViewRectRaw() const     { return mWorldViewRectRaw; }
+    LLRect          getWorldRenderViewRectRaw() const;
     S32             getWorldViewHeightRaw() const;
     S32             getWorldViewWidthRaw() const;
 
@@ -489,6 +490,7 @@ private:
     void            schedulePick(LLPickInfo& pick_info);
     S32             getChatConsoleBottomPad(); // Vertical padding for child console rect, varied by bottom clutter
     LLRect          getChatConsoleRect(); // Get optimal cosole rect.
+    void            maybeAutoResizeForOpenXR();
 
 private:
     LLWindow*       mWindow;                        // graphical window object
@@ -558,6 +560,9 @@ private:
 
     bool            mResDirty;
     bool            mStatesDirty;
+    LLCoordWindow   mOpenXRPreResizeWindowSize;
+    bool            mHasOpenXRPreResizeWindowSize = false;
+    bool            mOpenXRResizeApplied = false;
 
     std::unique_ptr<LLWindowListener> mWindowListener;
     std::unique_ptr<LLViewerWindowListener> mViewerWindowListener;

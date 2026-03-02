@@ -1,0 +1,247 @@
+2025-08-25 07:54:44 - root - INFO - logging_config.py:83 - Logging initialized - File: E:\source\phoenix-firestorm\indra\newview\ai_system_20250825_075444.log
+2025-08-25 07:54:44 - root - INFO - logging_config.py:84 - Log level: INFO
+2025-08-25 07:54:44 - python_bridge - INFO - logging_config.py:110 - ============================================================
+2025-08-25 07:54:44 - python_bridge - INFO - logging_config.py:111 - Python Bridge Logging Initialized
+2025-08-25 07:54:44 - python_bridge - INFO - logging_config.py:112 - ============================================================
+2025-08-25 07:54:44 - root - INFO - logging_config.py:83 - Logging initialized - File: E:\source\phoenix-firestorm\indra\newview\ai_system_20250825_075444.log
+2025-08-25 07:54:44 - root - INFO - logging_config.py:84 - Log level: INFO
+2025-08-25 07:54:44 - python_bridge - INFO - logging_config.py:110 - ============================================================
+2025-08-25 07:54:44 - python_bridge - INFO - logging_config.py:111 - Python Bridge Logging Initialized
+2025-08-25 07:54:44 - python_bridge - INFO - logging_config.py:112 - ============================================================
+2025-08-25 07:54:44 - root - INFO - ai_controller.py:19 - AI Controller logging initialized to: E:\source\phoenix-firestorm\indra\newview\ai_system_20250825_075444.log
+2025-08-25 07:54:44 - AIProcess - INFO - ai_process.py:627 - AI Process Starting - Hot Restart Capable!
+2025-08-25 07:54:44 - AIProcess - INFO - ai_process.py:628 - Connecting to 127.0.0.1:9999
+2025-08-25 07:54:44 - AIProcess - INFO - ai_process.py:451 - 🚀 Starting AI Process...
+2025-08-25 07:54:44 - AIProcess - INFO - ai_process.py:421 - Initializing AI system...
+2025-08-25 07:54:44 - mood_system - INFO - mood_system.py:46 - MoodSystem initialized for BabyMiku Takeda with default mood: MoodState.OBSERVANT
+2025-08-25 07:54:44 - autonomous_engine - INFO - autonomous_engine.py:56 - AutonomousDecisionEngine initialized for BabyMiku Takeda
+2025-08-25 07:54:44 - environment_monitor - INFO - environment_monitor.py:52 - EnvironmentMonitor initialized
+2025-08-25 07:54:44 - httpx - INFO - _client.py:1026 - HTTP Request: POST http://localhost:8000/api/v2/tenants/default_tenant/databases/default_database/collections "HTTP/1.1 200 OK"
+2025-08-25 07:54:44 - memory_systems - INFO - memory_systems.py:65 - VectorMemory switched to collection: babymiku-takeda
+2025-08-25 07:54:44 - memory_systems - INFO - memory_systems.py:462 - Memory manager switched to persona: BabyMiku Takeda
+2025-08-25 07:54:44 - message_pipeline - INFO - message_pipeline.py:75 - MessagePipeline initialized for BabyMiku Takeda
+2025-08-25 07:54:44 - ai_controller - INFO - ai_controller.py:60 - AIController initialized for persona: BabyMiku Takeda
+2025-08-25 07:54:44 - ai_controller - INFO - ai_controller.py:80 - AIController.start() called for BabyMiku Takeda
+2025-08-25 07:54:44 - ai_controller - INFO - ai_controller.py:87 - Starting AIController for BabyMiku Takeda...
+2025-08-25 07:54:44 - ai_controller - INFO - ai_controller.py:91 - Starting message pipeline for BabyMiku Takeda
+2025-08-25 07:54:44 - memory_systems - INFO - memory_systems.py:462 - Memory manager switched to persona: BabyMiku Takeda
+2025-08-25 07:54:44 - message_pipeline - INFO - message_pipeline.py:110 - Memory system switched to persona: BabyMiku Takeda
+2025-08-25 07:54:44 - python_message_queue - INFO - python_message_queue.py:592 - MessageQueueInterface created: memory_mapped, path: C:\Users\Yuki\AppData\Local\Temp\genesis_ai_queue.bin
+2025-08-25 07:54:44 - python_message_queue - INFO - python_message_queue.py:254 - Memory-mapped queue initialized: C:\Users\Yuki\AppData\Local\Temp\genesis_ai_queue.bin
+2025-08-25 07:54:44 - python_message_queue - INFO - python_message_queue.py:601 - Message queue initialized successfully: memory_mapped
+2025-08-25 07:54:44 - message_pipeline - INFO - message_pipeline.py:94 - Message queue initialized for BabyMiku Takeda: memory_mapped
+2025-08-25 07:54:44 - environment_monitor - INFO - environment_monitor.py:62 - Environment monitoring started
+2025-08-25 07:54:44 - message_pipeline - INFO - message_pipeline.py:119 - MessagePipeline started for BabyMiku Takeda
+2025-08-25 07:54:44 - ai_controller - INFO - ai_controller.py:95 - Creating autonomous task for BabyMiku Takeda
+2025-08-25 07:54:44 - ai_controller - INFO - ai_controller.py:98 - AIController started successfully for BabyMiku Takeda
+2025-08-25 07:54:44 - ai_controller - INFO - ai_controller.py:99 - Autonomous task created: <Task pending name='Task-3' coro=<AIController._autonomous_loop() running at D:\@home\snow\Documents\genesis\ai_controller.py:154>>
+2025-08-25 07:54:44 - ai_controller - DEBUG - ai_controller.py:76 - TCP client reference set for autonomous engine
+2025-08-25 07:54:44 - AIProcess - INFO - ai_process.py:442 - AI system initialized successfully!
+2025-08-25 07:54:44 - AIProcess - INFO - ai_process.py:73 - Connecting to AI Bridge at 127.0.0.1:9999...
+2025-08-25 07:54:44 - ai_controller - INFO - ai_controller.py:156 - Autonomous behavior loop started
+2025-08-25 07:54:44 - AIProcess - WARNING - ai_process.py:106 - Cannot send message - not connected
+2025-08-25 07:54:44 - message_pipeline - DEBUG - message_pipeline.py:323 - Autonomous evaluation: no action needed - Too soon since last action (0s < 45s minimum)
+2025-08-25 07:54:44 - AIProcess - INFO - ai_process.py:77 - Connected to AI Bridge successfully!
+2025-08-25 07:54:44 - AIProcess - INFO - ai_process.py:528 - AI output monitor started - forwarding responses via TCP
+2025-08-25 07:54:44 - AIProcess - INFO - ai_process.py:167 - 📥 Received message: process_chat
+2025-08-25 07:54:44 - AIProcess - INFO - ai_process.py:202 - Processing chat: 'Configuration Loaded' from [^.^Ayashi^.^] Aizawa hair(Unrigged)
+2025-08-25 07:54:44 - httpx - INFO - _client.py:1026 - HTTP Request: GET http://localhost:8000/api/v2/pre-flight-checks "HTTP/1.1 200 OK"
+2025-08-25 07:54:45 - httpx - INFO - _client.py:1026 - HTTP Request: POST http://localhost:8000/api/v2/tenants/default_tenant/databases/default_database/collections/b224f6dc-c194-41dd-90ea-fec7cba74a57/add "HTTP/1.1 201 Created"
+2025-08-25 07:54:45 - memory_systems - DEBUG - memory_systems.py:98 - Stored conversation memory: [CONVERSATION] [^.^Ayashi^.^] Aizawa hair(Unrigged...
+2025-08-25 07:54:45 - httpx - INFO - _client.py:1026 - HTTP Request: POST http://localhost:8000/api/v2/tenants/default_tenant/databases/default_database/collections/b224f6dc-c194-41dd-90ea-fec7cba74a57/query "HTTP/1.1 200 OK"
+2025-08-25 07:54:45 - httpx - INFO - _client.py:1026 - HTTP Request: POST http://localhost:8000/api/v2/tenants/default_tenant/databases/default_database/collections/b224f6dc-c194-41dd-90ea-fec7cba74a57/query "HTTP/1.1 200 OK"
+2025-08-25 07:54:46 - httpx - INFO - _client.py:1026 - HTTP Request: POST http://localhost:8000/api/v2/tenants/default_tenant/databases/default_database/collections/b224f6dc-c194-41dd-90ea-fec7cba74a57/query "HTTP/1.1 200 OK"
+2025-08-25 07:54:46 - httpx - INFO - _client.py:1026 - HTTP Request: POST http://localhost:8000/api/v2/tenants/default_tenant/databases/default_database/collections/b224f6dc-c194-41dd-90ea-fec7cba74a57/query "HTTP/1.1 200 OK"
+2025-08-25 07:54:46 - memory_systems - DEBUG - memory_systems.py:750 - Neo4j not available for fact search
+2025-08-25 07:54:46 - message_pipeline - DEBUG - message_pipeline.py:270 - Retrieved 3 relevant memories
+2025-08-25 07:54:46 - llm_interface - ERROR - llm_interface.py:206 - Error in LLM action generation: LLM API error 401: {"error":{"message":"No auth credentials found","code":401}}
+2025-08-25 07:54:46 - message_pipeline - DEBUG - message_pipeline.py:643 - Action: do nothing
+2025-08-25 07:54:46 - httpx - INFO - _client.py:1026 - HTTP Request: POST http://localhost:8000/api/v2/tenants/default_tenant/databases/default_database/collections/b224f6dc-c194-41dd-90ea-fec7cba74a57/add "HTTP/1.1 201 Created"
+2025-08-25 07:54:46 - memory_systems - DEBUG - memory_systems.py:98 - Stored conversation memory: [CONVERSATION] BabyMiku Takeda: remains quiet due ...
+2025-08-25 07:54:46 - message_pipeline - DEBUG - message_pipeline.py:298 - Stored interaction memory for conversation with [^.^Ayashi^.^] Aizawa hair(Unrigged)
+2025-08-25 07:54:46 - message_pipeline - INFO - message_pipeline.py:306 - Processed reactive message from [^.^Ayashi^.^] Aizawa hair(Unrigged)
+2025-08-25 07:54:46 - ai_controller - DEBUG - ai_controller.py:145 - Processed message from [^.^Ayashi^.^] Aizawa hair(Unrigged)
+2025-08-25 07:54:46 - AIProcess - INFO - ai_process.py:225 - AI processed message: 'Configuration Loaded'
+2025-08-25 07:54:46 - AIProcess - INFO - ai_process.py:167 - 📥 Received message: process_chat
+2025-08-25 07:54:46 - AIProcess - INFO - ai_process.py:202 - Processing chat: 'Ready, Memory Free: 9206KiB' from [^.^Ayashi^.^] Aizawa hair(Unrigged)
+2025-08-25 07:54:47 - httpx - INFO - _client.py:1026 - HTTP Request: POST http://localhost:8000/api/v2/tenants/default_tenant/databases/default_database/collections/b224f6dc-c194-41dd-90ea-fec7cba74a57/add "HTTP/1.1 201 Created"
+2025-08-25 07:54:47 - memory_systems - DEBUG - memory_systems.py:98 - Stored conversation memory: [CONVERSATION] [^.^Ayashi^.^] Aizawa hair(Unrigged...
+2025-08-25 07:54:47 - httpx - INFO - _client.py:1026 - HTTP Request: POST http://localhost:8000/api/v2/tenants/default_tenant/databases/default_database/collections/b224f6dc-c194-41dd-90ea-fec7cba74a57/query "HTTP/1.1 200 OK"
+2025-08-25 07:54:47 - httpx - INFO - _client.py:1026 - HTTP Request: POST http://localhost:8000/api/v2/tenants/default_tenant/databases/default_database/collections/b224f6dc-c194-41dd-90ea-fec7cba74a57/query "HTTP/1.1 200 OK"
+2025-08-25 07:54:48 - httpx - INFO - _client.py:1026 - HTTP Request: POST http://localhost:8000/api/v2/tenants/default_tenant/databases/default_database/collections/b224f6dc-c194-41dd-90ea-fec7cba74a57/query "HTTP/1.1 200 OK"
+2025-08-25 07:54:48 - httpx - INFO - _client.py:1026 - HTTP Request: POST http://localhost:8000/api/v2/tenants/default_tenant/databases/default_database/collections/b224f6dc-c194-41dd-90ea-fec7cba74a57/query "HTTP/1.1 200 OK"
+2025-08-25 07:54:48 - memory_systems - DEBUG - memory_systems.py:750 - Neo4j not available for fact search
+2025-08-25 07:54:48 - message_pipeline - DEBUG - message_pipeline.py:270 - Retrieved 3 relevant memories
+2025-08-25 07:54:48 - llm_interface - ERROR - llm_interface.py:206 - Error in LLM action generation: LLM API error 401: {"error":{"message":"No auth credentials found","code":401}}
+2025-08-25 07:54:48 - message_pipeline - DEBUG - message_pipeline.py:643 - Action: do nothing
+2025-08-25 07:54:48 - httpx - INFO - _client.py:1026 - HTTP Request: POST http://localhost:8000/api/v2/tenants/default_tenant/databases/default_database/collections/b224f6dc-c194-41dd-90ea-fec7cba74a57/add "HTTP/1.1 201 Created"
+2025-08-25 07:54:48 - memory_systems - DEBUG - memory_systems.py:98 - Stored conversation memory: [CONVERSATION] BabyMiku Takeda: remains quiet due ...
+2025-08-25 07:54:48 - message_pipeline - DEBUG - message_pipeline.py:298 - Stored interaction memory for conversation with [^.^Ayashi^.^] Aizawa hair(Unrigged)
+2025-08-25 07:54:48 - message_pipeline - INFO - message_pipeline.py:306 - Processed reactive message from [^.^Ayashi^.^] Aizawa hair(Unrigged)
+2025-08-25 07:54:48 - ai_controller - DEBUG - ai_controller.py:145 - Processed message from [^.^Ayashi^.^] Aizawa hair(Unrigged)
+2025-08-25 07:54:48 - AIProcess - INFO - ai_process.py:225 - AI processed message: 'Ready, Memory Free: 9206KiB'
+2025-08-25 07:54:59 - message_pipeline - DEBUG - message_pipeline.py:323 - Autonomous evaluation: no action needed - Too soon since last action (15s < 45s minimum)
+2025-08-25 07:55:14 - message_pipeline - DEBUG - message_pipeline.py:323 - Autonomous evaluation: no action needed - Too soon since last action (30s < 45s minimum)
+2025-08-25 07:55:21 - AIProcess - ERROR - ai_process.py:157 - 💥 Error receiving messages: [WinError 64] The specified network name is no longer available
+2025-08-25 07:55:29 - AIProcess - ERROR - ai_process.py:126 - 💥 Failed to send message: [WinError 64] The specified network name is no longer available
+2025-08-25 07:55:29 - llm_interface - ERROR - llm_interface.py:85 - Error in LLM evaluation: LLM API error 401: {"error":{"message":"No auth credentials found","code":401}}
+2025-08-25 07:55:29 - message_pipeline - DEBUG - message_pipeline.py:323 - Autonomous evaluation: no action needed - LLM error: LLM API error 401: {"error":{"message":"No auth credentials found","code":401}}
+2025-08-25 07:55:44 - AIProcess - ERROR - ai_process.py:126 - 💥 Failed to send message: [WinError 64] The specified network name is no longer available
+2025-08-25 07:55:44 - AIProcess - WARNING - ai_process.py:99 - Error during disconnect: [WinError 64] The specified network name is no longer available
+2025-08-25 07:55:44 - AIProcess - INFO - ai_process.py:101 - 🔌 Disconnected from AI Bridge
+2025-08-25 07:55:44 - AIProcess - INFO - ai_process.py:496 - 🏁 AI Process stopped
+2025-08-25 07:55:44 - AIProcess - INFO - ai_process.py:635 - ✅ AI Process completed successfully
+2025-08-25 07:55:44 - ai_controller - INFO - ai_controller.py:184 - Autonomous behavior loop stopped
+2025-08-25 07:58:18 - root - INFO - logging_config.py:83 - Logging initialized - File: E:\source\phoenix-firestorm\indra\newview\ai_system_20250825_075818.log
+2025-08-25 07:58:18 - root - INFO - logging_config.py:84 - Log level: INFO
+2025-08-25 07:58:18 - python_bridge - INFO - logging_config.py:110 - ============================================================
+2025-08-25 07:58:18 - python_bridge - INFO - logging_config.py:111 - Python Bridge Logging Initialized
+2025-08-25 07:58:18 - python_bridge - INFO - logging_config.py:112 - ============================================================
+2025-08-25 07:58:18 - root - INFO - logging_config.py:83 - Logging initialized - File: E:\source\phoenix-firestorm\indra\newview\ai_system_20250825_075818.log
+2025-08-25 07:58:18 - root - INFO - logging_config.py:84 - Log level: INFO
+2025-08-25 07:58:18 - python_bridge - INFO - logging_config.py:110 - ============================================================
+2025-08-25 07:58:18 - python_bridge - INFO - logging_config.py:111 - Python Bridge Logging Initialized
+2025-08-25 07:58:18 - python_bridge - INFO - logging_config.py:112 - ============================================================
+2025-08-25 07:58:18 - root - INFO - ai_controller.py:19 - AI Controller logging initialized to: E:\source\phoenix-firestorm\indra\newview\ai_system_20250825_075818.log
+2025-08-25 07:58:18 - AIProcess - INFO - ai_process.py:627 - AI Process Starting - Hot Restart Capable!
+2025-08-25 07:58:18 - AIProcess - INFO - ai_process.py:628 - Connecting to 127.0.0.1:9999
+2025-08-25 07:58:18 - AIProcess - INFO - ai_process.py:451 - 🚀 Starting AI Process...
+2025-08-25 07:58:18 - AIProcess - INFO - ai_process.py:421 - Initializing AI system...
+2025-08-25 07:58:18 - mood_system - INFO - mood_system.py:46 - MoodSystem initialized for BabyMiku Takeda with default mood: MoodState.OBSERVANT
+2025-08-25 07:58:18 - autonomous_engine - INFO - autonomous_engine.py:56 - AutonomousDecisionEngine initialized for BabyMiku Takeda
+2025-08-25 07:58:18 - environment_monitor - INFO - environment_monitor.py:52 - EnvironmentMonitor initialized
+2025-08-25 07:58:18 - httpx - INFO - _client.py:1026 - HTTP Request: POST http://localhost:8000/api/v2/tenants/default_tenant/databases/default_database/collections "HTTP/1.1 200 OK"
+2025-08-25 07:58:18 - memory_systems - INFO - memory_systems.py:65 - VectorMemory switched to collection: babymiku-takeda
+2025-08-25 07:58:18 - memory_systems - INFO - memory_systems.py:462 - Memory manager switched to persona: BabyMiku Takeda
+2025-08-25 07:58:18 - message_pipeline - INFO - message_pipeline.py:75 - MessagePipeline initialized for BabyMiku Takeda
+2025-08-25 07:58:18 - ai_controller - INFO - ai_controller.py:60 - AIController initialized for persona: BabyMiku Takeda
+2025-08-25 07:58:18 - ai_controller - INFO - ai_controller.py:80 - AIController.start() called for BabyMiku Takeda
+2025-08-25 07:58:18 - ai_controller - INFO - ai_controller.py:87 - Starting AIController for BabyMiku Takeda...
+2025-08-25 07:58:18 - ai_controller - INFO - ai_controller.py:91 - Starting message pipeline for BabyMiku Takeda
+2025-08-25 07:58:18 - memory_systems - INFO - memory_systems.py:462 - Memory manager switched to persona: BabyMiku Takeda
+2025-08-25 07:58:18 - message_pipeline - INFO - message_pipeline.py:110 - Memory system switched to persona: BabyMiku Takeda
+2025-08-25 07:58:18 - python_message_queue - INFO - python_message_queue.py:592 - MessageQueueInterface created: memory_mapped, path: C:\Users\Yuki\AppData\Local\Temp\genesis_ai_queue.bin
+2025-08-25 07:58:18 - python_message_queue - INFO - python_message_queue.py:254 - Memory-mapped queue initialized: C:\Users\Yuki\AppData\Local\Temp\genesis_ai_queue.bin
+2025-08-25 07:58:18 - python_message_queue - INFO - python_message_queue.py:601 - Message queue initialized successfully: memory_mapped
+2025-08-25 07:58:18 - message_pipeline - INFO - message_pipeline.py:94 - Message queue initialized for BabyMiku Takeda: memory_mapped
+2025-08-25 07:58:18 - environment_monitor - INFO - environment_monitor.py:62 - Environment monitoring started
+2025-08-25 07:58:18 - message_pipeline - INFO - message_pipeline.py:119 - MessagePipeline started for BabyMiku Takeda
+2025-08-25 07:58:18 - ai_controller - INFO - ai_controller.py:95 - Creating autonomous task for BabyMiku Takeda
+2025-08-25 07:58:18 - ai_controller - INFO - ai_controller.py:98 - AIController started successfully for BabyMiku Takeda
+2025-08-25 07:58:18 - ai_controller - INFO - ai_controller.py:99 - Autonomous task created: <Task pending name='Task-3' coro=<AIController._autonomous_loop() running at D:\@home\snow\Documents\genesis\ai_controller.py:154>>
+2025-08-25 07:58:18 - ai_controller - DEBUG - ai_controller.py:76 - TCP client reference set for autonomous engine
+2025-08-25 07:58:18 - AIProcess - INFO - ai_process.py:442 - AI system initialized successfully!
+2025-08-25 07:58:18 - AIProcess - INFO - ai_process.py:73 - Connecting to AI Bridge at 127.0.0.1:9999...
+2025-08-25 07:58:18 - ai_controller - INFO - ai_controller.py:156 - Autonomous behavior loop started
+2025-08-25 07:58:18 - AIProcess - WARNING - ai_process.py:106 - Cannot send message - not connected
+2025-08-25 07:58:18 - message_pipeline - DEBUG - message_pipeline.py:323 - Autonomous evaluation: no action needed - Too soon since last action (0s < 45s minimum)
+2025-08-25 07:58:18 - AIProcess - INFO - ai_process.py:77 - Connected to AI Bridge successfully!
+2025-08-25 07:58:18 - AIProcess - INFO - ai_process.py:528 - AI output monitor started - forwarding responses via TCP
+2025-08-25 07:58:18 - AIProcess - INFO - ai_process.py:167 - 📥 Received message: process_chat
+2025-08-25 07:58:18 - AIProcess - INFO - ai_process.py:202 - Processing chat: 'Configuration Loaded' from [^.^Ayashi^.^] Aizawa hair(Unrigged)
+2025-08-25 07:58:18 - httpx - INFO - _client.py:1026 - HTTP Request: GET http://localhost:8000/api/v2/pre-flight-checks "HTTP/1.1 200 OK"
+2025-08-25 07:58:18 - httpx - INFO - _client.py:1026 - HTTP Request: POST http://localhost:8000/api/v2/tenants/default_tenant/databases/default_database/collections/b224f6dc-c194-41dd-90ea-fec7cba74a57/add "HTTP/1.1 201 Created"
+2025-08-25 07:58:18 - memory_systems - DEBUG - memory_systems.py:98 - Stored conversation memory: [CONVERSATION] [^.^Ayashi^.^] Aizawa hair(Unrigged...
+2025-08-25 07:58:19 - httpx - INFO - _client.py:1026 - HTTP Request: POST http://localhost:8000/api/v2/tenants/default_tenant/databases/default_database/collections/b224f6dc-c194-41dd-90ea-fec7cba74a57/query "HTTP/1.1 200 OK"
+2025-08-25 07:58:19 - httpx - INFO - _client.py:1026 - HTTP Request: POST http://localhost:8000/api/v2/tenants/default_tenant/databases/default_database/collections/b224f6dc-c194-41dd-90ea-fec7cba74a57/query "HTTP/1.1 200 OK"
+2025-08-25 07:58:19 - httpx - INFO - _client.py:1026 - HTTP Request: POST http://localhost:8000/api/v2/tenants/default_tenant/databases/default_database/collections/b224f6dc-c194-41dd-90ea-fec7cba74a57/query "HTTP/1.1 200 OK"
+2025-08-25 07:58:20 - httpx - INFO - _client.py:1026 - HTTP Request: POST http://localhost:8000/api/v2/tenants/default_tenant/databases/default_database/collections/b224f6dc-c194-41dd-90ea-fec7cba74a57/query "HTTP/1.1 200 OK"
+2025-08-25 07:58:20 - memory_systems - DEBUG - memory_systems.py:750 - Neo4j not available for fact search
+2025-08-25 07:58:20 - message_pipeline - DEBUG - message_pipeline.py:270 - Retrieved 3 relevant memories
+2025-08-25 07:58:20 - llm_interface - ERROR - llm_interface.py:206 - Error in LLM action generation: LLM API error 401: {"error":{"message":"No auth credentials found","code":401}}
+2025-08-25 07:58:20 - message_pipeline - DEBUG - message_pipeline.py:643 - Action: do nothing
+2025-08-25 07:58:20 - httpx - INFO - _client.py:1026 - HTTP Request: POST http://localhost:8000/api/v2/tenants/default_tenant/databases/default_database/collections/b224f6dc-c194-41dd-90ea-fec7cba74a57/add "HTTP/1.1 201 Created"
+2025-08-25 07:58:20 - memory_systems - DEBUG - memory_systems.py:98 - Stored conversation memory: [CONVERSATION] BabyMiku Takeda: remains quiet due ...
+2025-08-25 07:58:20 - message_pipeline - DEBUG - message_pipeline.py:298 - Stored interaction memory for conversation with [^.^Ayashi^.^] Aizawa hair(Unrigged)
+2025-08-25 07:58:20 - message_pipeline - INFO - message_pipeline.py:306 - Processed reactive message from [^.^Ayashi^.^] Aizawa hair(Unrigged)
+2025-08-25 07:58:20 - ai_controller - DEBUG - ai_controller.py:145 - Processed message from [^.^Ayashi^.^] Aizawa hair(Unrigged)
+2025-08-25 07:58:20 - AIProcess - INFO - ai_process.py:225 - AI processed message: 'Configuration Loaded'
+2025-08-25 07:58:20 - AIProcess - INFO - ai_process.py:167 - 📥 Received message: process_chat
+2025-08-25 07:58:20 - AIProcess - INFO - ai_process.py:202 - Processing chat: 'Ready, Memory Free: 9206KiB' from [^.^Ayashi^.^] Aizawa hair(Unrigged)
+2025-08-25 07:58:21 - httpx - INFO - _client.py:1026 - HTTP Request: POST http://localhost:8000/api/v2/tenants/default_tenant/databases/default_database/collections/b224f6dc-c194-41dd-90ea-fec7cba74a57/add "HTTP/1.1 201 Created"
+2025-08-25 07:58:21 - memory_systems - DEBUG - memory_systems.py:98 - Stored conversation memory: [CONVERSATION] [^.^Ayashi^.^] Aizawa hair(Unrigged...
+2025-08-25 07:58:21 - httpx - INFO - _client.py:1026 - HTTP Request: POST http://localhost:8000/api/v2/tenants/default_tenant/databases/default_database/collections/b224f6dc-c194-41dd-90ea-fec7cba74a57/query "HTTP/1.1 200 OK"
+2025-08-25 07:58:21 - httpx - INFO - _client.py:1026 - HTTP Request: POST http://localhost:8000/api/v2/tenants/default_tenant/databases/default_database/collections/b224f6dc-c194-41dd-90ea-fec7cba74a57/query "HTTP/1.1 200 OK"
+2025-08-25 07:58:21 - httpx - INFO - _client.py:1026 - HTTP Request: POST http://localhost:8000/api/v2/tenants/default_tenant/databases/default_database/collections/b224f6dc-c194-41dd-90ea-fec7cba74a57/query "HTTP/1.1 200 OK"
+2025-08-25 07:58:22 - httpx - INFO - _client.py:1026 - HTTP Request: POST http://localhost:8000/api/v2/tenants/default_tenant/databases/default_database/collections/b224f6dc-c194-41dd-90ea-fec7cba74a57/query "HTTP/1.1 200 OK"
+2025-08-25 07:58:22 - memory_systems - DEBUG - memory_systems.py:750 - Neo4j not available for fact search
+2025-08-25 07:58:22 - message_pipeline - DEBUG - message_pipeline.py:270 - Retrieved 3 relevant memories
+2025-08-25 07:58:22 - llm_interface - ERROR - llm_interface.py:206 - Error in LLM action generation: LLM API error 401: {"error":{"message":"No auth credentials found","code":401}}
+2025-08-25 07:58:22 - message_pipeline - DEBUG - message_pipeline.py:643 - Action: do nothing
+2025-08-25 07:58:22 - httpx - INFO - _client.py:1026 - HTTP Request: POST http://localhost:8000/api/v2/tenants/default_tenant/databases/default_database/collections/b224f6dc-c194-41dd-90ea-fec7cba74a57/add "HTTP/1.1 201 Created"
+2025-08-25 07:58:22 - memory_systems - DEBUG - memory_systems.py:98 - Stored conversation memory: [CONVERSATION] BabyMiku Takeda: remains quiet due ...
+2025-08-25 07:58:22 - message_pipeline - DEBUG - message_pipeline.py:298 - Stored interaction memory for conversation with [^.^Ayashi^.^] Aizawa hair(Unrigged)
+2025-08-25 07:58:22 - message_pipeline - INFO - message_pipeline.py:306 - Processed reactive message from [^.^Ayashi^.^] Aizawa hair(Unrigged)
+2025-08-25 07:58:22 - ai_controller - DEBUG - ai_controller.py:145 - Processed message from [^.^Ayashi^.^] Aizawa hair(Unrigged)
+2025-08-25 07:58:22 - AIProcess - INFO - ai_process.py:225 - AI processed message: 'Ready, Memory Free: 9206KiB'
+2025-08-25 07:58:26 - AIProcess - ERROR - ai_process.py:157 - 💥 Error receiving messages: [WinError 64] The specified network name is no longer available
+2025-08-25 08:01:46 - root - INFO - logging_config.py:83 - Logging initialized - File: E:\source\phoenix-firestorm\indra\newview\ai_system_20250825_080146.log
+2025-08-25 08:01:46 - root - INFO - logging_config.py:84 - Log level: INFO
+2025-08-25 08:01:46 - python_bridge - INFO - logging_config.py:110 - ============================================================
+2025-08-25 08:01:46 - python_bridge - INFO - logging_config.py:111 - Python Bridge Logging Initialized
+2025-08-25 08:01:46 - python_bridge - INFO - logging_config.py:112 - ============================================================
+2025-08-25 08:01:46 - root - INFO - logging_config.py:83 - Logging initialized - File: E:\source\phoenix-firestorm\indra\newview\ai_system_20250825_080146.log
+2025-08-25 08:01:46 - root - INFO - logging_config.py:84 - Log level: INFO
+2025-08-25 08:01:46 - python_bridge - INFO - logging_config.py:110 - ============================================================
+2025-08-25 08:01:46 - python_bridge - INFO - logging_config.py:111 - Python Bridge Logging Initialized
+2025-08-25 08:01:46 - python_bridge - INFO - logging_config.py:112 - ============================================================
+2025-08-25 08:01:46 - root - INFO - ai_controller.py:19 - AI Controller logging initialized to: E:\source\phoenix-firestorm\indra\newview\ai_system_20250825_080146.log
+2025-08-25 08:01:46 - AIProcess - INFO - ai_process.py:627 - AI Process Starting - Hot Restart Capable!
+2025-08-25 08:01:46 - AIProcess - INFO - ai_process.py:628 - Connecting to 127.0.0.1:9999
+2025-08-25 08:01:46 - AIProcess - INFO - ai_process.py:451 - 🚀 Starting AI Process...
+2025-08-25 08:01:46 - AIProcess - INFO - ai_process.py:421 - Initializing AI system...
+2025-08-25 08:01:46 - mood_system - INFO - mood_system.py:46 - MoodSystem initialized for BabyMiku Takeda with default mood: MoodState.OBSERVANT
+2025-08-25 08:01:46 - autonomous_engine - INFO - autonomous_engine.py:56 - AutonomousDecisionEngine initialized for BabyMiku Takeda
+2025-08-25 08:01:46 - environment_monitor - INFO - environment_monitor.py:52 - EnvironmentMonitor initialized
+2025-08-25 08:01:46 - httpx - INFO - _client.py:1026 - HTTP Request: POST http://localhost:8000/api/v2/tenants/default_tenant/databases/default_database/collections "HTTP/1.1 200 OK"
+2025-08-25 08:01:46 - memory_systems - INFO - memory_systems.py:65 - VectorMemory switched to collection: babymiku-takeda
+2025-08-25 08:01:46 - memory_systems - INFO - memory_systems.py:462 - Memory manager switched to persona: BabyMiku Takeda
+2025-08-25 08:01:46 - message_pipeline - INFO - message_pipeline.py:75 - MessagePipeline initialized for BabyMiku Takeda
+2025-08-25 08:01:46 - ai_controller - INFO - ai_controller.py:60 - AIController initialized for persona: BabyMiku Takeda
+2025-08-25 08:01:46 - ai_controller - INFO - ai_controller.py:80 - AIController.start() called for BabyMiku Takeda
+2025-08-25 08:01:46 - ai_controller - INFO - ai_controller.py:87 - Starting AIController for BabyMiku Takeda...
+2025-08-25 08:01:46 - ai_controller - INFO - ai_controller.py:91 - Starting message pipeline for BabyMiku Takeda
+2025-08-25 08:01:46 - memory_systems - INFO - memory_systems.py:462 - Memory manager switched to persona: BabyMiku Takeda
+2025-08-25 08:01:46 - message_pipeline - INFO - message_pipeline.py:110 - Memory system switched to persona: BabyMiku Takeda
+2025-08-25 08:01:46 - python_message_queue - INFO - python_message_queue.py:592 - MessageQueueInterface created: memory_mapped, path: C:\Users\Yuki\AppData\Local\Temp\genesis_ai_queue.bin
+2025-08-25 08:01:46 - python_message_queue - INFO - python_message_queue.py:254 - Memory-mapped queue initialized: C:\Users\Yuki\AppData\Local\Temp\genesis_ai_queue.bin
+2025-08-25 08:01:46 - python_message_queue - INFO - python_message_queue.py:601 - Message queue initialized successfully: memory_mapped
+2025-08-25 08:01:46 - message_pipeline - INFO - message_pipeline.py:94 - Message queue initialized for BabyMiku Takeda: memory_mapped
+2025-08-25 08:01:46 - environment_monitor - INFO - environment_monitor.py:62 - Environment monitoring started
+2025-08-25 08:01:46 - message_pipeline - INFO - message_pipeline.py:119 - MessagePipeline started for BabyMiku Takeda
+2025-08-25 08:01:46 - ai_controller - INFO - ai_controller.py:95 - Creating autonomous task for BabyMiku Takeda
+2025-08-25 08:01:46 - ai_controller - INFO - ai_controller.py:98 - AIController started successfully for BabyMiku Takeda
+2025-08-25 08:01:46 - ai_controller - INFO - ai_controller.py:99 - Autonomous task created: <Task pending name='Task-3' coro=<AIController._autonomous_loop() running at D:\@home\snow\Documents\genesis\ai_controller.py:154>>
+2025-08-25 08:01:46 - ai_controller - DEBUG - ai_controller.py:76 - TCP client reference set for autonomous engine
+2025-08-25 08:01:46 - AIProcess - INFO - ai_process.py:442 - AI system initialized successfully!
+2025-08-25 08:01:46 - AIProcess - INFO - ai_process.py:73 - Connecting to AI Bridge at 127.0.0.1:9999...
+2025-08-25 08:01:46 - ai_controller - INFO - ai_controller.py:156 - Autonomous behavior loop started
+2025-08-25 08:01:46 - AIProcess - WARNING - ai_process.py:106 - Cannot send message - not connected
+2025-08-25 08:01:46 - message_pipeline - DEBUG - message_pipeline.py:323 - Autonomous evaluation: no action needed - Too soon since last action (0s < 45s minimum)
+2025-08-25 08:01:46 - AIProcess - INFO - ai_process.py:77 - Connected to AI Bridge successfully!
+2025-08-25 08:01:46 - AIProcess - INFO - ai_process.py:528 - AI output monitor started - forwarding responses via TCP
+2025-08-25 08:01:46 - AIProcess - INFO - ai_process.py:167 - 📥 Received message: process_chat
+2025-08-25 08:01:46 - AIProcess - INFO - ai_process.py:202 - Processing chat: 'Configuration Loaded' from [^.^Ayashi^.^] Aizawa hair(Unrigged)
+2025-08-25 08:01:47 - httpx - INFO - _client.py:1026 - HTTP Request: GET http://localhost:8000/api/v2/pre-flight-checks "HTTP/1.1 200 OK"
+2025-08-25 08:01:47 - httpx - INFO - _client.py:1026 - HTTP Request: POST http://localhost:8000/api/v2/tenants/default_tenant/databases/default_database/collections/b224f6dc-c194-41dd-90ea-fec7cba74a57/add "HTTP/1.1 201 Created"
+2025-08-25 08:01:47 - memory_systems - DEBUG - memory_systems.py:98 - Stored conversation memory: [CONVERSATION] [^.^Ayashi^.^] Aizawa hair(Unrigged...
+2025-08-25 08:01:47 - httpx - INFO - _client.py:1026 - HTTP Request: POST http://localhost:8000/api/v2/tenants/default_tenant/databases/default_database/collections/b224f6dc-c194-41dd-90ea-fec7cba74a57/query "HTTP/1.1 200 OK"
+2025-08-25 08:01:47 - httpx - INFO - _client.py:1026 - HTTP Request: POST http://localhost:8000/api/v2/tenants/default_tenant/databases/default_database/collections/b224f6dc-c194-41dd-90ea-fec7cba74a57/query "HTTP/1.1 200 OK"
+2025-08-25 08:01:48 - httpx - INFO - _client.py:1026 - HTTP Request: POST http://localhost:8000/api/v2/tenants/default_tenant/databases/default_database/collections/b224f6dc-c194-41dd-90ea-fec7cba74a57/query "HTTP/1.1 200 OK"
+2025-08-25 08:01:48 - httpx - INFO - _client.py:1026 - HTTP Request: POST http://localhost:8000/api/v2/tenants/default_tenant/databases/default_database/collections/b224f6dc-c194-41dd-90ea-fec7cba74a57/query "HTTP/1.1 200 OK"
+2025-08-25 08:01:48 - memory_systems - DEBUG - memory_systems.py:750 - Neo4j not available for fact search
+2025-08-25 08:01:48 - message_pipeline - DEBUG - message_pipeline.py:270 - Retrieved 3 relevant memories
+2025-08-25 08:01:48 - llm_interface - ERROR - llm_interface.py:206 - Error in LLM action generation: LLM API error 401: {"error":{"message":"No auth credentials found","code":401}}
+2025-08-25 08:01:48 - message_pipeline - DEBUG - message_pipeline.py:643 - Action: do nothing
+2025-08-25 08:01:49 - httpx - INFO - _client.py:1026 - HTTP Request: POST http://localhost:8000/api/v2/tenants/default_tenant/databases/default_database/collections/b224f6dc-c194-41dd-90ea-fec7cba74a57/add "HTTP/1.1 201 Created"
+2025-08-25 08:01:49 - memory_systems - DEBUG - memory_systems.py:98 - Stored conversation memory: [CONVERSATION] BabyMiku Takeda: remains quiet due ...
+2025-08-25 08:01:49 - message_pipeline - DEBUG - message_pipeline.py:298 - Stored interaction memory for conversation with [^.^Ayashi^.^] Aizawa hair(Unrigged)
+2025-08-25 08:01:49 - message_pipeline - INFO - message_pipeline.py:306 - Processed reactive message from [^.^Ayashi^.^] Aizawa hair(Unrigged)
+2025-08-25 08:01:49 - ai_controller - DEBUG - ai_controller.py:145 - Processed message from [^.^Ayashi^.^] Aizawa hair(Unrigged)
+2025-08-25 08:01:49 - AIProcess - INFO - ai_process.py:225 - AI processed message: 'Configuration Loaded'
+2025-08-25 08:01:49 - AIProcess - INFO - ai_process.py:167 - 📥 Received message: process_chat
+2025-08-25 08:01:49 - AIProcess - INFO - ai_process.py:202 - Processing chat: 'Ready, Memory Free: 9206KiB' from [^.^Ayashi^.^] Aizawa hair(Unrigged)
+2025-08-25 08:01:49 - httpx - INFO - _client.py:1026 - HTTP Request: POST http://localhost:8000/api/v2/tenants/default_tenant/databases/default_database/collections/b224f6dc-c194-41dd-90ea-fec7cba74a57/add "HTTP/1.1 201 Created"
+2025-08-25 08:01:49 - memory_systems - DEBUG - memory_systems.py:98 - Stored conversation memory: [CONVERSATION] [^.^Ayashi^.^] Aizawa hair(Unrigged...
+2025-08-25 08:01:49 - httpx - INFO - _client.py:1026 - HTTP Request: POST http://localhost:8000/api/v2/tenants/default_tenant/databases/default_database/collections/b224f6dc-c194-41dd-90ea-fec7cba74a57/query "HTTP/1.1 200 OK"
+2025-08-25 08:01:50 - httpx - INFO - _client.py:1026 - HTTP Request: POST http://localhost:8000/api/v2/tenants/default_tenant/databases/default_database/collections/b224f6dc-c194-41dd-90ea-fec7cba74a57/query "HTTP/1.1 200 OK"

@@ -51,6 +51,9 @@ public:
     FSFloaterNearbyChat(const LLSD& key);
     ~FSFloaterNearbyChat();
 
+    // Called when gSavedSettings['EnablePythonAI'] changes. Updates any internal state or UI as needed.
+    static void onEnablePythonAIChanged(const LLSD& newvalue);
+
     bool postBuild() override;
 
     /** @param archive true - to save a message to the chat history log */

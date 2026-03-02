@@ -86,6 +86,8 @@ endif ()
 
 set(viewer_SOURCE_FILES
 # <Add FS includes below this line>
+    python_bridge/py_ai_process_bridge.cpp
+    fsaiintegration.cpp
     alfloaterregiontracker.cpp
     animationexplorer.cpp
     ao.cpp
@@ -930,6 +932,7 @@ set(viewer_HEADER_FILES
     ViewerInstall.cmake
 
 # <Add FS includes below this line>
+    fsaiintegration.h
     alfloaterregiontracker.h
     animationexplorer.h
     ao.h
@@ -2604,6 +2607,25 @@ if (USE_DISCORD)
    target_link_libraries(${VIEWER_BINARY_NAME} ll::discord_sdk )
 endif ()
 
+target_sources(${VIEWER_BINARY_NAME} PRIVATE
+    llopenxrmanager.cpp
+    llopenxrmanager.h
+    )
+
+add_executable(openxr_glreq_probe
+    openxr_glreq_probe.cpp
+    )
+
+target_link_libraries(openxr_glreq_probe
+    ll::openxr
+    )
+
+if (LINUX)
+    target_link_libraries(openxr_glreq_probe
+        "dl"
+        )
+endif (LINUX)
+
 if( TARGET ll::intel_memops )
    target_link_libraries(${VIEWER_BINARY_NAME} ll::intel_memops )
 endif()
@@ -3128,4 +3150,3 @@ if (LL_TESTS)
 endif (LL_TESTS)
 
 check_message_template(${VIEWER_BINARY_NAME})
-

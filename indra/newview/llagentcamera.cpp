@@ -48,6 +48,8 @@
 #include "llviewerobjectlist.h"
 #include "llviewerregion.h"
 #include "llviewerwindow.h"
+#include "llkeyboard.h"
+#include "llopenxrmanager.h"
 #include "llvoavatarself.h"
 #include "llwindow.h"
 #include "llworld.h"
@@ -106,6 +108,162 @@ const F32 GROUND_TO_AIR_CAMERA_TRANSITION_TIME = 0.5f;
 const F32 GROUND_TO_AIR_CAMERA_TRANSITION_START_TIME = 0.5f;
 
 const F32 OBJECT_EXTENTS_PADDING = 0.5f;
+
+bool offsetEyeCompleted = 0;
+
+void debugVLocal(const std::string& mess, const LLVector3& v)
+{
+    FSCommon::report_to_nearby_chat(llformat("%s <%0.00001f,%0.00001f,%0.00001f>", mess, v.mV[0], v.mV[0], v.mV[0]));
+}
+
+F32 distance_between_vectors(const LLVector3& a, const LLVector3& b)
+{
+    F32 x = a.mV[0] - b.mV[0];
+    F32 y = a.mV[1] - b.mV[1];
+    F32 z = a.mV[2] - b.mV[2];
+    return (F32)sqrt(x * x + y * y + z * z);
+}
+
+namespace
+{
+constexpr const char* VIEWPOINT_OVERRIDE_ATTACHMENT_NAME = "viewpoint_override";
+constexpr const char* VIEWPOINT_OVERRIDE_DISABLE_HEAD_ANIMS_KEY = "FSViewpointOverrideDisableHeadAnims";
+constexpr const char* VIEWPOINT_OVERRIDE_INSTANT_HEAD_ROT_KEY = "FSViewpointOverrideInstantHeadRot";
+constexpr const char* VIEWPOINT_OVERRIDE_HEAD_ROLL_KEY = "FSViewpointOverrideHeadRoll";
+constexpr F32 DEFAULT_CAMERA_NEAR_CLIP = 0.1f;
+constexpr F32 VIEWPOINT_OVERRIDE_CAMERA_NEAR_CLIP = 0.01f;
+bool sViewpointOverrideMouseCaptured = true;
+bool sViewpointOverrideCtrlWasDown = false;
+bool sViewpointOverrideWasActive = false;
+F32 sViewpointOverrideHeadYaw = 0.f;
+F32 sViewpointOverrideHeadPitch = 0.f;
+F32 sViewpointOverrideHeadRoll = 0.f;
+bool sViewpointOverrideHmdCalibrated = false;
+F32 sViewpointOverrideHmdBaseYaw = 0.f;
+F32 sViewpointOverrideHmdBasePitch = 0.f;
+F32 sViewpointOverrideHmdBaseRoll = 0.f;
+bool sViewpointOverrideDisableHeadAnims = true;
+bool sViewpointOverrideInstantHeadRot = true;
+constexpr F32 VIEWPOINT_OVERRIDE_HEAD_ROTATION_CONSTRAINT = F_PI_BY_TWO * 0.8f; // match LLHeadRotMotion
+
+LLViewerObject* findViewpointOverrideMesh()
+{
+    if (gAgentAvatarp.isNull() || !gAgentAvatarp->isValid())
+    {
+        return nullptr;
+    }
+
+    for (const auto& attachment : gAgentAvatarp->mAttachmentPoints)
+    {
+        if (!attachment.second)
+        {
+            continue;
+        }
+
+        for (const auto& attached_object : attachment.second->mAttachedObjects)
+        {
+            LLViewerObject* object = attached_object.get();
+            if (object && object->getAttachmentItemName() == VIEWPOINT_OVERRIDE_ATTACHMENT_NAME)
+            {
+                return object;
+            }
+        }
+    }
+
+    return nullptr;
+}
+
+LLQuaternion getViewpointOverrideLookBasisRotation()
+{
+    if (gAgentAvatarp.isNull() || !gAgentAvatarp->isValid())
+    {
+        return LLQuaternion::DEFAULT;
+    }
+
+    if (gAgentAvatarp->mChestp)
+    {
+        return gAgentAvatarp->mChestp->getWorldRotation();
+    }
+
+    if (gAgentAvatarp->mPelvisp)
+    {
+        return gAgentAvatarp->mPelvisp->getWorldRotation();
+    }
+
+    if (gAgentAvatarp->mRoot)
+    {
+        return gAgentAvatarp->mRoot->getWorldRotation();
+    }
+
+    return LLQuaternion::DEFAULT;
+}
+
+void applyViewpointOverrideMouseCapture(bool captured)
+{
+    if (!gViewerWindow || !gViewerWindow->getWindow())
+    {
+        return;
+    }
+
+    if (captured)
+    {
+        gViewerWindow->hideCursor();
+        gViewerWindow->moveCursorToCenter();
+        gViewerWindow->getWindow()->setMouseClipping(true);
+    }
+    else
+    {
+        gViewerWindow->showCursor();
+        gViewerWindow->getWindow()->setMouseClipping(false);
+    }
+}
+
+bool getViewpointOverrideHmdYawPitchRoll(F32& out_yaw, F32& out_pitch, F32& out_roll)
+{
+    LLOpenXRManager& openxr = LLOpenXRManager::instance();
+    LLVector3 hmd_forward;
+    LLVector3 hmd_up;
+    if (!openxr.getHmdForward(hmd_forward) || !openxr.getHmdUp(hmd_up))
+    {
+        return false;
+    }
+
+    if (hmd_forward.normalize() <= 0.f)
+    {
+        return false;
+    }
+
+    out_yaw = atan2f(hmd_forward.mV[VX], -hmd_forward.mV[VZ]);
+    const F32 horizontal_len = sqrtf(
+        (hmd_forward.mV[VX] * hmd_forward.mV[VX]) +
+        (hmd_forward.mV[VZ] * hmd_forward.mV[VZ]));
+    out_pitch = atan2f(hmd_forward.mV[VY], llmax(horizontal_len, 0.00001f));
+
+    LLVector3 projected_hmd_up = hmd_up - (hmd_forward * (hmd_up * hmd_forward));
+    if (projected_hmd_up.normalize() <= 0.f)
+    {
+        return false;
+    }
+
+    LLVector3 reference_up = LLVector3(0.f, 1.f, 0.f);
+    reference_up -= hmd_forward * (reference_up * hmd_forward);
+    if (reference_up.normalize() <= 0.f)
+    {
+        reference_up = LLVector3(1.f, 0.f, 0.f);
+        reference_up -= hmd_forward * (reference_up * hmd_forward);
+        if (reference_up.normalize() <= 0.f)
+        {
+            return false;
+        }
+    }
+
+    const F32 sin_roll = (reference_up % projected_hmd_up) * hmd_forward;
+    const F32 cos_roll = llclamp(reference_up * projected_hmd_up, -1.f, 1.f);
+    out_roll = atan2f(sin_roll, cos_roll);
+    return true;
+}
+
+} // namespace
 
 static bool isDisableCameraConstraints()
 {
@@ -220,7 +378,7 @@ void LLAgentCamera::init()
 
     LLViewerCamera::getInstance()->setView(DEFAULT_FIELD_OF_VIEW);
     // Leave at 0.1 meters until we have real near clip management
-    LLViewerCamera::getInstance()->setNear(0.1f);
+    LLViewerCamera::getInstance()->setNear(DEFAULT_CAMERA_NEAR_CLIP);
     LLViewerCamera::getInstance()->setFar(mDrawDistance);           // if you want to change camera settings, do so in camera.h
     LLViewerCamera::getInstance()->setAspect( gViewerWindow->getWorldViewAspectRatio() );       // default, overridden in LLViewerWindow::reshape
     LLViewerCamera::getInstance()->setViewHeightInPixels(768);          // default, overridden in LLViewerWindow::reshape
@@ -780,6 +938,12 @@ bool LLAgentCamera::calcCameraMinDistance(F32 &obj_min_distance)
     return true;
 }
 
+// void LLAgentCamera::setEyeOffset(F32 X, F32 Y, F32 Z)
+// {
+//     desiredEyeOffset   = LLVector3(X, Y, Z);
+//     offsetEyeCompleted = 0;
+// }
+
 F32 LLAgentCamera::getCameraZoomFraction(bool get_third_person)
 {
     // 0.f -> camera zoomed all the way out
@@ -1224,8 +1388,163 @@ void LLAgentCamera::updateLookAt(const S32 mouse_x, const S32 mouse_y)
 
     if (!isAgentAvatarValid()) return;
 
+    const bool viewpoint_override_active = (findViewpointOverrideMesh() != nullptr);
     LLQuaternion av_inv_rot = ~gAgentAvatarp->mRoot->getWorldRotation();
     LLVector3 root_at = LLVector3::x_axis * gAgentAvatarp->mRoot->getWorldRotation();
+
+    if (gAgentAvatarp.notNull() && gAgentAvatarp->isValid())
+    {
+        if (viewpoint_override_active)
+        {
+            gAgentAvatarp->setAnimationData(VIEWPOINT_OVERRIDE_DISABLE_HEAD_ANIMS_KEY,
+                                            &sViewpointOverrideDisableHeadAnims);
+        }
+        else
+        {
+            gAgentAvatarp->removeAnimationData(VIEWPOINT_OVERRIDE_DISABLE_HEAD_ANIMS_KEY);
+            gAgentAvatarp->removeAnimationData(VIEWPOINT_OVERRIDE_INSTANT_HEAD_ROT_KEY);
+            gAgentAvatarp->removeAnimationData(VIEWPOINT_OVERRIDE_HEAD_ROLL_KEY);
+        }
+    }
+
+    if (viewpoint_override_active)
+    {
+        if (!sViewpointOverrideWasActive)
+        {
+            sViewpointOverrideWasActive = true;
+            sViewpointOverrideCtrlWasDown = false;
+            sViewpointOverrideMouseCaptured = true;
+            sViewpointOverrideHeadYaw = 0.f;
+            sViewpointOverrideHeadPitch = 0.f;
+            sViewpointOverrideHeadRoll = 0.f;
+            sViewpointOverrideHmdCalibrated = false;
+            sViewpointOverrideHmdBaseYaw = 0.f;
+            sViewpointOverrideHmdBasePitch = 0.f;
+            sViewpointOverrideHmdBaseRoll = 0.f;
+            applyViewpointOverrideMouseCapture(true);
+        }
+
+        const bool ctrl_down = gKeyboard && gKeyboard->getKeyDown(KEY_CONTROL);
+        if (ctrl_down && !sViewpointOverrideCtrlWasDown)
+        {
+            sViewpointOverrideMouseCaptured = !sViewpointOverrideMouseCaptured;
+            applyViewpointOverrideMouseCapture(sViewpointOverrideMouseCaptured);
+        }
+        sViewpointOverrideCtrlWasDown = ctrl_down;
+
+        F32 hmd_yaw = 0.f;
+        F32 hmd_pitch = 0.f;
+        F32 hmd_roll = 0.f;
+        const bool use_hmd_look = getViewpointOverrideHmdYawPitchRoll(hmd_yaw, hmd_pitch, hmd_roll);
+        if (gAgentAvatarp.notNull() && gAgentAvatarp->isValid())
+        {
+            if (use_hmd_look)
+            {
+                gAgentAvatarp->setAnimationData(
+                    VIEWPOINT_OVERRIDE_INSTANT_HEAD_ROT_KEY,
+                    &sViewpointOverrideInstantHeadRot);
+                gAgentAvatarp->setAnimationData(
+                    VIEWPOINT_OVERRIDE_HEAD_ROLL_KEY,
+                    &sViewpointOverrideHeadRoll);
+            }
+            else
+            {
+                gAgentAvatarp->removeAnimationData(VIEWPOINT_OVERRIDE_INSTANT_HEAD_ROT_KEY);
+                gAgentAvatarp->removeAnimationData(VIEWPOINT_OVERRIDE_HEAD_ROLL_KEY);
+            }
+        }
+
+        if (use_hmd_look)
+        {
+            if (!sViewpointOverrideHmdCalibrated)
+            {
+                sViewpointOverrideHmdBaseYaw = hmd_yaw;
+                sViewpointOverrideHmdBasePitch = hmd_pitch;
+                sViewpointOverrideHmdBaseRoll = hmd_roll;
+                sViewpointOverrideHmdCalibrated = true;
+            }
+
+            sViewpointOverrideHeadYaw = llclamp(
+                -(hmd_yaw - sViewpointOverrideHmdBaseYaw),
+                -VIEWPOINT_OVERRIDE_HEAD_ROTATION_CONSTRAINT,
+                 VIEWPOINT_OVERRIDE_HEAD_ROTATION_CONSTRAINT);
+            sViewpointOverrideHeadPitch = llclamp(
+                -(hmd_pitch - sViewpointOverrideHmdBasePitch),
+                -VIEWPOINT_OVERRIDE_HEAD_ROTATION_CONSTRAINT,
+                 VIEWPOINT_OVERRIDE_HEAD_ROTATION_CONSTRAINT);
+            sViewpointOverrideHeadRoll = llclamp(
+                (hmd_roll - sViewpointOverrideHmdBaseRoll),
+                -VIEWPOINT_OVERRIDE_HEAD_ROTATION_CONSTRAINT,
+                 VIEWPOINT_OVERRIDE_HEAD_ROTATION_CONSTRAINT);
+        }
+        else if (sViewpointOverrideMouseCaptured)
+        {
+            sViewpointOverrideHmdCalibrated = false;
+            sViewpointOverrideHeadRoll = 0.f;
+            const F32 NOMINAL_MOUSE_SENSITIVITY = 0.0025f;
+            static LLCachedControl<F32> mouseSensitivity(gSavedSettings, "MouseSensitivity");
+            static LLCachedControl<bool> invertMouse(gSavedSettings, "InvertMouse");
+
+            F32 mouse_sensitivity = (F32)mouseSensitivity;
+            mouse_sensitivity =
+                clamp_rescale(mouse_sensitivity, 0.f, 15.f, 0.5f, 2.75f) * NOMINAL_MOUSE_SENSITIVITY;
+
+            const S32 dx = -gViewerWindow->getCurrentMouseDX();
+            const S32 dy = -gViewerWindow->getCurrentMouseDY();
+
+            if (dx != 0 || dy != 0)
+            {
+                sViewpointOverrideHeadYaw = llclamp(
+                    sViewpointOverrideHeadYaw + (mouse_sensitivity * dx),
+                    -VIEWPOINT_OVERRIDE_HEAD_ROTATION_CONSTRAINT,
+                     VIEWPOINT_OVERRIDE_HEAD_ROTATION_CONSTRAINT);
+
+                const F32 pitch_delta = invertMouse ? (mouse_sensitivity * -dy) : (mouse_sensitivity * dy);
+                sViewpointOverrideHeadPitch = llclamp(
+                    sViewpointOverrideHeadPitch + pitch_delta,
+                    -VIEWPOINT_OVERRIDE_HEAD_ROTATION_CONSTRAINT,
+                     VIEWPOINT_OVERRIDE_HEAD_ROTATION_CONSTRAINT);
+
+                gViewerWindow->moveCursorToCenter();
+            }
+        }
+
+        const LLQuaternion look_basis_rot = getViewpointOverrideLookBasisRotation();
+        LLVector3 headLookAxis = LLVector3::x_axis * look_basis_rot;
+        const LLVector3 up_axis = LLVector3::z_axis * look_basis_rot;
+        LLVector3 left_axis = LLVector3::y_axis * look_basis_rot;
+
+        const LLQuaternion yaw_rot(sViewpointOverrideHeadYaw, up_axis);
+        headLookAxis = headLookAxis * yaw_rot;
+        left_axis = left_axis * yaw_rot;
+
+        const LLQuaternion pitch_rot(sViewpointOverrideHeadPitch, left_axis);
+        headLookAxis = headLookAxis * pitch_rot;
+        headLookAxis.normalize();
+
+        setLookAt(LOOKAT_TARGET_MOUSELOOK, gAgentAvatarp, headLookAxis);
+        last_at_axis = LLVector3::x_axis * look_basis_rot;
+        return;
+    }
+
+    if (sViewpointOverrideWasActive)
+    {
+        // Only force cursor visibility on exit when not in viewer mouselook.
+        if (!cameraMouselook())
+        {
+            applyViewpointOverrideMouseCapture(false);
+        }
+        sViewpointOverrideWasActive = false;
+        sViewpointOverrideCtrlWasDown = false;
+        sViewpointOverrideMouseCaptured = true;
+        sViewpointOverrideHeadYaw = 0.f;
+        sViewpointOverrideHeadPitch = 0.f;
+        sViewpointOverrideHeadRoll = 0.f;
+        sViewpointOverrideHmdCalibrated = false;
+        sViewpointOverrideHmdBaseYaw = 0.f;
+        sViewpointOverrideHmdBasePitch = 0.f;
+        sViewpointOverrideHmdBaseRoll = 0.f;
+    }
 
     if  (LLTrace::get_frame_recording().getLastRecording().getLastValue(*gViewerWindow->getMouseVelocityStat()) < 0.01f
         && (root_at * last_at_axis > 0.95f))
@@ -1606,10 +1925,41 @@ void LLAgentCamera::updateCamera()
     LLVector3 focus_agent = gAgent.getPosAgentFromGlobal(mFocusGlobal);
     LLVector3 position_agent = gAgent.getPosAgentFromGlobal(camera_pos_global);
 
-    // Try to move the camera
+    LLViewerObject* viewpoint_override_mesh = findViewpointOverrideMesh();
+    const bool viewpoint_override_active = (viewpoint_override_mesh != nullptr);
+    LLViewerCamera::getInstance()->setNear(
+        viewpoint_override_active ? VIEWPOINT_OVERRIDE_CAMERA_NEAR_CLIP : DEFAULT_CAMERA_NEAR_CLIP);
+    mCameraPositionAgent = gAgent.getPosAgentFromGlobal(camera_pos_global);
 
-    if (!LLViewerCamera::getInstance()->updateCameraLocation(position_agent, mCameraUpVector, focus_agent))
-        return;
+    if (gAgentAvatarp.notNull() && gAgentAvatarp->isValid())
+    {
+        if (viewpoint_override_active)
+        {
+            mCameraPositionAgent = viewpoint_override_mesh->getRenderPosition();
+            gAgentAvatarp->setAnimationData(VIEWPOINT_OVERRIDE_DISABLE_HEAD_ANIMS_KEY,
+                                            &sViewpointOverrideDisableHeadAnims);
+        }
+        else
+        {
+            gAgentAvatarp->removeAnimationData(VIEWPOINT_OVERRIDE_DISABLE_HEAD_ANIMS_KEY);
+        }
+    }
+    // Move the camera
+
+    LLViewerCamera::getInstance()->updateCameraLocation(mCameraPositionAgent, mCameraUpVector, focus_agent);
+    //LLViewerCamera::getInstance()->updateCameraLocation(mCameraPositionAgent, camera_skyward, focus_agent);
+
+    if (gAgentAvatarp.notNull() && gAgentAvatarp->isValid() && viewpoint_override_active)
+    {
+        if (gAgentAvatarp->mHeadp)
+        {
+            LLViewerCamera::getInstance()->setAxes(gAgentAvatarp->mHeadp->getWorldRotation());
+        }
+        else if (gAgentAvatarp->mEyeLeftp)
+        {
+            LLViewerCamera::getInstance()->setAxes(gAgentAvatarp->mEyeLeftp->getWorldRotation());
+        }
+    }
 
     // Change FOV
     LLViewerCamera::getInstance()->setView(LLViewerCamera::getInstance()->getDefaultFOV() / (1.f + mCameraCurrentFOVZoomFactor));
@@ -2281,6 +2631,11 @@ bool LLAgentCamera::isJoystickCameraUsed()
     return ((mOrbitAroundRadians != 0) || (mOrbitOverAngle != 0) || !mPanFocusDiff.isNull());
 }
 
+// LLVector3 LLAgentCamera::getViewOffset()
+// {
+//     return gAgentAvatarp->mEyeLeftp->getPosition();
+// }
+
 LLVector3 LLAgentCamera::getCameraOffsetInitial()
 {
     // getCameraOffsetInitial and getFocusOffsetInitial can be called on update from idle before init()
@@ -2441,6 +2796,11 @@ F32 LLAgentCamera::getCameraMinOffGround()
     }
 
     return 0.5f;
+}
+
+F32 LLAgentCamera::getPreferredNearClip() const
+{
+    return findViewpointOverrideMesh() ? VIEWPOINT_OVERRIDE_CAMERA_NEAR_CLIP : DEFAULT_CAMERA_NEAR_CLIP;
 }
 
 
