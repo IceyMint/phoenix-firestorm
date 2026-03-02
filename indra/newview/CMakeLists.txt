@@ -53,11 +53,6 @@ include(ColladaDom)
 include(jemalloc)
 include(Discord)
 
-#find_package(Python3 COMPONENTS Development REQUIRED)
-#find_package(pybind11 CONFIG REQUIRED)
-
-#include_directories(${Python3_INCLUDE_DIRS} C:/Users/Yuki/AppData/Local/Programs/Python/Python313/Lib/site-packages/pybind11/include})
-
 # <FS:ND> if using ndPhysicsstub this variable will be unset, we don't need to build any stub code viewer side in that case
 if (LLPHYSICSEXTENSIONS_SRC_DIR)
 # </FS:ND>
@@ -926,9 +921,6 @@ set(viewer_HEADER_FILES
     ViewerInstall.cmake
 
 # <Add FS includes below this line>
-    python_bridge/py_ai_controller_bridge.h
-    python_bridge/ai_message_queue.h
-    python_bridge/queue_processor.h
     fsaiintegration.h
     alfloaterregiontracker.h
     animationexplorer.h
@@ -2559,14 +2551,7 @@ target_link_libraries(${VIEWER_BINARY_NAME}
         ll::openxr
         fs::glod # <FS:Beq/> restore GLOD dependencies
         fs::discord # <FS:Ansariel> Discord  support
-	#pybind11::embed
-	#pybind11::pybind11
         )
-
-target_include_directories(${VIEWER_BINARY_NAME} PRIVATE
-	#C:/Users/Yuki/AppData/Local/Programs/Python/Python313/Lib/site-packages/pybind11/include
-	Z:/source/phoenix-firestorm/indra/newview/python_bridge/include
-)
 
 target_sources(${VIEWER_BINARY_NAME} PRIVATE
     llopenxrmanager.cpp
