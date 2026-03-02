@@ -26,6 +26,7 @@ public:
     bool getHmdUp(LLVector3& out_up) const;
     bool getLeftEyeVerticalFov(F32& out_vertical_fov_radians) const;
     bool getLeftEyeAspect(F32& out_aspect) const;
+    bool getRecommendedRenderSize(S32& out_width, S32& out_height) const;
     void setMonoEnabled(bool enabled);
     bool isMonoEnabled() const;
     bool isSessionRunning() const;

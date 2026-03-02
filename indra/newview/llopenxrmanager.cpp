@@ -13,6 +13,8 @@
 #define XR_USE_PLATFORM_XLIB
 #include <openxr/openxr_platform.h>
 
+#include "llviewerdisplay.h"
+#include "pipeline.h"
 #include "llviewerwindow.h"
 #include "llwindowsdl.h"
 
@@ -240,16 +242,79 @@ XrPosef xr_center_pose_from_views(const XrView& left_view, const XrView& right_v
     return pose;
 }
 
-XrFovf xr_centered_mono_fov(F32 vertical_fov_radians, F32 aspect)
+bool xr_fov_aspect(const XrFovf& fov, F32& out_aspect)
 {
-    XrFovf fov{};
-    const F32 vertical_half = llclamp(vertical_fov_radians * 0.5f, 0.01f, 1.56f);
-    const F32 horizontal_half = llclamp(atanf(tanf(vertical_half) * llmax(aspect, 0.01f)), 0.01f, 1.56f);
+    const F32 horizontal_extent = tanf(fov.angleRight) + tanf(-fov.angleLeft);
+    const F32 vertical_extent = tanf(fov.angleUp) + tanf(-fov.angleDown);
+    if (!std::isfinite(horizontal_extent) || !std::isfinite(vertical_extent) ||
+        horizontal_extent <= 0.f || vertical_extent <= 0.f)
+    {
+        return false;
+    }
 
-    fov.angleLeft = -horizontal_half;
-    fov.angleRight = horizontal_half;
-    fov.angleUp = vertical_half;
-    fov.angleDown = -vertical_half;
+    out_aspect = horizontal_extent / vertical_extent;
+    return std::isfinite(out_aspect) && out_aspect > 0.f;
+}
+
+LLRect center_crop_rect_to_aspect(const LLRect& source_rect, F32 target_aspect)
+{
+    if (!std::isfinite(target_aspect) || target_aspect <= 0.f)
+    {
+        return source_rect;
+    }
+
+    const S32 source_width = llmax(source_rect.getWidth(), 1);
+    const S32 source_height = llmax(source_rect.getHeight(), 1);
+    const F32 source_aspect = (F32)source_width / (F32)source_height;
+    if (fabsf(source_aspect - target_aspect) < 0.0001f)
+    {
+        return source_rect;
+    }
+
+    LLRect cropped_rect = source_rect;
+    if (source_aspect > target_aspect)
+    {
+        const S32 target_width = llclamp((S32)((F32)source_height * target_aspect + 0.5f), 1, source_width);
+        const S32 inset_x = (source_width - target_width) / 2;
+        cropped_rect.mLeft = source_rect.mLeft + inset_x;
+        cropped_rect.mRight = cropped_rect.mLeft + target_width;
+    }
+    else
+    {
+        const S32 target_height = llclamp((S32)((F32)source_width / target_aspect + 0.5f), 1, source_height);
+        const S32 inset_y = (source_height - target_height) / 2;
+        cropped_rect.mBottom = source_rect.mBottom + inset_y;
+        cropped_rect.mTop = cropped_rect.mBottom + target_height;
+    }
+
+    return cropped_rect;
+}
+
+XrFovf xr_centered_mono_fov_for_source_crop(const XrFovf& reference_view_fov,
+                                            const LLRect& full_source_rect,
+                                            const LLRect& cropped_source_rect)
+{
+    const F32 full_width = llmax((F32)full_source_rect.getWidth(), 1.f);
+    const F32 full_height = llmax((F32)full_source_rect.getHeight(), 1.f);
+    const F32 crop_width = llclamp((F32)cropped_source_rect.getWidth(), 1.f, full_width);
+    const F32 crop_height = llclamp((F32)cropped_source_rect.getHeight(), 1.f, full_height);
+    const F32 full_aspect = full_width / full_height;
+    const F32 crop_x = llclamp(crop_width / full_width, 0.01f, 1.f);
+    const F32 crop_y = llclamp(crop_height / full_height, 0.01f, 1.f);
+    const F32 source_vertical_fov = llclamp(reference_view_fov.angleUp - reference_view_fov.angleDown, 0.02f, 3.12f);
+    const F32 source_vertical_half = llclamp(source_vertical_fov * 0.5f, 0.01f, 1.56f);
+    const F32 source_horizontal_half = llclamp(
+        atanf(tanf(source_vertical_half) * llmax(full_aspect, 0.01f)),
+        0.01f,
+        1.56f);
+    const F32 mono_vertical_half = llclamp(atanf(tanf(source_vertical_half) * crop_y), 0.01f, 1.56f);
+    const F32 mono_horizontal_half = llclamp(atanf(tanf(source_horizontal_half) * crop_x), 0.01f, 1.56f);
+
+    XrFovf fov{};
+    fov.angleLeft = -mono_horizontal_half;
+    fov.angleRight = mono_horizontal_half;
+    fov.angleUp = mono_vertical_half;
+    fov.angleDown = -mono_vertical_half;
     return fov;
 }
 
@@ -395,6 +460,7 @@ struct LLOpenXRManagerImpl
     std::vector<XrView> views;
     std::vector<OpenXRSwapchain> swapchains;
     GLuint blit_fbo = 0;
+    GLuint source_read_fbo = 0;
     bool session_running = false;
     bool submit_ready_logged = false;
     uint64_t frame_submit_count = 0;
@@ -888,6 +954,9 @@ bool LLOpenXRManager::initialize()
     openxr_info(std::string("OpenXR mono initialized. Runtime OpenGL requirements are available; set ") +
                 OPENXR_MONO_ENV + "=0 to disable.");
 
+    // Re-evaluate internal screen target sizing now that runtime view sizes are known.
+    gResizeScreenTexture = true;
+
     return true;
 #endif
 }
@@ -944,6 +1013,7 @@ void LLOpenXRManager::processEvents()
                 mImpl->has_hmd_forward = false;
                 mImpl->has_left_eye_vertical_fov = false;
                 mImpl->has_left_eye_aspect = false;
+                gResizeScreenTexture = true;
                 openxr_info("OpenXR session stopped.");
             }
             else if (mImpl->session_state == XR_SESSION_STATE_EXITING ||
@@ -953,6 +1023,7 @@ void LLOpenXRManager::processEvents()
                 mImpl->has_hmd_forward = false;
                 mImpl->has_left_eye_vertical_fov = false;
                 mImpl->has_left_eye_aspect = false;
+                gResizeScreenTexture = true;
                 mDisabled = true;
                 return;
             }
@@ -1166,14 +1237,66 @@ void LLOpenXRManager::submitFrameMono(const LLRect& source_rect)
         init_xr_struct(layer_view, XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW);
     }
 
+    LLRect submit_input_rect = source_rect;
+    bool using_pipeline_submit_source = false;
+    if (LLRenderTarget::sUseFBO)
+    {
+        const LLRenderTarget* xr_submit_source = gPipeline.getXRSubmitSource();
+        if (xr_submit_source && xr_submit_source->isComplete() &&
+            xr_submit_source->getNumTextures() > 0 &&
+            xr_submit_source->getWidth() > 0 && xr_submit_source->getHeight() > 0)
+        {
+            if (mImpl->source_read_fbo == 0)
+            {
+                glGenFramebuffers(1, &mImpl->source_read_fbo);
+            }
+
+            if (mImpl->source_read_fbo != 0)
+            {
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, mImpl->source_read_fbo);
+                glFramebufferTexture2D(
+                    GL_READ_FRAMEBUFFER,
+                    GL_COLOR_ATTACHMENT0,
+                    GL_TEXTURE_2D,
+                    xr_submit_source->getTexture(0),
+                    0);
+                glReadBuffer(GL_COLOR_ATTACHMENT0);
+
+                if (glCheckFramebufferStatus(GL_READ_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE)
+                {
+                    using_pipeline_submit_source = true;
+                    submit_input_rect.mLeft = 0;
+                    submit_input_rect.mBottom = 0;
+                    submit_input_rect.mRight = (S32)xr_submit_source->getWidth();
+                    submit_input_rect.mTop = (S32)xr_submit_source->getHeight();
+                }
+                else
+                {
+                    openxr_warn("OpenXR pipeline submit source framebuffer incomplete; falling back to desktop backbuffer.");
+                }
+            }
+        }
+    }
+
+    if (!using_pipeline_submit_source)
+    {
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    }
+
     // Mono submit uses one rendered viewpoint duplicated to both eyes.
-    // Use centered mono pose/FOV to keep compositor projection aligned with that image.
-    const F32 source_width = llmax((F32)source_rect.getWidth(), 1.f);
-    const F32 source_height = llmax((F32)source_rect.getHeight(), 1.f);
-    const F32 source_aspect = source_width / source_height;
-    const F32 left_eye_vertical_fov = mImpl->views[0].fov.angleUp - mImpl->views[0].fov.angleDown;
+    // Keep submit projection independent from desktop window size by center-cropping
+    // the source image to runtime aspect when needed.
+    const XrFovf& left_eye_fov = mImpl->views[0].fov;
+    F32 runtime_aspect = 0.f;
+    if (!xr_fov_aspect(left_eye_fov, runtime_aspect))
+    {
+        const F32 source_width = llmax((F32)submit_input_rect.getWidth(), 1.f);
+        const F32 source_height = llmax((F32)submit_input_rect.getHeight(), 1.f);
+        runtime_aspect = source_width / source_height;
+    }
+    const LLRect submit_source_rect = center_crop_rect_to_aspect(submit_input_rect, runtime_aspect);
     const XrPosef mono_pose = xr_center_pose_from_views(mImpl->views[0], mImpl->views[1]);
-    const XrFovf mono_fov = xr_centered_mono_fov(left_eye_vertical_fov, source_aspect);
+    const XrFovf mono_fov = xr_centered_mono_fov_for_source_crop(left_eye_fov, submit_input_rect, submit_source_rect);
 
     uint32_t submitted_view_count = 0;
     for (uint32_t eye = 0; eye < 2 && eye < (uint32_t)mImpl->swapchains.size(); ++eye)
@@ -1210,17 +1333,16 @@ void LLOpenXRManager::submitFrameMono(const LLRect& source_rect)
 
         const GLuint color_texture = swapchain.images[image_index].image;
 
-        glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, mImpl->blit_fbo);
         glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, color_texture, 0);
 
         if (glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE)
         {
             glBlitFramebuffer(
-                source_rect.mLeft,
-                source_rect.mBottom,
-                source_rect.mRight,
-                source_rect.mTop,
+                submit_source_rect.mLeft,
+                submit_source_rect.mBottom,
+                submit_source_rect.mRight,
+                submit_source_rect.mTop,
                 0,
                 0,
                 (GLint)swapchain.width,
@@ -1228,7 +1350,7 @@ void LLOpenXRManager::submitFrameMono(const LLRect& source_rect)
                 GL_COLOR_BUFFER_BIT,
                 GL_LINEAR);
 
-            draw_openxr_cursor_overlay(source_rect, swapchain.width, swapchain.height);
+            draw_openxr_cursor_overlay(submit_source_rect, swapchain.width, swapchain.height);
         }
         else
         {
@@ -1352,6 +1474,49 @@ bool LLOpenXRManager::getLeftEyeAspect(F32& out_aspect) const
 #endif
 }
 
+bool LLOpenXRManager::getRecommendedRenderSize(S32& out_width, S32& out_height) const
+{
+#if LL_LINUX && LL_X11
+    if (!mImpl)
+    {
+        return false;
+    }
+
+    S32 max_width = 0;
+    S32 max_height = 0;
+
+    if (!mImpl->swapchains.empty())
+    {
+        for (const auto& swapchain : mImpl->swapchains)
+        {
+            max_width = llmax(max_width, (S32)swapchain.width);
+            max_height = llmax(max_height, (S32)swapchain.height);
+        }
+    }
+    else
+    {
+        for (const auto& view : mImpl->config_views)
+        {
+            max_width = llmax(max_width, (S32)view.recommendedImageRectWidth);
+            max_height = llmax(max_height, (S32)view.recommendedImageRectHeight);
+        }
+    }
+
+    if (max_width <= 0 || max_height <= 0)
+    {
+        return false;
+    }
+
+    out_width = max_width;
+    out_height = max_height;
+    return true;
+#else
+    (void)out_width;
+    (void)out_height;
+    return false;
+#endif
+}
+
 void LLOpenXRManager::shutdown()
 {
 #if LL_LINUX && LL_X11
@@ -1360,12 +1525,19 @@ void LLOpenXRManager::shutdown()
         return;
     }
 
+    gResizeScreenTexture = true;
     openxr_info("OpenXR shutdown started.");
 
     if (mImpl->blit_fbo != 0)
     {
         glDeleteFramebuffers(1, &mImpl->blit_fbo);
         mImpl->blit_fbo = 0;
+    }
+
+    if (mImpl->source_read_fbo != 0)
+    {
+        glDeleteFramebuffers(1, &mImpl->source_read_fbo);
+        mImpl->source_read_fbo = 0;
     }
 
     if (mImpl->session_running && mImpl->session != XR_NULL_HANDLE)

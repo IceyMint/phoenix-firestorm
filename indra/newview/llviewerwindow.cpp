@@ -282,12 +282,50 @@ bool                gDisplayFOV = false;
 namespace
 {
 constexpr const char* OPENXR_DECOUPLED_RENDER_ENV = "FS_OPENXR_DECOUPLED_RENDER";
+constexpr const char* OPENXR_AUTO_RESIZE_ENV = "FS_OPENXR_AUTO_RESIZE";
+constexpr const char* OPENXR_NATIVE_RES_ENV = "FS_OPENXR_NATIVE_RES";
 
 bool is_openxr_decoupled_render_requested()
 {
     std::string value = LLStringUtil::getenv(OPENXR_DECOUPLED_RENDER_ENV);
     if (value.empty())
     {
+        return true;
+    }
+
+    bool requested = false;
+    if (LLStringUtil::convertToBOOL(value, requested))
+    {
+        return requested;
+    }
+
+    return true;
+}
+
+bool is_openxr_auto_resize_requested()
+{
+    std::string value = LLStringUtil::getenv(OPENXR_AUTO_RESIZE_ENV);
+    if (value.empty())
+    {
+        // Keep desktop window sizing user-controlled by default.
+        return false;
+    }
+
+    bool requested = false;
+    if (LLStringUtil::convertToBOOL(value, requested))
+    {
+        return requested;
+    }
+
+    return true;
+}
+
+bool is_openxr_native_resolution_requested()
+{
+    std::string value = LLStringUtil::getenv(OPENXR_NATIVE_RES_ENV);
+    if (value.empty())
+    {
+        // Default to native-target rendering while XR is active.
         return true;
     }
 
@@ -307,33 +345,61 @@ LLRect get_openxr_decoupled_world_render_rect(const LLRect& world_rect)
         return world_rect;
     }
 
+    LLOpenXRManager& openxr = LLOpenXRManager::instance();
     F32 xr_aspect = 0.f;
-    if (!LLOpenXRManager::instance().getLeftEyeAspect(xr_aspect) || !std::isfinite(xr_aspect) || xr_aspect <= 0.f)
+    bool have_xr_aspect = openxr.getLeftEyeAspect(xr_aspect) && std::isfinite(xr_aspect) && xr_aspect > 0.f;
+
+    S32 xr_native_width = 0;
+    S32 xr_native_height = 0;
+    const bool use_xr_native_resolution =
+        is_openxr_native_resolution_requested() &&
+        openxr.isSessionRunning() &&
+        openxr.getRecommendedRenderSize(xr_native_width, xr_native_height) &&
+        xr_native_width > 0 &&
+        xr_native_height > 0;
+
+    if (!have_xr_aspect && use_xr_native_resolution)
     {
-        return world_rect;
+        xr_aspect = (F32)xr_native_width / (F32)xr_native_height;
+        have_xr_aspect = std::isfinite(xr_aspect) && xr_aspect > 0.f;
     }
 
-    const S32 world_width = llmax(world_rect.getWidth(), 1);
-    const S32 world_height = llmax(world_rect.getHeight(), 1);
-    const F32 world_aspect = (F32)world_width / (F32)world_height;
-    if (fabsf(world_aspect - xr_aspect) < 0.0001f)
+    if (!have_xr_aspect)
     {
         return world_rect;
     }
 
     LLRect render_rect = world_rect;
-    if (world_aspect > xr_aspect)
+    if (use_xr_native_resolution)
     {
-        const S32 target_width = llclamp((S32)((F32)world_height * xr_aspect + 0.5f), 1, world_width);
-        const S32 inset_x = (world_width - target_width) / 2;
-        render_rect.mLeft = world_rect.mLeft + inset_x;
+        // Render world to a dedicated XR-sized viewport so desktop window size
+        // does not reduce XR detail.
+        render_rect.mLeft = 0;
+        render_rect.mBottom = 0;
+        render_rect.mRight = xr_native_width;
+        render_rect.mTop = xr_native_height;
+    }
+
+    const S32 render_width = llmax(render_rect.getWidth(), 1);
+    const S32 render_height = llmax(render_rect.getHeight(), 1);
+    const F32 render_aspect = (F32)render_width / (F32)render_height;
+    if (fabsf(render_aspect - xr_aspect) < 0.0001f)
+    {
+        return render_rect;
+    }
+
+    if (render_aspect > xr_aspect)
+    {
+        const S32 target_width = llclamp((S32)((F32)render_height * xr_aspect + 0.5f), 1, render_width);
+        const S32 inset_x = (render_width - target_width) / 2;
+        render_rect.mLeft += inset_x;
         render_rect.mRight = render_rect.mLeft + target_width;
     }
     else
     {
-        const S32 target_height = llclamp((S32)((F32)world_width / xr_aspect + 0.5f), 1, world_height);
-        const S32 inset_y = (world_height - target_height) / 2;
-        render_rect.mBottom = world_rect.mBottom + inset_y;
+        const S32 target_height = llclamp((S32)((F32)render_width / xr_aspect + 0.5f), 1, render_height);
+        const S32 inset_y = (render_height - target_height) / 2;
+        render_rect.mBottom += inset_y;
         render_rect.mTop = render_rect.mBottom + target_height;
     }
 
@@ -4520,6 +4586,11 @@ static LLTrace::BlockTimerStatHandle FTM_UPDATE_WORLD_VIEW("Update World View");
 void LLViewerWindow::maybeAutoResizeForOpenXR()
 {
 #if LL_LINUX && LL_X11
+    if (!is_openxr_auto_resize_requested())
+    {
+        return;
+    }
+
     if (!mWindow)
     {
         return;
@@ -6979,15 +7050,25 @@ void LLViewerWindow::setup2DViewport(S32 x_offset, S32 y_offset)
 void LLViewerWindow::setup3DRender()
 {
     const LLRect render_rect = getWorldRenderViewRectRaw();
+    LLViewerCamera* camera = LLViewerCamera::getInstance();
+    const S32 render_height = llmax(render_rect.getHeight(), 1);
+    const F32 render_aspect = (F32)llmax(render_rect.getWidth(), 1) / (F32)render_height;
+
+    // Keep projection math in sync with the actual render viewport.
+    // Without this, setPerspective() still uses the camera aspect sourced from
+    // mWorldViewRectRaw, which reintroduces desktop-window aspect distortion in XR.
+    camera->setViewHeightInPixels(render_height);
+    camera->setAspect(render_aspect);
+
     // setup perspective camera
-    LLViewerCamera::getInstance()->setPerspective(
+    camera->setPerspective(
         NOT_FOR_SELECTION,
         render_rect.mLeft,
         render_rect.mBottom,
         render_rect.getWidth(),
         render_rect.getHeight(),
         false,
-        LLViewerCamera::getInstance()->getNear(),
+        camera->getNear(),
         MAX_FAR_CLIP * 2.f);
     setup3DViewport();
 }
