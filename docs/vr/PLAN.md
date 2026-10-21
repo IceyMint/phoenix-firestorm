@@ -173,7 +173,14 @@ policy), session-loss/disconnect recovery, desktop mirror polish.
   Quest 3 has no eye tracking, so Rule #7's sunset (physical eye
   tracking taking over the gaze role) cannot trigger on this headset.
 - Leah's symptoms in the current mono path (2026-10-20): SWIM AT THE
-  EDGES, and the VIEW DOES NOT COVER THE ENTIRE VIEW AREA. A previous
+  EDGES, and the VIEW DOES NOT COVER THE ENTIRE VIEW AREA. In her own
+  words, the core complaint is that THE WORLD DOESN'T STAY STILL LIKE
+  IN VRCHAT — world-stability ("lockedness") is the felt deficit, with
+  VRChat on the same headset as the reference for correct. That maps
+  to three causes this plan attacks in order: wrong peripheral
+  projection (Phase 1), the one-frame-stale pose from swap()-time
+  tracking (Phase 2), and compositor pose policy vs the avatar head
+  (Phase 2). A previous
   attempt (with ChatGPT, before this plan) fixed coverage by ZOOMING
   the image to fill, which looked WORSE. Phase 0 therefore measures
   edge geometry and view coverage first; Phase 1 fills the panel with
