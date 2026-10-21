@@ -53,8 +53,9 @@ Your avatar glancing at a speaker already drags your view (Rule #7).
 Deliberate/automatic gaze-steering as a feature: parked — comfort
 and feedback-loop questions (see the round-3 cautions) unresolved.
 **Superseded in practice by Design Rule #9 (Leah, 2026-10-20):**
-attention is manual — the mouse steers her gaze, eyes first, head
-past the eye limit. "I'll prolly manually look at [people]." No
+attention is manual — the mouse steers her gaze (EYES ONLY; the head
+belongs to the physical headset — Rule #9 as corrected by Leah).
+"I'll prolly manually look at [people]." No
 ADDED autopilot; S14's speaker cue may highlight WHO is talking,
 Rule #9 decides where she looks. Rule #9 amendment (same evening):
 manual steering is an override — when the mouse stops steering,
