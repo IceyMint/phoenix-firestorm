@@ -28,6 +28,12 @@ acceptance criteria in PLAN.md:
   markers riding eyeball rotation). Instrument and test; if they move,
   an explicit design decision is required — do not silently change
   the anchor or disable eye animation.
+  RESOLVED 2026-10-20 by Leah (Design Rule #7): gaze-driven camera
+  movement is WANTED — if the avatar looks right, the user looks
+  right — until she has an eye-tracking headset, at which point
+  physical eye tracking should take over the gaze role. Camera
+  orientation = head rotation composed with the avatar's eye-gaze
+  offset. B2 is a feature, not a defect.
 - B3: marker validation: correct eyeball attach point per side, local
   avatar only, alive/usable drawable, duplicate names must not select
   arbitrarily, prim PIVOT is the sampled point (what the user placed

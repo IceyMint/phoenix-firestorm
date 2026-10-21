@@ -64,3 +64,20 @@ rule wins and the conflict gets documented, not silently resolved.
    review, 2026-10-20.) Marker sampling uses the prim's PIVOT, and
    each marker must validate as the local avatar's, on the correct
    eyeball attach point, with a usable drawable.
+
+7. **The avatar's gaze moves the camera.** (Leah, 2026-10-20 20:26)
+   Round-2 item B2 asked whether eyeball-attach markers moving with
+   the avatar's eye-gaze animation is a problem. Leah's answer: it is
+   WANTED. If the avatar looks right, the user looks right — the
+   avatar's eye gaze affects the camera, not just the head joint.
+   This stands UNTIL she has an eye-tracking-capable headset; the
+   intent is that physical eye tracking would eventually take over
+   this role. Consequences for the plan: (a) B2 is a feature, not a
+   defect — do not instrument it as a bug; the AvatarEyeFrame simply
+   captures the gaze-influenced state like everything else. (b) The
+   camera orientation model is: head joint world rotation COMPOSED
+   WITH the avatar's eye-gaze offset (the eyes' look direction
+   relative to the head), within the rule-1 clamp philosophy — the
+   gaze is the avatar's own, already constrained by SL's look-at
+   system. (c) Marker positions riding the eyeball attach points
+   with gaze is consistent with this rule for the same reason.

@@ -36,8 +36,12 @@ spacing). Concretely:
   (mEyeLeft/mEyeRight) are a fallback only — their positions are not
   trusted to match where the eye mesh renders (system-eye morphs and
   worn mesh-eye attachments are not bound to the joints).
-- Eye orientations: head joint world rotation for both eyes (per rules
-  #3/#6); eye joint gaze rotation is never used.
+- Eye orientations: head joint world rotation COMPOSED WITH the
+  avatar's eye-gaze offset, for both eyes (rules #3/#6 as amended by
+  rule #7, 2026-10-20): the avatar's gaze moves the camera — if the
+  avatar looks right, the user looks right. This holds until an
+  eye-tracking headset exists, at which point physical eye tracking
+  is intended to take over the gaze role.
 - Fallbacks (skeleton eye joints, sagittal mirroring) are DIAGNOSTIC or
   explicitly-selected emergency modes only — never an automatic route
   into stereo. Stereo requires both markers, full stop.
@@ -52,10 +56,12 @@ spacing). Concretely:
   rotation + both marker positions + projection params + prediction
   timestamp) behind a synchronization barrier, and both eye passes
   consume only that snapshot.
-- Eyeball attach points may move with gaze animation. This must be
-  instrumented and measured; if markers move with gaze, that behaviour
-  gets an explicit design decision — never a silent anchor change and
-  never disabling eye animation to hide it.
+- Eyeball attach points moving with gaze animation: RESOLVED
+  2026-10-20 (rule #7) — this is WANTED. The avatar's gaze affects the
+  camera; markers riding the eyeballs with gaze is correct behaviour,
+  and the AvatarEyeFrame captures the gaze-influenced state as-is.
+  (Instrumentation may still log it for diagnostics; it is not a bug
+  to fix and eye animation is never disabled to hide it.)
 
 ## Phases
 
