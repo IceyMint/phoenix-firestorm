@@ -1353,6 +1353,33 @@ void LLOpenXRManager::submitFrameMono(const LLRect& source_rect)
         return;
     }
 
+    // P0-06/V2: respect the located view state's validity flags. An
+    // invalid pose must drive neither the avatar head nor a submitted
+    // view; end the frame with no layers instead. Nothing here
+    // recalibrates or reuses a stale pose.
+    const bool orientation_valid =
+        (view_state.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) != 0;
+    const bool position_valid = (view_state.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) != 0;
+    if (!orientation_valid || !position_valid)
+    {
+        if (!orientation_valid)
+        {
+            mImpl->has_hmd_forward = false;
+            mImpl->has_hmd_up = false;
+        }
+        mImpl->has_left_eye_vertical_fov = false;
+        mImpl->has_left_eye_aspect = false;
+        XrFrameEndInfo frame_end_info{};
+        frame_end_info.type = XR_TYPE_FRAME_END_INFO;
+        frame_end_info.displayTime = frame_state.predictedDisplayTime;
+        frame_end_info.environmentBlendMode = mImpl->blend_mode;
+        frame_end_info.layerCount = 0;
+        frame_end_info.layers = nullptr;
+        xrEndFrame(mImpl->session, &frame_end_info);
+        xr_trace.finish("invalid_view_state");
+        return;
+    }
+
     const uint32_t usable_view_count = std::min<uint32_t>(located_view_count, (uint32_t)mImpl->views.size());
     if (usable_view_count > 0)
     {
