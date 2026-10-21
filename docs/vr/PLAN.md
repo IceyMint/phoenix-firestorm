@@ -143,12 +143,22 @@ scale control, persistent Left / Right / Stereo setting (mono modes
 still submit the full located view count with an explicit right-eye
 policy), session-loss/disconnect recovery, desktop mirror polish.
 
-## Open items
-- Headset model in use (affects FOV asymmetry expectations).
+## Confirmed facts & open items
+- Headset: Meta Quest 3 via WiVRn (confirmed 2026-10-20). Note: the
+  Quest 3 has no eye tracking, so Rule #7's sunset (physical eye
+  tracking taking over the gaze role) cannot trigger on this headset.
+- Leah's symptoms in the current mono path (2026-10-20): SWIM AT THE
+  EDGES, and the VIEW DOES NOT COVER THE ENTIRE VIEW AREA. A previous
+  attempt (with ChatGPT, before this plan) fixed coverage by ZOOMING
+  the image to fill, which looked WORSE. Phase 0 therefore measures
+  edge geometry and view coverage first; Phase 1 fills the panel with
+  correct asymmetric tangents — never crop/zoom-to-fill.
 - Compositor policy choice (Phase 2 experiments decide).
-- Remaining build rules from Leah (only Rule #1 — always build in the
-  Ubuntu chroot — recorded so far; see BUILD-RULES in the safety-backup
-  notes).
+- Build rules: COMPLETE as recorded (Leah, 2026-10-20: "that's all
+  the build rules — everything that you saw in the bash history").
+  The full procedure lives in the BUILD-RULES notes from the
+  safety-backup work: always build in the Ubuntu chroot, ReleaseFS_open,
+  --avx2 --fmodstudio, channel Snowy, tests off, autobuild.
 
 ## Provenance
 - Original plan + questions: Muse, 2026-10-20.
