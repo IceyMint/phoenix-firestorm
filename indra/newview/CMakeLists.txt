@@ -2610,6 +2610,8 @@ endif ()
 target_sources(${VIEWER_BINARY_NAME} PRIVATE
     llopenxrmanager.cpp
     llopenxrmanager.h
+    llopenxrtrace.cpp
+    llopenxrtrace.h
     )
 
 add_executable(openxr_glreq_probe

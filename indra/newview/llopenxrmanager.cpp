@@ -2,6 +2,8 @@
 
 #include "llopenxrmanager.h"
 
+#include "llopenxrtrace.h"
+
 #include "llerror.h"
 #include "llrect.h"
 #include "llstring.h"
@@ -1000,6 +1002,12 @@ void LLOpenXRManager::processEvents()
                 {
                     mImpl->session_running = true;
                     openxr_info("OpenXR session started.");
+                    if (LLOpenXRTrace::enabled())
+                    {
+                        const unsigned int trace_run = LLOpenXRTrace::beginRun("legacy_mono");
+                        openxr_info("OpenXR trace run " + std::to_string(trace_run) +
+                                    " -> " + LLOpenXRTrace::traceFilePath());
+                    }
                 }
                 else
                 {
@@ -1015,11 +1023,13 @@ void LLOpenXRManager::processEvents()
                 mImpl->has_left_eye_aspect = false;
                 gResizeScreenTexture = true;
                 openxr_info("OpenXR session stopped.");
+                LLOpenXRTrace::endRun("stopping");
             }
             else if (mImpl->session_state == XR_SESSION_STATE_EXITING ||
                      mImpl->session_state == XR_SESSION_STATE_LOSS_PENDING)
             {
                 openxr_warn("OpenXR runtime requested exit; disabling VR submit.");
+                LLOpenXRTrace::endRun("exiting");
                 mImpl->has_hmd_forward = false;
                 mImpl->has_left_eye_vertical_fov = false;
                 mImpl->has_left_eye_aspect = false;
@@ -1042,6 +1052,7 @@ void LLOpenXRManager::processEvents()
 void LLOpenXRManager::submitFrameMono(const LLRect& source_rect)
 {
 #if LL_LINUX && LL_X11
+    LLOpenXRTrace::flushIfDue();
     static bool submit_entry_logged = false;
     if (!submit_entry_logged)
     {
@@ -1520,6 +1531,7 @@ bool LLOpenXRManager::getRecommendedRenderSize(S32& out_width, S32& out_height) 
 void LLOpenXRManager::shutdown()
 {
 #if LL_LINUX && LL_X11
+    LLOpenXRTrace::endRun("shutdown");
     if (!mImpl)
     {
         return;
