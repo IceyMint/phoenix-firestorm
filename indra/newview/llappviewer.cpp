@@ -1590,11 +1590,32 @@ bool LLAppViewer::frame()
 
 bool LLAppViewer::doFrame()
 {
+    // P2-01B: diagnostic fixed-cadence lock (FS_OPENXR_DIAG_FIXED_
+    // CADENCE_HZ; legacy loop only, default off). Pacing runs BEFORE
+    // this iteration's frame token is allocated, so the token's
+    // t_mainloop_frame_start_us is the paced start; the achieved
+    // interval and deadline miss are stamped onto the fresh context
+    // below and land on this iteration's app_frame record. When the
+    // diagnostic is not configured this is a single env check. The
+    // wait sits here -- the head of the main-loop iteration -- so
+    // the deadline grid schedules frame STARTS; it does not alter
+    // the viewer's own frame limiter or any desktop behaviour.
+    F32 diag_target_hz = 0.f;
+    bool diag_has_interval = false;
+    long long diag_interval_us = 0;
+    long long diag_miss_us = 0;
+    const bool diag_paced = LLOpenXRManager::diagPaceFrameStart(diag_target_hz, diag_has_interval,
+                                                                 diag_interval_us, diag_miss_us);
     // P2-01: allocate this main-loop iteration's functional frame
     // token (joins the iteration's render and xr_submit records in
     // the trace; the precursor of the Phase 2 frame context). Cheap
     // and unconditional, like the render-provenance channel.
     LLOpenXRTrace::beginAppFrame(LLOpenXRTrace::nextAppFrameToken());
+    if (diag_paced)
+    {
+        LLOpenXRTrace::setAppFrameDiagCadence(diag_target_hz, diag_has_interval,
+                                              diag_interval_us, diag_miss_us);
+    }
 #ifdef LL_DISCORD
     {
         LL_PROFILE_ZONE_NAMED("discord_callbacks");
@@ -1852,6 +1873,18 @@ bool LLAppViewer::doFrame()
                     app_fields << ",\"t_world_render_start_us\":" << app_ctx.t_world_render_start_us;
                     app_fields << ",\"t_render_end_us\":" << app_ctx.t_render_end_us;
                     app_fields << ",\"t_display_return_us\":" << app_ctx.t_display_return_us;
+                    // P2-01B: diagnostic cadence evidence for this
+                    // iteration (emitted only when the lock paced
+                    // it, so non-diagnostic records are unchanged).
+                    if (app_ctx.diag_cadence_active)
+                    {
+                        app_fields << ",\"diag_cadence_target_hz\":" << app_ctx.diag_cadence_target_hz;
+                        app_fields << ",\"diag_achieved_interval_us\":"
+                                   << (app_ctx.has_diag_achieved_interval
+                                           ? std::to_string(app_ctx.diag_achieved_interval_us)
+                                           : std::string("null"));
+                        app_fields << ",\"diag_deadline_miss_us\":" << app_ctx.diag_deadline_miss_us;
+                    }
                     LLOpenXRTrace::writeRecord("app_frame", app_fields.str());
                 }
             }

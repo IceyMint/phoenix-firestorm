@@ -36,7 +36,10 @@ public:
     // Begin a trace run for an XR session. Writes the "session" record.
     // If a run is already active it is ended first (status "superseded").
     // No-op when tracing is disabled. Returns the run id (0 when disabled).
-    static unsigned int beginRun(const std::string& mode);
+    // extra_fields_json, when non-empty, is a raw JSON fragment (no
+    // leading/trailing comma) appended to the "session" record --
+    // P2-01B uses it to state the diagnostic cadence mode.
+    static unsigned int beginRun(const std::string& mode, const std::string& extra_fields_json = std::string());
 
     // End the active run: writes an "end" record with the dropped-record
     // count, flushes, and closes the run. No-op without an active run.
@@ -132,6 +135,17 @@ public:
         long long t_world_render_start_us = 0;
         long long t_render_end_us = 0;
         long long t_display_return_us = 0;
+        // P2-01B: diagnostic fixed-cadence state of this iteration,
+        // stamped by LLAppViewer::doFrame() when the cadence lock
+        // paced the iteration's start (see
+        // LLOpenXRManager::diagPaceFrameStart()). The achieved
+        // interval is the wake-to-wake spacing of paced frame
+        // starts; the first paced iteration has none.
+        bool diag_cadence_active = false;
+        float diag_cadence_target_hz = 0.f;
+        bool has_diag_achieved_interval = false;
+        long long diag_achieved_interval_us = 0;
+        long long diag_deadline_miss_us = 0;
     };
     static unsigned long long nextAppFrameToken();
     static void beginAppFrame(unsigned long long app_frame_token);
@@ -140,6 +154,8 @@ public:
     static void markAppFrameWorldRenderStart();
     static void markAppFrameRenderEnd();
     static void markAppFrameDisplayReturn();
+    static void setAppFrameDiagCadence(float target_hz, bool has_achieved_interval,
+                                       long long achieved_interval_us, long long deadline_miss_us);
     static bool peekAppFrameContext(AppFrameContext& out);
     static unsigned long long currentAppFrameToken();
 

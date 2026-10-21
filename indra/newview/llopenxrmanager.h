@@ -60,6 +60,22 @@ public:
     // A/B comparison; unset, empty, true or unparseable values keep
     // the coherent default.
     static bool coherentOpticsEnabled();
+    // P2-01B: diagnostic controls for the pre-surgery experiments.
+    // Both are opt-in via environment, default OFF, and change
+    // nothing when unset. diagFixedCadenceHz() returns the target
+    // rate of FS_OPENXR_DIAG_FIXED_CADENCE_HZ (0 when unset or
+    // invalid); diagFrameMarkerEnabled() reads
+    // FS_OPENXR_DIAG_FRAME_MARKER. diagPaceFrameStart() is called
+    // once per main-loop iteration by LLAppViewer::doFrame() BEFORE
+    // the iteration's frame token is allocated; when the cadence
+    // lock engages (legacy loop only, XR mono enabled, session
+    // running) it sleeps until the iteration's absolute deadline on
+    // a fixed monotonic grid and reports the achieved wake-to-wake
+    // interval and the deadline miss through the out-params.
+    static F32 diagFixedCadenceHz();
+    static bool diagFrameMarkerEnabled();
+    static bool diagPaceFrameStart(F32& out_target_hz, bool& out_has_achieved_interval,
+                                   long long& out_achieved_interval_us, long long& out_deadline_miss_us);
     void setMonoEnabled(bool enabled);
     bool isMonoEnabled() const;
     bool isSessionRunning() const;

@@ -10,6 +10,10 @@
 
 #include "llglheaders.h"
 
+#include <chrono>
+#include <cstdlib>
+#include <thread>
+
 #if LL_LINUX && LL_X11
 #define XR_USE_GRAPHICS_API_OPENGL
 #define XR_USE_PLATFORM_XLIB
@@ -38,6 +42,8 @@ namespace
 constexpr const char* OPENXR_MONO_ENV = "FS_OPENXR_MONO";
 constexpr const char* OPENXR_LOG_ENV = "FS_OPENXR_LOG_FILE";
 constexpr const char* OPENXR_P1_OPTICS_ENV = "FS_OPENXR_P1_OPTICS_EXPERIMENTAL";
+constexpr const char* OPENXR_DIAG_CADENCE_ENV = "FS_OPENXR_DIAG_FIXED_CADENCE_HZ";
+constexpr const char* OPENXR_DIAG_MARKER_ENV = "FS_OPENXR_DIAG_FRAME_MARKER";
 
 bool is_openxr_mono_requested()
 {
@@ -76,6 +82,57 @@ bool xr_coherent_optics_enabled()
 
     return true;
 }
+
+// P2-01B: FS_OPENXR_DIAG_FIXED_CADENCE_HZ parser. The whole value
+// must be a single float in (0, 1000]; anything else (empty,
+// trailing junk, out of range) leaves the lock disabled.
+bool parse_diag_cadence_hz(const std::string& raw, F32& out_hz)
+{
+    if (raw.empty())
+    {
+        return false;
+    }
+    char* end = nullptr;
+    const float parsed = std::strtof(raw.c_str(), &end);
+    if (end == raw.c_str() || *end != '\0' || !(parsed > 0.f) || parsed > 1000.f)
+    {
+        return false;
+    }
+    out_hz = parsed;
+    return true;
+}
+
+// P2-01B: FS_OPENXR_DIAG_FRAME_MARKER reader (same convention as
+// the mono request: unset/empty = off, unparseable non-empty = on).
+bool diag_frame_marker_requested()
+{
+    std::string value = LLStringUtil::getenv(OPENXR_DIAG_MARKER_ENV);
+    if (value.empty())
+    {
+        return false;
+    }
+
+    bool result = false;
+    if (LLStringUtil::convertToBOOL(value, result))
+    {
+        return result;
+    }
+
+    return true;
+}
+
+// P2-01B: legacy-loop gate hook for the diagnostic cadence lock.
+// The frame-loop mode is a compile-time fact in this commit -- the
+// legacy after-render loop is the only loop that exists -- and the
+// lock is a legacy-loop diagnostic by contract. When P2-02
+// introduces the runtime-paced loop, this helper is where a
+// loop-mode selector plugs in: the lock engages only in legacy
+// mode, and the new loop's entry points never call
+// diagPaceFrameStart() at all (its xrWaitFrame IS the pacing).
+bool xr_diag_frame_loop_is_legacy()
+{
+    return true;
+}
 }
 
 /*static*/ bool LLOpenXRManager::coherentOpticsEnabled()
@@ -83,10 +140,40 @@ bool xr_coherent_optics_enabled()
     return xr_coherent_optics_enabled();
 }
 
+/*static*/ F32 LLOpenXRManager::diagFixedCadenceHz()
+{
+    // Parsed once: the diagnostic is launch-time configuration.
+    static const F32 cached_hz = [] {
+        F32 hz = 0.f;
+        parse_diag_cadence_hz(LLStringUtil::getenv(OPENXR_DIAG_CADENCE_ENV), hz);
+        return hz;
+    }();
+    return cached_hz;
+}
+
+/*static*/ bool LLOpenXRManager::diagFrameMarkerEnabled()
+{
+    return diag_frame_marker_requested();
+}
+
 #if LL_LINUX && LL_X11
 namespace
 {
 constexpr XrViewConfigurationType XR_VIEW_CONFIG = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+
+// P2-01B: diagnostic cadence-lock grid state. Main thread only
+// (diagPaceFrameStart() is called from LLAppViewer::doFrame()).
+// Deadlines live on an absolute grid anchored at engagement:
+// deadline_k = anchor + k * period. Slots lost to an overrun are
+// skipped -- the lock never bursts to catch up.
+struct DiagCadenceGrid
+{
+    bool anchored = false;
+    std::chrono::steady_clock::time_point next_deadline{};
+    std::chrono::steady_clock::time_point last_wake{};
+    bool has_last_wake = false;
+};
+DiagCadenceGrid g_diag_cadence_grid;
 
 std::string openxr_log_file_path()
 {
@@ -470,6 +557,96 @@ void draw_openxr_cursor_overlay(const LLRect& source_rect, uint32_t framebuffer_
         glDisable(GL_SCISSOR_TEST);
     }
 }
+
+// P2-01B: diagnostic frame marker (FS_OPENXR_DIAG_FRAME_MARKER=1).
+// Draws a chunky Gray-coded encoding of a 10-bit marker value into
+// the swapchain image currently attached to the blit FBO. It is
+// called at the submission blit point in submitFrameMono, AFTER the
+// world blit and after the cursor overlay (so nothing overdraws
+// it), once per eye; it never touches the desktop backbuffer.
+// Layout, in GL bottom-left-origin image coordinates:
+//   - cell size 40x40 px; grid 14 columns x 2 rows (560x80 px);
+//   - grid centred horizontally; its bottom edge sits 160 px above
+//     the image's bottom edge (inside the lens-visible area, away
+//     from the corners the circular view crops);
+//   - row 0 (lower): [1][0][g9..g0][parity][1] -- a white sync
+//     cell, a black sync cell, the 10 Gray-code bits of the value
+//     (g = v ^ (v >> 1)) MSB first, one even-parity bit over those
+//     10 bits, and a white sync cell;
+//   - row 1 (upper): the exact inverse of row 0, as a consistency
+//     check under compression.
+// Cells are pure white (1) or pure black (0), drawn with the same
+// scissored clears as the cursor overlay. At the Quest recording's
+// 720 px width (source 3096 px, ~0.23x) one cell is ~9 recording
+// px, big enough to sample at cell centres. Decoder: read row 0's
+// cell centres left to right; verify the sync cells (1, 0, ..., 1),
+// row 1 == NOT row 0, and even parity; un-Gray (b9 = g9,
+// bi = b(i+1) ^ gi) to recover v; match v against the xr_submit
+// records' diagnostic_marker_value in the same run.
+void draw_openxr_diag_frame_marker(uint32_t framebuffer_width, uint32_t framebuffer_height, unsigned int marker_value)
+{
+    const S32 dst_width = llmax(0, (S32)framebuffer_width);
+    const S32 dst_height = llmax(0, (S32)framebuffer_height);
+    constexpr S32 cell_size = 40;
+    constexpr S32 columns = 14;
+    constexpr S32 rows = 2;
+    constexpr S32 bottom_inset = 160;
+    const S32 grid_width = cell_size * columns;
+    const S32 grid_height = cell_size * rows;
+    if (dst_width < grid_width || dst_height < bottom_inset + grid_height)
+    {
+        return;
+    }
+
+    const unsigned int value = marker_value & 0x3FF;
+    const unsigned int gray = value ^ (value >> 1);
+    int cells[columns];
+    cells[0] = 1;
+    cells[1] = 0;
+    int parity = 0;
+    for (int i = 0; i < 10; i++)
+    {
+        const int bit = (int)((gray >> (9 - i)) & 1u);
+        cells[2 + i] = bit;
+        parity ^= bit;
+    }
+    cells[12] = parity;
+    cells[13] = 1;
+
+    const S32 origin_x = (dst_width - grid_width) / 2;
+    const S32 origin_y = bottom_inset;
+
+    GLboolean scissor_was_enabled = glIsEnabled(GL_SCISSOR_TEST);
+    GLint previous_scissor_box[4] = {};
+    glGetIntegerv(GL_SCISSOR_BOX, previous_scissor_box);
+    GLboolean previous_color_mask[4] = {};
+    glGetBooleanv(GL_COLOR_WRITEMASK, previous_color_mask);
+    GLfloat previous_clear_color[4] = {};
+    glGetFloatv(GL_COLOR_CLEAR_VALUE, previous_clear_color);
+
+    glEnable(GL_SCISSOR_TEST);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    for (S32 row = 0; row < rows; row++)
+    {
+        for (S32 col = 0; col < columns; col++)
+        {
+            const int bit = cells[col] ^ (row == 1 ? 1 : 0);
+            const F32 level = bit ? 1.f : 0.f;
+            clear_scissored_rect(dst_width, dst_height,
+                                 origin_x + col * cell_size, origin_y + row * cell_size,
+                                 origin_x + (col + 1) * cell_size, origin_y + (row + 1) * cell_size,
+                                 level, level, level, 1.f);
+        }
+    }
+
+    glScissor(previous_scissor_box[0], previous_scissor_box[1], previous_scissor_box[2], previous_scissor_box[3]);
+    glColorMask(previous_color_mask[0], previous_color_mask[1], previous_color_mask[2], previous_color_mask[3]);
+    glClearColor(previous_clear_color[0], previous_clear_color[1], previous_clear_color[2], previous_clear_color[3]);
+    if (!scissor_was_enabled)
+    {
+        glDisable(GL_SCISSOR_TEST);
+    }
+}
 }
 
 struct OpenXRSwapchain
@@ -611,6 +788,80 @@ bool LLOpenXRManager::isSessionRunning() const
 {
 #if LL_LINUX && LL_X11
     return mImpl && mImpl->session_running;
+#else
+    return false;
+#endif
+}
+
+// P2-01B: the diagnostic cadence lock's per-iteration pacing point.
+// Called by LLAppViewer::doFrame() before the iteration's frame
+// token is allocated. Engages only when the lock is configured, the
+// active frame loop is the legacy one, XR mono is enabled and a
+// session is running; otherwise it is a no-op and (when XR is not
+// submitting) the grid is dropped so re-engagement re-anchors.
+/*static*/ bool LLOpenXRManager::diagPaceFrameStart(F32& out_target_hz, bool& out_has_achieved_interval,
+                                                    long long& out_achieved_interval_us, long long& out_deadline_miss_us)
+{
+    out_target_hz = 0.f;
+    out_has_achieved_interval = false;
+    out_achieved_interval_us = 0;
+    out_deadline_miss_us = 0;
+#if LL_LINUX && LL_X11
+    const F32 target_hz = diagFixedCadenceHz();
+    if (target_hz <= 0.f)
+    {
+        return false;
+    }
+    if (!xr_diag_frame_loop_is_legacy())
+    {
+        return false;
+    }
+    if (!instance().isMonoEnabled() || !instance().isSessionRunning())
+    {
+        g_diag_cadence_grid = DiagCadenceGrid();
+        return false;
+    }
+
+    DiagCadenceGrid& grid = g_diag_cadence_grid;
+    const std::chrono::steady_clock::duration period =
+        std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+            std::chrono::duration<double>(1.0 / (double)target_hz));
+    const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+    if (!grid.anchored)
+    {
+        grid.next_deadline = now;
+        grid.anchored = true;
+        grid.has_last_wake = false;
+    }
+    const std::chrono::steady_clock::time_point deadline = grid.next_deadline;
+    long long miss_us = 0;
+    if (now > deadline)
+    {
+        miss_us = (long long)std::chrono::duration_cast<std::chrono::microseconds>(now - deadline).count();
+    }
+    else if (now < deadline)
+    {
+        std::this_thread::sleep_until(deadline);
+    }
+    const std::chrono::steady_clock::time_point wake = std::chrono::steady_clock::now();
+    if (grid.has_last_wake)
+    {
+        out_has_achieved_interval = true;
+        out_achieved_interval_us =
+            (long long)std::chrono::duration_cast<std::chrono::microseconds>(wake - grid.last_wake).count();
+    }
+    grid.last_wake = wake;
+    grid.has_last_wake = true;
+    grid.next_deadline = deadline + period;
+    if (grid.next_deadline <= wake)
+    {
+        // Slots were lost to an overrun or a long block elsewhere:
+        // skip them. The lock never bursts to catch up.
+        grid.next_deadline = wake + period;
+    }
+    out_target_hz = target_hz;
+    out_deadline_miss_us = miss_us;
+    return true;
 #else
     return false;
 #endif
@@ -1064,7 +1315,18 @@ void LLOpenXRManager::processEvents()
                     openxr_info("OpenXR session started.");
                     if (LLOpenXRTrace::enabled())
                     {
-                        const unsigned int trace_run = LLOpenXRTrace::beginRun("legacy_mono");
+                        // P2-01B: the session record states the
+                        // diagnostic cadence target when the lock is
+                        // configured for this process.
+                        std::string trace_extra_fields;
+                        const F32 diag_cadence_hz = LLOpenXRManager::diagFixedCadenceHz();
+                        if (diag_cadence_hz > 0.f)
+                        {
+                            std::ostringstream hz_stream;
+                            hz_stream << diag_cadence_hz;
+                            trace_extra_fields = "\"diag_cadence_target_hz\":" + hz_stream.str();
+                        }
+                        const unsigned int trace_run = LLOpenXRTrace::beginRun("legacy_mono", trace_extra_fields);
                         openxr_info("OpenXR trace run " + std::to_string(trace_run) +
                                     " -> " + LLOpenXRTrace::traceFilePath());
                     }
@@ -1216,6 +1478,15 @@ struct XrSubmitTrace
     int source_gl_scissor[4] = {0, 0, 0, 0};
     bool source_gl_scissor_enabled = false;
     std::string source_render_fingerprint;
+    // P2-01B: diagnostic source-image marker state for this
+    // submission (FS_OPENXR_DIAG_FRAME_MARKER). The value is the
+    // 10-bit value the marker encoded (the low 10 bits of the
+    // producing iteration's app_frame_token); has_ stays false when
+    // no eye's blit completed, i.e. the marker never reached an
+    // image.
+    bool diagnostic_marker_enabled = false;
+    bool has_diagnostic_marker_value = false;
+    unsigned int diagnostic_marker_value = 0;
     // P2-01: swapchain image index per eye (at acquire) and the blit
     // rectangles per eye (source [left,bottom,w,h], dest [x,y,w,h];
     // the filter is the glBlitFramebuffer literal, GL_LINEAR).
@@ -1552,6 +1823,15 @@ struct XrSubmitTrace
         // is null here -- app_frame_token (above) is the linkage
         // available in P2-01.
         f << ",\"avatar_eye_frame_token\":null";
+        // P2-01B: diagnostic marker join for the headset-recording
+        // A/B analysis. Emitted only when the marker diagnostic is
+        // enabled, so non-diagnostic records are unchanged.
+        if (diagnostic_marker_enabled)
+        {
+            f << ",\"diagnostic_marker_enabled\":true";
+            f << ",\"diagnostic_marker_value\":"
+              << (has_diagnostic_marker_value ? std::to_string(diagnostic_marker_value) : std::string("null"));
+        }
         f << ",\"submitted_view_count\":" << submitted_view_count;
         f << ",\"layer_count\":" << layer_count;
         f << ",\"xr_optics_mode\":\"" << (optics_coherent ? "coherent" : "legacy") << "\"";
@@ -2364,6 +2644,18 @@ void LLOpenXRManager::submitFrameMono(const LLRect& source_rect)
     xr_trace.mono_quat[2] = mono_pose.orientation.z;
     xr_trace.mono_quat[3] = mono_pose.orientation.w;
 
+    // P2-01B: diagnostic source-image marker state for this
+    // submission. The encoded value is the low 10 bits of the
+    // producing iteration's app_frame_token (maintained whether or
+    // not a trace run is active); it is drawn into each eye image
+    // whose blit completes, and recorded on the xr_submit record so
+    // a headset recording decodes straight back to this submission.
+    const bool diag_marker_enabled = LLOpenXRManager::diagFrameMarkerEnabled();
+    const unsigned int diag_marker_value = diag_marker_enabled
+        ? (unsigned int)(LLOpenXRTrace::currentAppFrameToken() & 0x3FFULL)
+        : 0;
+    xr_trace.diagnostic_marker_enabled = diag_marker_enabled;
+
     uint32_t submitted_view_count = 0;
     bool any_eye_failed = false;
     for (uint32_t eye = 0; eye < 2 && eye < (uint32_t)mImpl->swapchains.size(); ++eye)
@@ -2455,6 +2747,16 @@ void LLOpenXRManager::submitFrameMono(const LLRect& source_rect)
                 GL_LINEAR);
 
             draw_openxr_cursor_overlay(submit_source_rect, swapchain.width, swapchain.height);
+
+            // P2-01B: diagnostic frame marker, drawn LAST (after
+            // the cursor overlay) so nothing overdraws it, into
+            // this eye's swapchain image only.
+            if (diag_marker_enabled)
+            {
+                draw_openxr_diag_frame_marker(swapchain.width, swapchain.height, diag_marker_value);
+                xr_trace.has_diagnostic_marker_value = true;
+                xr_trace.diagnostic_marker_value = diag_marker_value;
+            }
         }
         else
         {

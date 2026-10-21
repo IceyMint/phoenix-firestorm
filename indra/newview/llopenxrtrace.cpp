@@ -183,7 +183,7 @@ std::string frame_record_unlocked(TraceState& state, const std::string& event,
     return OPENXR_TRACE_DEFAULT_FILE;
 }
 
-/*static*/ unsigned int LLOpenXRTrace::beginRun(const std::string& mode)
+/*static*/ unsigned int LLOpenXRTrace::beginRun(const std::string& mode, const std::string& extra_fields_json)
 {
     if (!enabled())
     {
@@ -215,6 +215,10 @@ std::string frame_record_unlocked(TraceState& state, const std::string& event,
     std::string fields = "\"mode\":\"" + json_escape(mode) +
                          "\",\"source_commit\":\"" + json_escape(source_commit()) +
                          "\",\"trace_file\":\"" + json_escape(traceFilePath()) + "\"";
+    if (!extra_fields_json.empty())
+    {
+        fields += "," + extra_fields_json;
+    }
     buffer_record_unlocked(state, frame_record_unlocked(state, "session", fields));
     flush_unlocked(state);
     return state.run_id;
@@ -383,6 +387,21 @@ std::string frame_record_unlocked(TraceState& state, const std::string& event,
     if (state.app_frame_context.present)
     {
         state.app_frame_context.t_display_return_us = now_us_unlocked(state);
+    }
+}
+
+/*static*/ void LLOpenXRTrace::setAppFrameDiagCadence(float target_hz, bool has_achieved_interval,
+                                                      long long achieved_interval_us, long long deadline_miss_us)
+{
+    TraceState& state = trace_state();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    if (state.app_frame_context.present)
+    {
+        state.app_frame_context.diag_cadence_active = true;
+        state.app_frame_context.diag_cadence_target_hz = target_hz;
+        state.app_frame_context.has_diag_achieved_interval = has_achieved_interval;
+        state.app_frame_context.diag_achieved_interval_us = achieved_interval_us;
+        state.app_frame_context.diag_deadline_miss_us = deadline_miss_us;
     }
 }
 
