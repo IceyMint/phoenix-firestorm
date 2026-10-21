@@ -122,6 +122,16 @@ rule wins and the conflict gets documented, not silently resolved.
    tremor never becomes view swim, and a defined mode boundary
    between mouse-as-pointer (UI/clicking) and mouse-as-gaze — with
    S3, cursor, gaze and view converge on the same point.
+   MODE SPLIT (Leah, 22:08): the eyes-only limit is a VR rule,
+   because there the head has a physical owner. On DESKTOP there is
+   no headset: Leah likes the desktop head movement, so there the
+   mouse steers BODY-ORDERED — eyes first, head past the eye limit
+   (the native layered look-at behaviour). Principle: the mouse may
+   steer the head only when nothing physical owns it. Implementation
+   note from the 22:01 audit: today's desktop fallback inside the
+   override accumulates mouse into the HEAD ONLY, skipping the eye
+   stage — the desktop path should use the native layered target
+   (eyes lead) instead.
    AMENDMENT (Leah, same evening): manual control is an OVERRIDE,
    autonomy is the resting state. When the mouse is not actively
    steering them, the EYES return to the avatar's AUTONOMOUS
