@@ -124,7 +124,9 @@ rule wins and the conflict gets documented, not silently resolved.
    look at) — and per Rule #7 the camera follows that autonomous
    gaze too. So "no autopilot" means no ADDED steering system; the
    avatar's own attention was never removed, it is what manual
-   control temporarily borrows. Release behaviour (when exactly the
-   override ends — mouse-idle moment, explicit release) is a
-   prototype question; the principle is not: hers by default, yours
-   while you steer, hers again when you stop.
+   control temporarily borrows. Hers by default, yours while you
+   steer, hers again when you stop. RELEASE TRIGGER (Leah, same
+   evening): the mouse NOT MOVING ends the override — stillness
+   hands the eyes back to autonomous control. The only remaining
+   tuning value is how long the stillness must last (a beat, not a
+   hair trigger), settled by feel in the prototype.
