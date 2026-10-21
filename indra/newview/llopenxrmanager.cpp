@@ -1525,6 +1525,7 @@ void LLOpenXRManager::submitFrameMono(const LLRect& source_rect)
     xr_trace.mono_quat[3] = mono_pose.orientation.w;
 
     uint32_t submitted_view_count = 0;
+    bool any_eye_failed = false;
     for (uint32_t eye = 0; eye < 2 && eye < (uint32_t)mImpl->swapchains.size(); ++eye)
     {
         OpenXRSwapchain& swapchain = mImpl->swapchains[eye];
@@ -1548,6 +1549,7 @@ void LLOpenXRManager::submitFrameMono(const LLRect& source_rect)
         if (XR_FAILED(result))
         {
             openxr_warn("xrAcquireSwapchainImage failed: " + format_xr_result(mImpl->instance, result));
+            any_eye_failed = true;
             continue;
         }
 
@@ -1562,6 +1564,7 @@ void LLOpenXRManager::submitFrameMono(const LLRect& source_rect)
             XrSwapchainImageReleaseInfo release_info{};
             release_info.type = XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO;
             xr_trace.eye_release_result[eye] = (int)xrReleaseSwapchainImage(swapchain.handle, &release_info);
+            any_eye_failed = true;
             continue;
         }
 
@@ -1592,12 +1595,24 @@ void LLOpenXRManager::submitFrameMono(const LLRect& source_rect)
         else
         {
             openxr_warn("OpenXR swapchain framebuffer incomplete, skipping eye " + std::to_string(eye));
+            any_eye_failed = true;
         }
 
         XrSwapchainImageReleaseInfo release_info{};
         release_info.type = XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO;
-        xr_trace.eye_release_result[eye] = (int)xrReleaseSwapchainImage(swapchain.handle, &release_info);
-        xr_trace.eye_submitted[eye] = true;
+        const XrResult release_result = xrReleaseSwapchainImage(swapchain.handle, &release_info);
+        xr_trace.eye_release_result[eye] = (int)release_result;
+
+        // P0-05/V1: per-eye success means the copy actually completed and
+        // the image was released cleanly. Anything less fails the frame.
+        const bool eye_ok = xr_trace.eye_fbo_complete[eye] && xr_trace.eye_blit_done[eye] &&
+                            XR_SUCCEEDED(release_result);
+        xr_trace.eye_submitted[eye] = eye_ok;
+        if (!eye_ok)
+        {
+            any_eye_failed = true;
+            continue;
+        }
 
         XrCompositionLayerProjectionView& projection_view = layer_views[submitted_view_count];
         projection_view.pose = mono_pose;
@@ -1627,8 +1642,9 @@ void LLOpenXRManager::submitFrameMono(const LLRect& source_rect)
     frame_end_info.type = XR_TYPE_FRAME_END_INFO;
     frame_end_info.displayTime = frame_state.predictedDisplayTime;
     frame_end_info.environmentBlendMode = mImpl->blend_mode;
-    frame_end_info.layerCount = (submitted_view_count > 0) ? 1 : 0;
-    frame_end_info.layers = (submitted_view_count > 0) ? layers : nullptr;
+    const bool submit_layer = (submitted_view_count == 2 && !any_eye_failed);
+    frame_end_info.layerCount = submit_layer ? 1 : 0;
+    frame_end_info.layers = submit_layer ? layers : nullptr;
 
     xr_trace.submitted_view_count = submitted_view_count;
     xr_trace.layer_count = frame_end_info.layerCount;
@@ -1644,7 +1660,9 @@ void LLOpenXRManager::submitFrameMono(const LLRect& source_rect)
         xr_trace.finish("end_failed");
         return;
     }
-    xr_trace.finish("submitted");
+    xr_trace.finish(submit_layer ? "submitted"
+                                 : ((submitted_view_count > 0 || any_eye_failed) ? "partial_dropped"
+                                                                                  : "no_views"));
 
     mImpl->frame_submit_count++;
     if (mImpl->frame_submit_count == 1 || (mImpl->frame_submit_count % 300) == 0)
