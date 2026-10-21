@@ -1520,6 +1520,44 @@ void LLOpenXRManager::submitFrameMono(const LLRect& source_rect)
     if (!using_pipeline_submit_source)
     {
         glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+
+        // P0-08/D13: framebuffer 0 is the desktop backbuffer, sized by
+        // the window -- not by the XR render rect. Clamp the source
+        // rect to the real drawable bounds and log any clamp; never
+        // blit from outside the backbuffer.
+        const S32 backbuffer_w = gViewerWindow ? gViewerWindow->getWindowWidthRaw() : 0;
+        const S32 backbuffer_h = gViewerWindow ? gViewerWindow->getWindowHeightRaw() : 0;
+        LLRect clamped_rect = submit_input_rect;
+        clamped_rect.mLeft = llclamp(clamped_rect.mLeft, 0, backbuffer_w);
+        clamped_rect.mRight = llclamp(clamped_rect.mRight, 0, backbuffer_w);
+        clamped_rect.mBottom = llclamp(clamped_rect.mBottom, 0, backbuffer_h);
+        clamped_rect.mTop = llclamp(clamped_rect.mTop, 0, backbuffer_h);
+        const bool rect_clamped = clamped_rect.mLeft != submit_input_rect.mLeft ||
+                                  clamped_rect.mRight != submit_input_rect.mRight ||
+                                  clamped_rect.mBottom != submit_input_rect.mBottom ||
+                                  clamped_rect.mTop != submit_input_rect.mTop;
+        if (rect_clamped)
+        {
+            openxr_warn("OpenXR backbuffer fallback: source rect " +
+                        std::to_string(submit_input_rect.getWidth()) + "x" +
+                        std::to_string(submit_input_rect.getHeight()) +
+                        " exceeds framebuffer 0 (" + std::to_string(backbuffer_w) + "x" +
+                        std::to_string(backbuffer_h) + "); clamped.");
+            submit_input_rect = clamped_rect;
+        }
+        if (submit_input_rect.getWidth() <= 0 || submit_input_rect.getHeight() <= 0)
+        {
+            openxr_warn("OpenXR backbuffer fallback: no valid source area; submitting no layer.");
+            XrFrameEndInfo frame_end_info{};
+            frame_end_info.type = XR_TYPE_FRAME_END_INFO;
+            frame_end_info.displayTime = frame_state.predictedDisplayTime;
+            frame_end_info.environmentBlendMode = mImpl->blend_mode;
+            frame_end_info.layerCount = 0;
+            frame_end_info.layers = nullptr;
+            xrEndFrame(mImpl->session, &frame_end_info);
+            xr_trace.finish("d13_empty_source");
+            return;
+        }
     }
 
     // Mono submit uses one rendered viewpoint duplicated to both eyes.
