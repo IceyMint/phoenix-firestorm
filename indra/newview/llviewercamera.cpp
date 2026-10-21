@@ -73,6 +73,11 @@ LLViewerCamera::LLViewerCamera() : LLCamera()
     mScreenPixelArea = 0;
     mZoomFactor = 1.f;
     mZoomSubregion = 1;
+    mProjectionMode = PROJECTION_SYMMETRIC;
+    mXRTanLeft = -1.f;
+    mXRTanRight = 1.f;
+    mXRTanDown = -1.f;
+    mXRTanUp = 1.f;
     mAverageSpeed = 0.f;
     mAverageAngularSpeed = 0.f;
 
@@ -179,11 +184,79 @@ const LLMatrix4 &LLViewerCamera::getModelview() const
     return mModelviewMatrix;
 }
 
+bool LLViewerCamera::setProjectionModeXROffCenter(F32 tan_left, F32 tan_right, F32 tan_down, F32 tan_up)
+{
+    // Signed tangents in XrFovf convention (left/down negative). A
+    // degenerate or non-finite frustum must never be installed:
+    // refuse and stay symmetric rather than fabricate a projection.
+    if (!std::isfinite(tan_left) || !std::isfinite(tan_right) ||
+        !std::isfinite(tan_down) || !std::isfinite(tan_up) ||
+        !(tan_right > tan_left) || !(tan_up > tan_down))
+    {
+        return false;
+    }
+
+    mXRTanLeft = tan_left;
+    mXRTanRight = tan_right;
+    mXRTanDown = tan_down;
+    mXRTanUp = tan_up;
+    mProjectionMode = PROJECTION_XR_OFF_CENTER;
+    return true;
+}
+
+void LLViewerCamera::setProjectionModeSymmetric()
+{
+    mProjectionMode = PROJECTION_SYMMETRIC;
+}
+
+bool LLViewerCamera::getXROffCenterTangents(F32& tan_left, F32& tan_right, F32& tan_down, F32& tan_up) const
+{
+    if (mProjectionMode != PROJECTION_XR_OFF_CENTER)
+    {
+        return false;
+    }
+
+    tan_left = mXRTanLeft;
+    tan_right = mXRTanRight;
+    tan_down = mXRTanDown;
+    tan_up = mXRTanUp;
+    return true;
+}
+
 void LLViewerCamera::calcProjection(const F32 far_distance) const
 {
-    F32 fov_y = getView();
     F32 z_far = far_distance;
     F32 z_near = getNear();
+
+    if (mProjectionMode == PROJECTION_XR_OFF_CENTER)
+    {
+        // P1-02: off-centre frustum from the mode's four signed
+        // tangents. LLMatrix4 stores the logical GL matrix transposed
+        // (mMatrix[row][col] = P[col][row] -- the same relation the
+        // symmetric branch below has to glm::perspective, and the
+        // relation glm::make_mat4((F32*)mMatrix) relies on), so these
+        // entries are exactly the glm::frustum matrix setPerspective()
+        // installs: cache and GL projection agree by construction.
+        // The tangents absorb the near plane (2n/(r-l) with
+        // r-l = (tan_r-tan_l)*n); the depth entries intentionally
+        // reuse the symmetric formulas unchanged.
+        const F32 tan_l = mXRTanLeft;
+        const F32 tan_r = mXRTanRight;
+        const F32 tan_d = mXRTanDown;
+        const F32 tan_u = mXRTanUp;
+
+        mProjectionMatrix.setZero();
+        mProjectionMatrix.mMatrix[0][0] = 2.f / (tan_r - tan_l);
+        mProjectionMatrix.mMatrix[2][0] = (tan_r + tan_l) / (tan_r - tan_l);
+        mProjectionMatrix.mMatrix[1][1] = 2.f / (tan_u - tan_d);
+        mProjectionMatrix.mMatrix[2][1] = (tan_u + tan_d) / (tan_u - tan_d);
+        mProjectionMatrix.mMatrix[2][2] = (z_far + z_near) / (z_near - z_far);
+        mProjectionMatrix.mMatrix[3][2] = (2 * z_far * z_near) / (z_near - z_far);
+        mProjectionMatrix.mMatrix[2][3] = -1;
+        return;
+    }
+
+    F32 fov_y = getView();
     F32 aspect = getAspect();
 
     F32 f = 1 / tan(fov_y * 0.5f);
@@ -374,7 +447,21 @@ void LLViewerCamera::setPerspective(bool for_selection,
 
     calcProjection(z_far); // Update the projection matrix cache
 
-    proj_mat *= glm::perspective(fov_y,aspect,z_near,z_far);
+    if (!for_selection && mProjectionMode == PROJECTION_XR_OFF_CENTER)
+    {
+        // P1-02: install the same off-centre frustum calcProjection()
+        // just cached, built from the mode's signed tangents at this
+        // call's near plane. Selection rendering never uses the XR
+        // mode (and the mode is never engaged outside the main-world
+        // camera setup in display_update_camera()).
+        proj_mat *= glm::frustum(mXRTanLeft * z_near, mXRTanRight * z_near,
+                                 mXRTanDown * z_near, mXRTanUp * z_near,
+                                 z_near, z_far);
+    }
+    else
+    {
+        proj_mat *= glm::perspective(fov_y,aspect,z_near,z_far);
+    }
 
     gGL.loadMatrix(glm::value_ptr(proj_mat));
 

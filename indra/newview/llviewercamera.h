@@ -67,6 +67,34 @@ public:
     static void updateFrustumPlanes(LLCamera& camera, bool ortho = false, bool zflip = false, bool no_hacks = false);
     void setPerspective(bool for_selection, S32 x, S32 y_from_bot, S32 width, S32 height, bool limit_select_distance, F32 z_near = 0, F32 z_far = 0);
 
+    // P1-02: explicit optical mode for the projection installed by
+    // setPerspective()/calcProjection(). PROJECTION_SYMMETRIC is the
+    // stock behaviour. PROJECTION_XR_OFF_CENTER builds an off-centre
+    // frustum (glm::frustum) from four signed tangents in XrFovf
+    // convention (tan of the left/right/down/up angles; left/down
+    // tangents negative). The mode is engaged ONLY by the XR
+    // main-world render path (display_update_camera), only around its
+    // setup3DRender() call, and is cleared before that function
+    // returns; every other consumer (selection, previews, snapshots,
+    // probes, HUD, desktop) always runs symmetric. Do not engage it
+    // from any other site: calcProjection() maintains the cache/GL
+    // agreement using getNear(), which is the near plane
+    // setup3DRender() passes to setPerspective().
+    enum EProjectionMode
+    {
+        PROJECTION_SYMMETRIC = 0,
+        PROJECTION_XR_OFF_CENTER
+    };
+
+    // Engage the off-centre mode with the given signed tangents.
+    // Returns false (and leaves the mode symmetric) for a degenerate
+    // or non-finite frustum -- an invalid sample must never be
+    // replaced by a fabricated projection.
+    bool setProjectionModeXROffCenter(F32 tan_left, F32 tan_right, F32 tan_down, F32 tan_up);
+    void setProjectionModeSymmetric();
+    EProjectionMode getProjectionMode() const { return mProjectionMode; }
+    bool getXROffCenterTangents(F32& tan_left, F32& tan_right, F32& tan_down, F32& tan_up) const;
+
     const LLMatrix4 &getProjection() const;
     const LLMatrix4 &getModelview() const;
 
@@ -114,6 +142,11 @@ protected:
     F32       mAverageSpeed ;
     F32       mAverageAngularSpeed ;
     mutable LLMatrix4   mProjectionMatrix;  // Cache of perspective matrix
+    EProjectionMode     mProjectionMode;    // P1-02: SYMMETRIC except during the XR main-world camera setup
+    F32                 mXRTanLeft;         // P1-02: signed off-centre tangents (XrFovf convention)
+    F32                 mXRTanRight;
+    F32                 mXRTanDown;
+    F32                 mXRTanUp;
     mutable LLMatrix4   mModelviewMatrix;
     F32                 mCameraFOVDefault;
     F32                 mPrevCameraFOVDefault;

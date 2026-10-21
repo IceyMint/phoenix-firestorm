@@ -27,6 +27,7 @@
 #include "llviewerprecompiledheaders.h"
 
 #include "llviewerdisplay.h"
+#include "llstring.h"
 
 #include "fsyspath.h"
 #include "hexdump.h"
@@ -234,12 +235,36 @@ struct XRRenderOpticsCapture
     bool present = false;
     LLXRLeftEyeFovSample fov_sample;
     bool fov_sample_valid = false;
+    bool offcenter_engaged = false;   // P1-02: this render used the XR off-centre mode
     glm::mat4 world_gl_projection = glm::mat4(1.f);
     GLint world_gl_viewport[4] = {0, 0, 0, 0};
     F32 near_plane = 0.f;
     F32 far_plane = 0.f;
 };
 XRRenderOpticsCapture g_xr_render_optics_capture;
+
+// P1-02: experimental gate for the XR off-centre optics. DEFAULT
+// DISABLED: unset, empty, or unparseable all mean the legacy
+// symmetric path. The gate is only ever activated together with the
+// P1-03 submission change; nothing in P1-02 turns it on.
+constexpr const char* OPENXR_P1_OPTICS_EXPERIMENTAL_ENV = "FS_OPENXR_P1_OPTICS_EXPERIMENTAL";
+
+bool xr_p1_optics_experimental()
+{
+    const std::string value = LLStringUtil::getenv(OPENXR_P1_OPTICS_EXPERIMENTAL_ENV);
+    if (value.empty())
+    {
+        return false;
+    }
+
+    bool requested = false;
+    if (LLStringUtil::convertToBOOL(value, requested))
+    {
+        return requested;
+    }
+
+    return false;
+}
 } // namespace
 
 void display_update_camera()
@@ -309,7 +334,30 @@ void display_update_camera()
             LLOpenXRManager::instance().getLeftEyeFovSample(g_xr_render_optics_capture.fov_sample);
     }
 
+    // P1-02: with the experimental gate on and a valid located sample,
+    // engage the XR off-centre optical mode for THIS main-world camera
+    // setup only, and clear it immediately after setup3DRender()
+    // returns, so the mode can never leak into another pass (cube
+    // snapshots, selection, previews, HUD, desktop). Gate off, cube
+    // snapshot, or no valid sample: the render stays legacy symmetric
+    // and the trace shows it (see record_render_trace()).
+    LLViewerCamera* camera = LLViewerCamera::getInstance();
+    bool xr_offcenter_engaged = false;
+    if (!gCubeSnapshot && g_xr_render_optics_capture.fov_sample_valid &&
+        xr_p1_optics_experimental())
+    {
+        const LLXRLeftEyeFovSample& sample = g_xr_render_optics_capture.fov_sample;
+        xr_offcenter_engaged = camera->setProjectionModeXROffCenter(
+            tanf(sample.left), tanf(sample.right), tanf(sample.down), tanf(sample.up));
+        g_xr_render_optics_capture.offcenter_engaged = xr_offcenter_engaged;
+    }
+
     gViewerWindow->setup3DRender();
+
+    if (xr_offcenter_engaged)
+    {
+        camera->setProjectionModeSymmetric();
+    }
 
     if (!gCubeSnapshot)
     {
@@ -644,12 +692,17 @@ void record_render_trace()
     fields << ",\"gl_viewport\":[" << gl_viewport[0] << "," << gl_viewport[1] << "," << gl_viewport[2]
            << "," << gl_viewport[3] << "]";
 
-    // P1-01: XR optics provenance for this render. In P1-01 the render
-    // still uses the legacy symmetric projection, so the mode is
-    // labelled explicitly and the used-FOV fields stay null; the
-    // candidate is the located left-eye sample read for this render.
+    // P1-01/P1-02: XR optics provenance for this render. The mode
+    // label states which projection the render actually used:
+    // "xr_offcenter" only when the P1-02 gate was on, a valid sample
+    // existed, and display_update_camera() engaged the off-centre
+    // mode for this render's camera setup (the used-FOV fields then
+    // carry that sample). Otherwise "legacy_symmetric" with null
+    // used-FOV fields; a gate-on frame without a valid sample falls
+    // back to legacy for that frame, visible here as legacy_symmetric
+    // with xr_render_fov_valid=false below.
     const XRRenderOpticsCapture& optics = g_xr_render_optics_capture;
-    fields << ",\"xr_projection_mode\":\"legacy_symmetric\"";
+    fields << ",\"xr_projection_mode\":\"" << (optics.offcenter_engaged ? "xr_offcenter" : "legacy_symmetric") << "\"";
     if (optics.present && optics.fov_sample_valid)
     {
         fields << ",\"xr_fov_candidate_rad\":" << trace_fov4_rad(optics.fov_sample);
@@ -662,7 +715,15 @@ void record_render_trace()
         fields << ",\"xr_fov_candidate_rad\":null,\"xr_fov_candidate_tan\":null";
         fields << ",\"xr_fov_locate_generation\":null,\"xr_fov_located_monotonic_us\":null";
     }
-    fields << ",\"xr_render_fov_used_rad\":null,\"xr_render_fov_used_tan\":null";
+    if (optics.present && optics.offcenter_engaged && optics.fov_sample_valid)
+    {
+        fields << ",\"xr_render_fov_used_rad\":" << trace_fov4_rad(optics.fov_sample);
+        fields << ",\"xr_render_fov_used_tan\":" << trace_fov4_tan(optics.fov_sample);
+    }
+    else
+    {
+        fields << ",\"xr_render_fov_used_rad\":null,\"xr_render_fov_used_tan\":null";
+    }
     fields << ",\"xr_render_fov_valid\":"
            << ((optics.present && optics.fov_sample_valid) ? "true" : "false");
     if (optics.present)
