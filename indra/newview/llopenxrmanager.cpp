@@ -902,7 +902,14 @@ bool LLOpenXRManager::initialize()
         swapchain_info.type = XR_TYPE_SWAPCHAIN_CREATE_INFO;
         swapchain_info.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
         swapchain_info.format = chosen_format;
-        swapchain_info.sampleCount = llmax(1u, view.recommendedSwapchainSampleCount);
+        // P0-07/V3: submission copies into swapchain images with a
+        // GL_TEXTURE_2D blit; a multisampled swapchain would be
+        // incompatible with that copy. Force 1, log the runtime values.
+        swapchain_info.sampleCount = 1;
+        openxr_info("OpenXR swapchain eye " + std::to_string(eye) +
+                    ": sampleCount forced to 1 for the GL blit path (recommended=" +
+                    std::to_string(view.recommendedSwapchainSampleCount) + ", max=" +
+                    std::to_string(view.maxSwapchainSampleCount) + ").");
         swapchain_info.width = view.recommendedImageRectWidth;
         swapchain_info.height = view.recommendedImageRectHeight;
         swapchain_info.faceCount = 1;
