@@ -81,3 +81,19 @@ rule wins and the conflict gets documented, not silently resolved.
    gaze is the avatar's own, already constrained by SL's look-at
    system. (c) Marker positions riding the eyeball attach points
    with gaze is consistent with this rule for the same reason.
+
+8. **Self-visibility follows real life.** (Leah, 2026-10-20 21:14)
+   "I want to see my hair. And anything you would see in real life.
+   My own head doesn't disappear in real life." From the cornea view
+   the user must see what a person actually sees of themselves:
+   their HAIR framing the view (fringe/bangs at the top edge, long
+   hair over the shoulders/chest looking down, hair moving with the
+   animations), GLASSES FRAMES if the avatar wears them (Leah wears
+   glasses in real life — "I see my glasses on my face right now" —
+   and her avatar wears them too), the nose at extreme down-gaze,
+   and the body below. The standard industry approach of hiding the
+   whole head in first person is explicitly REJECTED. Implementation
+   shape (for the embodiment plan): hide the face/skin/eyes that
+   would block the cornea, keep hair and head-worn items visible,
+   with near-distance fading for geometry that crosses the camera —
+   selective visibility, not head deletion.
