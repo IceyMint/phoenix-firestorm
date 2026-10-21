@@ -64,6 +64,10 @@ public:
     // Monotonic per-run sequence for XR frame records (P0-03 assigns
     // xr_frame_id with this). Returns 0 when no run is active.
     static unsigned long long nextXrFrameSeq();
+
+    // Monotonic per-run sequence for render records (P0-02 assigns
+    // render_seq with this). Returns 0 when no run is active.
+    static unsigned long long nextRenderSeq();
 };
 
 #endif // LL_LLOPENXRTRACE_H

@@ -30,6 +30,7 @@ struct TraceState
     unsigned int run_id = 0;
     unsigned int next_run_id = 1;
     unsigned long long xr_frame_seq = 0;
+    unsigned long long render_seq = 0;
     unsigned long long dropped_records = 0;
     unsigned long long written_records = 0;
     long long last_flush_us = 0;
@@ -201,6 +202,7 @@ std::string frame_record_unlocked(TraceState& state, const std::string& event,
     state.run_id = state.next_run_id++;
     state.run_active = true;
     state.xr_frame_seq = 0;
+    state.render_seq = 0;
     state.dropped_records = 0;
     state.written_records = 0;
 
@@ -273,6 +275,17 @@ std::string frame_record_unlocked(TraceState& state, const std::string& event,
     TraceState& state = trace_state();
     std::lock_guard<std::mutex> lock(state.mutex);
     return now_us_unlocked(state);
+}
+
+/*static*/ unsigned long long LLOpenXRTrace::nextRenderSeq()
+{
+    TraceState& state = trace_state();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    if (!state.run_active)
+    {
+        return 0;
+    }
+    return ++state.render_seq;
 }
 
 /*static*/ unsigned long long LLOpenXRTrace::nextXrFrameSeq()

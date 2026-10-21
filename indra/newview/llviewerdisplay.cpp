@@ -83,6 +83,8 @@
 #include "llviewertexturelist.h"
 #include "llviewerwindow.h"
 #include "llopenxrmanager.h"
+#include "llopenxrtrace.h"
+#include "llframetimer.h"
 #include "llvoavatarself.h"
 #include "llvograss.h"
 #include "llworld.h"
@@ -483,6 +485,117 @@ static void update_tp_display(bool minimized)
 }
 
 // Paint the display!
+
+namespace
+{
+// P0-02: build and emit the per-frame "render" trace record. Called from
+// display() immediately after renderFinalize(), while the world camera
+// matrices are final and before HUD/UI rendering replaces them. Records
+// only; never alters render state. Spatial values are in viewer agent
+// coordinates unless the field name says otherwise. Matrices are the
+// viewer's LLMatrix4 storage order (mMatrix[row][column]).
+std::string trace_f32(F32 value)
+{
+    std::ostringstream oss;
+    oss << std::setprecision(9) << value;
+    return oss.str();
+}
+
+std::string trace_vec3(const LLVector3& v)
+{
+    return "[" + trace_f32(v.mV[VX]) + "," + trace_f32(v.mV[VY]) + "," + trace_f32(v.mV[VZ]) + "]";
+}
+
+std::string trace_quat(const LLQuaternion& q)
+{
+    return "[" + trace_f32(q.mQ[VX]) + "," + trace_f32(q.mQ[VY]) + "," + trace_f32(q.mQ[VZ]) + "," +
+           trace_f32(q.mQ[VW]) + "]";
+}
+
+std::string trace_mat4(const LLMatrix4& m)
+{
+    std::string out = "[";
+    for (int row = 0; row < 4; row++)
+    {
+        for (int col = 0; col < 4; col++)
+        {
+            if (row > 0 || col > 0)
+            {
+                out += ",";
+            }
+            out += trace_f32(m.mMatrix[row][col]);
+        }
+    }
+    out += "]";
+    return out;
+}
+
+void record_render_trace()
+{
+    if (!LLOpenXRTrace::runActive())
+    {
+        return;
+    }
+
+    LLViewerCamera* camera = LLViewerCamera::getInstance();
+    const LLRect world_render_rect = gViewerWindow->getWorldRenderViewRectRaw();
+    const LLRect world_view_rect = gViewerWindow->getWorldViewRectRaw();
+
+    GLint gl_viewport[4] = {0, 0, 0, 0};
+    glGetIntegerv(GL_VIEWPORT, gl_viewport);
+
+    std::ostringstream fields;
+    fields << "\"frame_id\":" << LLFrameTimer::getFrameCount();
+    fields << ",\"render_seq\":" << LLOpenXRTrace::nextRenderSeq();
+    fields << ",\"camera_mode\":" << (S32)gAgentCamera.getCameraMode();
+    fields << ",\"camera_mouselook\":" << (gAgentCamera.cameraMouselook() ? "true" : "false");
+    fields << ",\"look_at_type\":" << (S32)gAgentCamera.getLookAtType();
+    fields << ",\"cam_origin_agent\":" << trace_vec3(camera->getOrigin());
+    fields << ",\"cam_at\":" << trace_vec3(camera->getAtAxis());
+    fields << ",\"cam_left\":" << trace_vec3(camera->getLeftAxis());
+    fields << ",\"cam_up\":" << trace_vec3(camera->getUpAxis());
+    fields << ",\"vfov_rad\":" << trace_f32(camera->getView());
+    fields << ",\"aspect\":" << trace_f32(camera->getAspect());
+    fields << ",\"near_effective\":" << trace_f32(camera->getNear());
+    fields << ",\"far\":" << trace_f32(camera->getFar());
+    fields << ",\"zoom_factor\":" << trace_f32(camera->getZoomFactor());
+    fields << ",\"zoom_subregion\":" << camera->getZoomSubRegion();
+    fields << ",\"projection\":" << trace_mat4(camera->getProjection());
+    fields << ",\"modelview\":" << trace_mat4(camera->getModelview());
+    fields << ",\"gl_viewport\":[" << gl_viewport[0] << "," << gl_viewport[1] << "," << gl_viewport[2]
+           << "," << gl_viewport[3] << "]";
+    fields << ",\"world_render_rect\":[" << world_render_rect.mLeft << "," << world_render_rect.mBottom
+           << "," << world_render_rect.getWidth() << "," << world_render_rect.getHeight() << "]";
+    fields << ",\"world_view_rect_raw\":[" << world_view_rect.mLeft << "," << world_view_rect.mBottom
+           << "," << world_view_rect.getWidth() << "," << world_view_rect.getHeight() << "]";
+
+    const LLRenderTarget* xr_source = gPipeline.getXRSubmitSource();
+    fields << ",\"xr_source_present\":" << (xr_source ? "true" : "false");
+    if (xr_source)
+    {
+        fields << ",\"xr_source_w\":" << xr_source->getWidth();
+        fields << ",\"xr_source_h\":" << xr_source->getHeight();
+        fields << ",\"xr_source_tex\":" << xr_source->getTexture();
+    }
+
+    if (gPipeline.mRT)
+    {
+        fields << ",\"rt_screen_w\":" << gPipeline.mRT->screen.getWidth();
+        fields << ",\"rt_screen_h\":" << gPipeline.mRT->screen.getHeight();
+        fields << ",\"rt_deferred_w\":" << gPipeline.mRT->deferredScreen.getWidth();
+        fields << ",\"rt_deferred_h\":" << gPipeline.mRT->deferredScreen.getHeight();
+    }
+
+    if (gAgentAvatarp.notNull() && gAgentAvatarp->isValid())
+    {
+        fields << ",\"avatar_render_pos\":" << trace_vec3(gAgentAvatarp->getRenderPosition());
+        fields << ",\"avatar_render_rot\":" << trace_quat(gAgentAvatarp->getRenderRotation());
+    }
+
+    LLOpenXRTrace::writeRecord("render", fields.str());
+}
+} // namespace
+
 void display(bool rebuild, F32 zoom_factor, int subfield, bool for_snapshot)
 {
     LL_PROFILE_ZONE_NAMED_CATEGORY_DISPLAY("Render");
@@ -1639,6 +1752,9 @@ void render_ui(F32 zoom_factor, int subfield)
 
     // apply gamma correction and post effects
     gPipeline.renderFinalize();
+
+    // P0-02: per-frame render trace (no-op unless an XR trace run is active).
+    record_render_trace();
 
     {
         LLGLState::checkStates();
