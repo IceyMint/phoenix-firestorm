@@ -116,3 +116,15 @@ rule wins and the conflict gets documented, not silently resolved.
    tremor never becomes view swim, and a defined mode boundary
    between mouse-as-pointer (UI/clicking) and mouse-as-gaze — with
    S3, cursor, gaze and view converge on the same point.
+   AMENDMENT (Leah, same evening): manual control is an OVERRIDE,
+   autonomy is the resting state. When the mouse is not actively
+   steering them, the EYES return to the avatar's AUTONOMOUS
+   control — her native look-at/interest behaviour (glancing at
+   speakers, things that move, whatever the avatar herself would
+   look at) — and per Rule #7 the camera follows that autonomous
+   gaze too. So "no autopilot" means no ADDED steering system; the
+   avatar's own attention was never removed, it is what manual
+   control temporarily borrows. Release behaviour (when exactly the
+   override ends — mouse-idle moment, explicit release) is a
+   prototype question; the principle is not: hers by default, yours
+   while you steer, hers again when you stop.

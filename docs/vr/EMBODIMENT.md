@@ -55,8 +55,12 @@ and feedback-loop questions (see the round-3 cautions) unresolved.
 **Superseded in practice by Design Rule #9 (Leah, 2026-10-20):**
 attention is manual — the mouse steers her gaze, eyes first, head
 past the eye limit. "I'll prolly manually look at [people]." No
-autopilot; S14's speaker cue may highlight WHO is talking, Rule #9
-decides where she looks.
+ADDED autopilot; S14's speaker cue may highlight WHO is talking,
+Rule #9 decides where she looks. Rule #9 amendment (same evening):
+manual steering is an override — when the mouse stops steering,
+the eyes return to the avatar's own AUTONOMOUS look-at behaviour,
+which natively includes glancing at speakers. S5's substance thus
+arrives as the resting state of Rule #9 rather than as a feature.
 
 ### S6 — Micro-life (breathing/sway) — PRESERVE
 Inherited head-joint micro-motion already reaches the camera.
