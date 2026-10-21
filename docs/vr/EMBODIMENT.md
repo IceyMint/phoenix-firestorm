@@ -25,11 +25,15 @@ intersects an eye is suppressed, locally, via a **corneal obstruction
 mask** (distance + direction from the eye, coherent across both eyes
 so nothing flickers between them). Visibility policy is per
 attachment/per material class, user-selectable. Split:
-- **S1a — visibility audit & restoration (can start NOW):** find and
-  inventory the mechanisms that currently hide the self in first
-  person (the addendum reply names three, with citations, in the
-  chat transcript — re-derive at audit time), restore body/hair/
-  glasses rendering behind a setting.
+- **S1a — visibility audit (DONE 2026-10-20, re-scoped same day):**
+  the audit (S1A-AUDIT-DRAFT.md) found the self-hiding mechanisms
+  (master setting, needsRenderHead, eyeball removal, avatar_lad.xml
+  first-person flags) — and ALL of them are gated on mouselook
+  camera mode. Leah's VR does not use mouselook: **in VR nothing is
+  hidden today, and she likes it that way.** No restoration work is
+  needed or wanted for the VR path. Remaining VR scope: the
+  override's 0.01 m near clip vs near-face geometry (glasses,
+  fringe). The audit remains the reference map for mouselook.
 - **S1b — corneal masking (Phase 3/4):** the obstruction mask,
   integrated with the per-eye render passes.
 
