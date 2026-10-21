@@ -220,6 +220,28 @@ void display_startup()
     glClear(GL_DEPTH_BUFFER_BIT);
 }
 
+namespace
+{
+// P1-01: per-render XR optics capture. display_update_camera() fills
+// this ONCE for the main world render (cube-snapshot passes excluded):
+// the located left-eye FOV sample is read before setup3DRender()
+// installs the projection, and the TRUE GL projection is captured
+// immediately after. The capture is immutable for the render;
+// record_render_trace() consumes it for the "render" record and hands
+// the FOV provenance to LLOpenXRTrace for the matching xr_submit.
+struct XRRenderOpticsCapture
+{
+    bool present = false;
+    LLXRLeftEyeFovSample fov_sample;
+    bool fov_sample_valid = false;
+    glm::mat4 world_gl_projection = glm::mat4(1.f);
+    GLint world_gl_viewport[4] = {0, 0, 0, 0};
+    F32 near_plane = 0.f;
+    F32 far_plane = 0.f;
+};
+XRRenderOpticsCapture g_xr_render_optics_capture;
+} // namespace
+
 void display_update_camera()
 {
     LL_PROFILE_ZONE_NAMED_CATEGORY_DISPLAY("Update Camera");
@@ -275,7 +297,32 @@ void display_update_camera()
         openxr_fov_override_active = false;
     }
 
+    // P1-01: read the located left-eye FOV sample ONCE, before
+    // setup3DRender() installs this render's projection. Never
+    // re-read for this render. Cube snapshots are not the main world
+    // render and must not overwrite the capture.
+    if (!gCubeSnapshot)
+    {
+        g_xr_render_optics_capture = XRRenderOpticsCapture();
+        g_xr_render_optics_capture.present = true;
+        g_xr_render_optics_capture.fov_sample_valid =
+            LLOpenXRManager::instance().getLeftEyeFovSample(g_xr_render_optics_capture.fov_sample);
+    }
+
     gViewerWindow->setup3DRender();
+
+    if (!gCubeSnapshot)
+    {
+        // P1-01: capture the TRUE GL projection the main world render
+        // will use, immediately after setup3DRender() installed it.
+        // (The "projection" trace field comes from the camera's
+        // calcProjection cache and cannot prove a GL render matrix.)
+        g_xr_render_optics_capture.world_gl_projection = get_current_projection();
+        glGetIntegerv(GL_VIEWPORT, g_xr_render_optics_capture.world_gl_viewport);
+        LLViewerCamera* xr_camera = LLViewerCamera::getInstance();
+        g_xr_render_optics_capture.near_plane = xr_camera->getNear();
+        g_xr_render_optics_capture.far_plane = xr_camera->getFar();
+    }
 
     if (!gCubeSnapshot)
     {
@@ -530,6 +577,37 @@ std::string trace_mat4(const LLMatrix4& m)
     return out;
 }
 
+std::string trace_fov4_rad(const LLXRLeftEyeFovSample& s)
+{
+    return "[" + trace_f32(s.left) + "," + trace_f32(s.right) + "," + trace_f32(s.down) + "," +
+           trace_f32(s.up) + "]";
+}
+
+std::string trace_fov4_tan(const LLXRLeftEyeFovSample& s)
+{
+    return "[" + trace_f32(tanf(s.left)) + "," + trace_f32(tanf(s.right)) + "," +
+           trace_f32(tanf(s.down)) + "," + trace_f32(tanf(s.up)) + "]";
+}
+
+// glm::mat4 storage is column-major: value_ptr order is column 0's
+// four rows, then column 1, and so on. world_gl_projection is emitted
+// in exactly this order and labelled "column_major_glm".
+std::string trace_glm_mat4(const glm::mat4& m)
+{
+    const F32* v = glm::value_ptr(m);
+    std::string out = "[";
+    for (int i = 0; i < 16; i++)
+    {
+        if (i > 0)
+        {
+            out += ",";
+        }
+        out += trace_f32(v[i]);
+    }
+    out += "]";
+    return out;
+}
+
 void record_render_trace()
 {
     if (!LLOpenXRTrace::runActive())
@@ -546,7 +624,8 @@ void record_render_trace()
 
     std::ostringstream fields;
     fields << "\"frame_id\":" << LLFrameTimer::getFrameCount();
-    fields << ",\"render_seq\":" << LLOpenXRTrace::nextRenderSeq();
+    const unsigned long long render_seq = LLOpenXRTrace::nextRenderSeq();
+    fields << ",\"render_seq\":" << render_seq;
     fields << ",\"camera_mode\":" << (S32)gAgentCamera.getCameraMode();
     fields << ",\"camera_mouselook\":" << (gAgentCamera.cameraMouselook() ? "true" : "false");
     fields << ",\"look_at_type\":" << (S32)gAgentCamera.getLookAtType();
@@ -564,6 +643,43 @@ void record_render_trace()
     fields << ",\"modelview\":" << trace_mat4(camera->getModelview());
     fields << ",\"gl_viewport\":[" << gl_viewport[0] << "," << gl_viewport[1] << "," << gl_viewport[2]
            << "," << gl_viewport[3] << "]";
+
+    // P1-01: XR optics provenance for this render. In P1-01 the render
+    // still uses the legacy symmetric projection, so the mode is
+    // labelled explicitly and the used-FOV fields stay null; the
+    // candidate is the located left-eye sample read for this render.
+    const XRRenderOpticsCapture& optics = g_xr_render_optics_capture;
+    fields << ",\"xr_projection_mode\":\"legacy_symmetric\"";
+    if (optics.present && optics.fov_sample_valid)
+    {
+        fields << ",\"xr_fov_candidate_rad\":" << trace_fov4_rad(optics.fov_sample);
+        fields << ",\"xr_fov_candidate_tan\":" << trace_fov4_tan(optics.fov_sample);
+        fields << ",\"xr_fov_locate_generation\":" << optics.fov_sample.locate_generation;
+        fields << ",\"xr_fov_located_monotonic_us\":" << optics.fov_sample.located_monotonic_us;
+    }
+    else
+    {
+        fields << ",\"xr_fov_candidate_rad\":null,\"xr_fov_candidate_tan\":null";
+        fields << ",\"xr_fov_locate_generation\":null,\"xr_fov_located_monotonic_us\":null";
+    }
+    fields << ",\"xr_render_fov_used_rad\":null,\"xr_render_fov_used_tan\":null";
+    fields << ",\"xr_render_fov_valid\":"
+           << ((optics.present && optics.fov_sample_valid) ? "true" : "false");
+    if (optics.present)
+    {
+        fields << ",\"world_gl_projection\":" << trace_glm_mat4(optics.world_gl_projection);
+        fields << ",\"world_gl_projection_order\":\"column_major_glm\"";
+        fields << ",\"world_gl_viewport\":[" << optics.world_gl_viewport[0] << ","
+               << optics.world_gl_viewport[1] << "," << optics.world_gl_viewport[2] << ","
+               << optics.world_gl_viewport[3] << "]";
+        fields << ",\"xr_render_near\":" << trace_f32(optics.near_plane);
+        fields << ",\"xr_render_far\":" << trace_f32(optics.far_plane);
+    }
+    else
+    {
+        fields << ",\"world_gl_projection\":null,\"world_gl_projection_order\":null";
+        fields << ",\"world_gl_viewport\":null,\"xr_render_near\":null,\"xr_render_far\":null";
+    }
     fields << ",\"world_render_rect\":[" << world_render_rect.mLeft << "," << world_render_rect.mBottom
            << "," << world_render_rect.getWidth() << "," << world_render_rect.getHeight() << "]";
     fields << ",\"world_view_rect_raw\":[" << world_view_rect.mLeft << "," << world_view_rect.mBottom
@@ -593,6 +709,22 @@ void record_render_trace()
     }
 
     LLOpenXRTrace::writeRecord("render", fields.str());
+
+    // P1-01: transfer this render's FOV provenance with its image; the
+    // xr_submit record for the submission of THIS render takes it.
+    {
+        float fov_rad[4] = {0.f, 0.f, 0.f, 0.f};
+        if (optics.fov_sample_valid)
+        {
+            fov_rad[0] = optics.fov_sample.left;
+            fov_rad[1] = optics.fov_sample.right;
+            fov_rad[2] = optics.fov_sample.down;
+            fov_rad[3] = optics.fov_sample.up;
+        }
+        LLOpenXRTrace::stashRenderProvenance(
+            render_seq, optics.present && optics.fov_sample_valid,
+            optics.fov_sample_valid ? optics.fov_sample.locate_generation : 0, fov_rad);
+    }
 }
 } // namespace
 

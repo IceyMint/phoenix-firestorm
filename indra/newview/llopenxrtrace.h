@@ -68,6 +68,25 @@ public:
     // Monotonic per-run sequence for render records (P0-02 assigns
     // render_seq with this). Returns 0 when no run is active.
     static unsigned long long nextRenderSeq();
+
+    // P1-01: FOV provenance of the most recently completed render,
+    // transferred explicitly to the xr_submit record that submits that
+    // render's image (association is NEVER inferred from frame
+    // numbers). stashRenderProvenance() is called when a render record
+    // is emitted; takeRenderProvenance() is called once by the submit
+    // path and clears the stash. fov_rad order is the XrFovf order
+    // [left, right, down, up], signed radians.
+    struct RenderProvenance
+    {
+        bool present = false;
+        unsigned long long render_seq = 0;
+        bool fov_valid = false;
+        unsigned long long fov_generation = 0;
+        float fov_rad[4] = {0.f, 0.f, 0.f, 0.f};
+    };
+    static void stashRenderProvenance(unsigned long long render_seq, bool fov_valid,
+                                      unsigned long long fov_generation, const float* fov_rad);
+    static bool takeRenderProvenance(RenderProvenance& out);
 };
 
 #endif // LL_LLOPENXRTRACE_H

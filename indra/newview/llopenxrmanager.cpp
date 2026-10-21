@@ -476,6 +476,8 @@ struct LLOpenXRManagerImpl
     bool has_left_eye_vertical_fov = false;
     F32 latest_left_eye_aspect = 0.f;
     bool has_left_eye_aspect = false;
+    LLXRLeftEyeFovSample left_eye_fov_sample;
+    unsigned long long left_eye_fov_locate_generation = 0;
 };
 #endif
 
@@ -1032,6 +1034,7 @@ void LLOpenXRManager::processEvents()
                 mImpl->has_hmd_forward = false;
                 mImpl->has_left_eye_vertical_fov = false;
                 mImpl->has_left_eye_aspect = false;
+                mImpl->left_eye_fov_sample.valid = false;
                 gResizeScreenTexture = true;
                 openxr_info("OpenXR session stopped.");
                 LLOpenXRTrace::endRun("stopping");
@@ -1044,6 +1047,7 @@ void LLOpenXRManager::processEvents()
                 mImpl->has_hmd_forward = false;
                 mImpl->has_left_eye_vertical_fov = false;
                 mImpl->has_left_eye_aspect = false;
+                mImpl->left_eye_fov_sample.valid = false;
                 gResizeScreenTexture = true;
                 mDisabled = true;
                 return;
@@ -1111,6 +1115,15 @@ struct XrSubmitTrace
     bool eye_submitted[2] = {false, false};
     uint32_t submitted_view_count = 0;
     uint32_t layer_count = 0;
+    // P1-01: render provenance transferred with the submitted image.
+    bool has_render_source = false;
+    unsigned long long render_seq_source = 0;
+    bool render_fov_valid = false;
+    unsigned long long render_fov_generation = 0;
+    float render_fov_rad[4] = {0.f, 0.f, 0.f, 0.f};
+    // P1-01: manager's latest located left-eye sample at submit time.
+    bool has_latest_located = false;
+    float latest_located_fov_rad[4] = {0.f, 0.f, 0.f, 0.f};
 
     static std::string f32(float v)
     {
@@ -1186,6 +1199,52 @@ struct XrSubmitTrace
         f << ",\"mono_fov\":[" << f32(mono_fov[0]) << "," << f32(mono_fov[1]) << "," << f32(mono_fov[2]) << "," << f32(mono_fov[3]) << "]";
         f << ",\"mono_pos\":[" << f32(mono_pos[0]) << "," << f32(mono_pos[1]) << "," << f32(mono_pos[2]) << "]";
         f << ",\"mono_quat\":[" << f32(mono_quat[0]) << "," << f32(mono_quat[1]) << "," << f32(mono_quat[2]) << "," << f32(mono_quat[3]) << "]";
+        if (has_render_source)
+        {
+            f << ",\"render_seq_source\":" << render_seq_source;
+            f << ",\"xr_render_fov_generation\":"
+              << (render_fov_valid ? std::to_string(render_fov_generation) : std::string("null"));
+            f << ",\"xr_render_fov_rad\":";
+            if (render_fov_valid)
+            {
+                f << "[" << f32(render_fov_rad[0]) << "," << f32(render_fov_rad[1]) << ","
+                  << f32(render_fov_rad[2]) << "," << f32(render_fov_rad[3]) << "]";
+            }
+            else
+            {
+                f << "null";
+            }
+        }
+        else
+        {
+            f << ",\"render_seq_source\":null,\"xr_render_fov_generation\":null,\"xr_render_fov_rad\":null";
+        }
+        f << ",\"xr_submitted_fov_rad\":[" << f32(mono_fov[0]) << "," << f32(mono_fov[1]) << ","
+          << f32(mono_fov[2]) << "," << f32(mono_fov[3]) << "]";
+        f << ",\"xr_latest_located_left_fov_rad\":";
+        if (has_latest_located)
+        {
+            f << "[" << f32(latest_located_fov_rad[0]) << "," << f32(latest_located_fov_rad[1]) << ","
+              << f32(latest_located_fov_rad[2]) << "," << f32(latest_located_fov_rad[3]) << "]";
+        }
+        else
+        {
+            f << "null";
+        }
+        if (has_latest_located && submitted_view_count > 0)
+        {
+            float max_delta_rad = 0.f;
+            for (int i = 0; i < 4; i++)
+            {
+                max_delta_rad = std::max(max_delta_rad, std::fabs(mono_fov[i] - latest_located_fov_rad[i]));
+            }
+            f << ",\"xr_fov_delta_current_deg\":" << f32(max_delta_rad * 57.29577951308232f);
+        }
+        else
+        {
+            f << ",\"xr_fov_delta_current_deg\":null";
+        }
+        f << ",\"xr_optics_source_valid\":" << ((has_render_source && render_fov_valid) ? "true" : "false");
         f << ",\"submitted_view_count\":" << submitted_view_count;
         f << ",\"layer_count\":" << layer_count;
         LLOpenXRTrace::writeRecord("xr_submit", f.str());
@@ -1208,6 +1267,24 @@ void LLOpenXRManager::submitFrameMono(const LLRect& source_rect)
     if (xr_trace.tracing)
     {
         xr_trace.t_entry = LLOpenXRTrace::nowUs();
+    }
+    if (xr_trace.tracing)
+    {
+        // P1-01: the image this call submits is the most recently
+        // completed render; take the provenance stashed when that
+        // render's record was emitted. Never inferred from frame ids.
+        LLOpenXRTrace::RenderProvenance provenance;
+        if (LLOpenXRTrace::takeRenderProvenance(provenance))
+        {
+            xr_trace.has_render_source = true;
+            xr_trace.render_seq_source = provenance.render_seq;
+            xr_trace.render_fov_valid = provenance.fov_valid;
+            xr_trace.render_fov_generation = provenance.fov_generation;
+            for (int i = 0; i < 4; i++)
+            {
+                xr_trace.render_fov_rad[i] = provenance.fov_rad[i];
+            }
+        }
     }
     static bool submit_entry_logged = false;
     if (!submit_entry_logged)
@@ -1350,6 +1427,7 @@ void LLOpenXRManager::submitFrameMono(const LLRect& source_rect)
         mImpl->has_hmd_up = false;
         mImpl->has_left_eye_vertical_fov = false;
         mImpl->has_left_eye_aspect = false;
+        mImpl->left_eye_fov_sample.valid = false;
         XrFrameEndInfo frame_end_info{};
         frame_end_info.type = XR_TYPE_FRAME_END_INFO;
         frame_end_info.displayTime = frame_state.predictedDisplayTime;
@@ -1383,6 +1461,7 @@ void LLOpenXRManager::submitFrameMono(const LLRect& source_rect)
         frame_end_info.layerCount = 0;
         frame_end_info.layers = nullptr;
         xrEndFrame(mImpl->session, &frame_end_info);
+        mImpl->left_eye_fov_sample.valid = false;
         xr_trace.finish("invalid_view_state");
         return;
     }
@@ -1414,11 +1493,49 @@ void LLOpenXRManager::submitFrameMono(const LLRect& source_rect)
         {
             mImpl->has_left_eye_aspect = false;
         }
+
+        // P1-01: cache the full located left-eye FOV as a provenance
+        // sample. Only a locate that passed the P0-06 validity gate
+        // and yields finite angles with positive extent counts as a
+        // valid replacement (locate_generation increments); anything
+        // else invalidates the sample. Never synthetic.
+        const bool fov_angles_finite =
+            std::isfinite(left_eye_fov.angleLeft) && std::isfinite(left_eye_fov.angleRight) &&
+            std::isfinite(left_eye_fov.angleDown) && std::isfinite(left_eye_fov.angleUp);
+        if (fov_angles_finite && std::isfinite(vertical_fov) && vertical_fov > 0.f &&
+            (left_eye_fov.angleRight - left_eye_fov.angleLeft) > 0.f)
+        {
+            LLXRLeftEyeFovSample sample;
+            sample.left = left_eye_fov.angleLeft;
+            sample.right = left_eye_fov.angleRight;
+            sample.down = left_eye_fov.angleDown;
+            sample.up = left_eye_fov.angleUp;
+            sample.locate_generation = ++mImpl->left_eye_fov_locate_generation;
+            sample.located_monotonic_us = LLOpenXRTrace::nowUs();
+            sample.valid = true;
+            mImpl->left_eye_fov_sample = sample;
+        }
+        else
+        {
+            mImpl->left_eye_fov_sample.valid = false;
+        }
     }
     else
     {
         mImpl->has_left_eye_vertical_fov = false;
         mImpl->has_left_eye_aspect = false;
+        mImpl->left_eye_fov_sample.valid = false;
+    }
+
+    // P1-01: the manager's latest located left-eye sample, for the
+    // xr_submit record's render-vs-latest-located comparison.
+    if (mImpl->left_eye_fov_sample.valid)
+    {
+        xr_trace.has_latest_located = true;
+        xr_trace.latest_located_fov_rad[0] = mImpl->left_eye_fov_sample.left;
+        xr_trace.latest_located_fov_rad[1] = mImpl->left_eye_fov_sample.right;
+        xr_trace.latest_located_fov_rad[2] = mImpl->left_eye_fov_sample.down;
+        xr_trace.latest_located_fov_rad[3] = mImpl->left_eye_fov_sample.up;
     }
 
     for (uint32_t i = 0; i < usable_view_count && i < 2; ++i)
@@ -1795,6 +1912,23 @@ bool LLOpenXRManager::getLeftEyeVerticalFov(F32& out_vertical_fov_radians) const
 #endif
 }
 
+bool LLOpenXRManager::getLeftEyeFovSample(LLXRLeftEyeFovSample& out_sample) const
+{
+#if LL_LINUX && LL_X11
+    if (!mImpl || !mImpl->session_running || !mImpl->left_eye_fov_sample.valid)
+    {
+        out_sample = LLXRLeftEyeFovSample();
+        return false;
+    }
+
+    out_sample = mImpl->left_eye_fov_sample;
+    return true;
+#else
+    out_sample = LLXRLeftEyeFovSample();
+    return false;
+#endif
+}
+
 bool LLOpenXRManager::getLeftEyeAspect(F32& out_aspect) const
 {
 #if LL_LINUX && LL_X11
@@ -1886,6 +2020,7 @@ void LLOpenXRManager::shutdown()
     mImpl->has_hmd_forward = false;
     mImpl->has_left_eye_vertical_fov = false;
     mImpl->has_left_eye_aspect = false;
+    mImpl->left_eye_fov_sample.valid = false;
 
     for (auto& swapchain : mImpl->swapchains)
     {

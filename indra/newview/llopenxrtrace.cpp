@@ -31,6 +31,7 @@ struct TraceState
     unsigned int next_run_id = 1;
     unsigned long long xr_frame_seq = 0;
     unsigned long long render_seq = 0;
+    LLOpenXRTrace::RenderProvenance render_provenance;
     unsigned long long dropped_records = 0;
     unsigned long long written_records = 0;
     long long last_flush_us = 0;
@@ -203,6 +204,7 @@ std::string frame_record_unlocked(TraceState& state, const std::string& event,
     state.run_active = true;
     state.xr_frame_seq = 0;
     state.render_seq = 0;
+    state.render_provenance = RenderProvenance();
     state.dropped_records = 0;
     state.written_records = 0;
 
@@ -286,6 +288,38 @@ std::string frame_record_unlocked(TraceState& state, const std::string& event,
         return 0;
     }
     return ++state.render_seq;
+}
+
+/*static*/ void LLOpenXRTrace::stashRenderProvenance(unsigned long long render_seq, bool fov_valid,
+                                                      unsigned long long fov_generation, const float* fov_rad)
+{
+    TraceState& state = trace_state();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    if (!state.run_active)
+    {
+        return;
+    }
+    state.render_provenance.present = true;
+    state.render_provenance.render_seq = render_seq;
+    state.render_provenance.fov_valid = fov_valid;
+    state.render_provenance.fov_generation = fov_generation;
+    for (int i = 0; i < 4; i++)
+    {
+        state.render_provenance.fov_rad[i] = fov_rad ? fov_rad[i] : 0.f;
+    }
+}
+
+/*static*/ bool LLOpenXRTrace::takeRenderProvenance(RenderProvenance& out)
+{
+    TraceState& state = trace_state();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    if (!state.render_provenance.present)
+    {
+        return false;
+    }
+    out = state.render_provenance;
+    state.render_provenance = RenderProvenance();
+    return true;
 }
 
 /*static*/ unsigned long long LLOpenXRTrace::nextXrFrameSeq()
