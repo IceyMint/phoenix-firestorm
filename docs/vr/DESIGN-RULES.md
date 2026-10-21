@@ -97,3 +97,22 @@ rule wins and the conflict gets documented, not silently resolved.
    would block the cornea, keep hair and head-worn items visible,
    with near-distance fading for geometry that crosses the camera —
    selective visibility, not head deletion.
+
+9. **Attention is manual and body-ordered.** (Leah, 2026-10-20 21:44)
+   The mouse steers the avatar's gaze: moving it first moves the EYES
+   (within the avatar's own eye-motion limits); pushing further turns
+   the HEAD (within Rule #1's existing ±72° clamp). This is how a
+   person actually looks — eyes for small shifts, head for large
+   ones — performed by the avatar's own layered look-at machinery
+   (eyes lead, head follows, with its own smoothing), not a custom
+   free-look controller. It is the input half of Rule #7: the user
+   commands the gaze, the gaze moves the camera. Leah on social
+   attention: "I'll prolly manually look at [people]" — there is NO
+   autopilot steering her view toward speakers (embodiment seed S5
+   stays parked, superseded by this rule). Composition with the HMD
+   (prototype questions, not blockers): physical head rotation stays
+   primary; the mouse contributes an eye offset plus a saturating
+   head offset inside the same clamp. Needs a small deadzone so mouse
+   tremor never becomes view swim, and a defined mode boundary
+   between mouse-as-pointer (UI/clicking) and mouse-as-gaze — with
+   S3, cursor, gaze and view converge on the same point.

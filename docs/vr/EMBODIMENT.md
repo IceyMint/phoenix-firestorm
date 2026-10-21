@@ -52,6 +52,11 @@ Useful failure mode, not on the critical path.
 Your avatar glancing at a speaker already drags your view (Rule #7).
 Deliberate/automatic gaze-steering as a feature: parked — comfort
 and feedback-loop questions (see the round-3 cautions) unresolved.
+**Superseded in practice by Design Rule #9 (Leah, 2026-10-20):**
+attention is manual — the mouse steers her gaze, eyes first, head
+past the eye limit. "I'll prolly manually look at [people]." No
+autopilot; S14's speaker cue may highlight WHO is talking, Rule #9
+decides where she looks.
 
 ### S6 — Micro-life (breathing/sway) — PRESERVE
 Inherited head-joint micro-motion already reaches the camera.
