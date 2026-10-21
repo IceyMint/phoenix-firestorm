@@ -127,6 +127,12 @@ rule wins and the conflict gets documented, not silently resolved.
    control temporarily borrows. Hers by default, yours while you
    steer, hers again when you stop. RELEASE TRIGGER (Leah, same
    evening): the mouse NOT MOVING ends the override — stillness
-   hands the eyes back to autonomous control. The only remaining
-   tuning value is how long the stillness must last (a beat, not a
-   hair trigger), settled by feel in the prototype.
+   hands the eyes back to autonomous control. MECHANISM (Leah,
+   pointing at existing behaviour): this is the viewer's OWN
+   look-at target behaviour — in the official viewer the look-at
+   target already moves with the mouse and resets after a few
+   seconds. Rule #9 therefore RIDES the existing look-at machinery
+   and its native reset timer rather than inventing a new gaze
+   system or a new timer; the timer is good as it stands. Any
+   retuning of the duration needs evidence from the prototype that
+   the native value feels wrong in the headset.
