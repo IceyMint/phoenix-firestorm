@@ -38,13 +38,40 @@ spacing). Concretely:
   worn mesh-eye attachments are not bound to the joints).
 - Eye orientations: head joint world rotation for both eyes (per rules
   #3/#6); eye joint gaze rotation is never used.
+- Fallbacks (skeleton eye joints, sagittal mirroring) are DIAGNOSTIC or
+  explicitly-selected emergency modes only — never an automatic route
+  into stereo. Stereo requires both markers, full stop.
+- Marker rigour (from the round-2 review): the sampled point is the
+  prim's PIVOT; each marker must be validated as worn by the local
+  avatar on the CORRECT eyeball attach point (left/right), alive, with
+  a usable drawable; duplicate names must never select arbitrarily;
+  missing/detaching markers cause deliberate mode transitions.
+- Both eye positions must come from the SAME completed animation state:
+  attachment drawables can be updated damped/async relative to the
+  skeleton, so Phase 2 freezes an immutable AvatarEyeFrame (head
+  rotation + both marker positions + projection params + prediction
+  timestamp) behind a synchronization barrier, and both eye passes
+  consume only that snapshot.
+- Eyeball attach points may move with gaze animation. This must be
+  instrumented and measured; if markers move with gaze, that behaviour
+  gets an explicit design decision — never a silent anchor change and
+  never disabling eye animation to hide it.
 
 ## Phases
 
-### Phase 0 — Instrument the current mono path
+### Phase 0 — Instrument the current mono path + validity gate
 Camera/FOV traces, frame-timing capture, color-patch (sRGB) diagnostic,
 record actual render dimensions vs swapchain dimensions. Exit: measurable
 optical, timing and color baselines; no behaviour change.
+Also in Phase 0, fix three validity defects already present in the
+current source (found in round-2 review, verified against the tree):
+(1) submitFrameMono() must never submit a partial projection layer —
+under a PRIMARY_STEREO configuration a frame submits a full 2-view
+layer or no layer (today one failed eye produces an invalid 1-view
+layer); (2) XrViewState::viewStateFlags must be checked after
+xrLocateViews before orientations are used; (3) validate the swapchain
+sample count actually chosen against the blit path's texture target
+(multisample swapchains vs GL_TEXTURE_2D attachment).
 
 ### Phase 1 — Proper left-eye rendering
 Real asymmetric projection from the runtime's XrFovf tangents, as ONE
@@ -66,7 +93,22 @@ quantities): prototype world-locked (LOCAL) vs view-relative (VIEW)
 submission and compare under four cases — rotation within the clamp,
 beyond the clamp, torso animating while HMD still, physical lean.
 Exit: no extra frame of pose delay; clamp behaviour predictable and
-chosen, not accidental.
+chosen, not accidental. The two policies are NOT equals: LOCAL is the
+production candidate; VIEW is a diagnostic (Khronos guidance warns
+against ordinary world content in VIEW space — the world would behave
+head-locked). The exit bar is conjunctive: the chosen policy must
+preserve the avatar-camera rules AND demonstrate acceptable spatial
+stability in motion; if neither policy achieves both, Phase 2 documents
+that limitation explicitly instead of declaring success. Note the
+avatar-baseline complication (round-2 review): no rigid transform maps
+a non-physical eye baseline onto the physical eyes, so reprojection
+equivalence with a physical-IPD camera cannot be promised — validate
+at much smaller and much larger avatar baselines, and log the
+physical/avatar IPD ratio as a diagnostic (never an auto-correction).
+Phase 2 also delivers the AvatarEyeFrame synchronization barrier
+described in the eye model section: the frame snapshot freezes the
+complete eye rig, not just the head anchor, and is consumed identically
+by both eye passes.
 
 ### Phase 3 — Renderer refactor, no stereo yet
 Split the display path into frame-wide update (once: visibility counters,
@@ -78,8 +120,10 @@ Single left eye through the new path must be visually equivalent to
 Phase 2 before proceeding.
 
 ### Phase 4 — Experimental stereo
-Second eye pass using the right marker's position; buffers reused
-sequentially at one eye's resolution; shared union visibility volume
+Second eye pass using the right marker's position; working buffers
+reused sequentially, sized to the MAXIMUM eye extent (the two eyes'
+recommended extents are not guaranteed equal), each eye rendering with
+its own exact viewport, projection and output rectangle; shared union visibility volume
 covering BOTH eye frusta; hardware occlusion OFF initially; shared
 shadow maps (union coverage); exposure shared between eyes; DoF and
 vignette off in VR. Acceptance: near/far parallax matches the avatar's

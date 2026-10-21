@@ -57,5 +57,10 @@ rule wins and the conflict gets documented, not silently resolved.
    visually placed facts and spacing follows the avatar exactly.
    Graceful degradation: right marker missing -> mono-left mode
    (Leah's own default anyway); left missing -> VR mode off, as
-   today. Last-resort fallbacks: skeleton eye joints, then mirroring
-   across the head's sagittal plane.
+   today. Last-resort fallbacks (skeleton eye joints, then mirroring
+   across the head's sagittal plane) are diagnostic or explicitly
+   selected emergency modes ONLY — never an automatic route into
+   stereo; stereo requires both markers. (Clarified in the round-2
+   review, 2026-10-20.) Marker sampling uses the prim's PIVOT, and
+   each marker must validate as the local avatar's, on the correct
+   eyeball attach point, with a usable drawable.

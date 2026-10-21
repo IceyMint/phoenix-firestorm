@@ -1,5 +1,15 @@
 # ChatGPT critique of the Firestorm stereo plan — digest (2026-10-20)
 
+> STATUS UPDATE (round 2, 2026-10-20): this digest records the ROUND-1
+> critique. Two of its positions have since been superseded and must
+> not be treated as instructions: (1) its recommendation of
+> runtime-derived eye geometry / physical IPD is OVERRIDDEN by Design
+> Rule #6 (avatar-eye embodiment) and the adopted two-marker eye model;
+> (2) plan adoption is no longer "pending" in the round-1 sense —
+> ChatGPT reviewed the documented plan and the actual source in round 2
+> and CONCURRED on the eye model and the plan, with amendments now
+> folded into PLAN.md. See CHATGPT-CONCURRENCE-DIGEST.md.
+
 Full conversation (Leah's ChatGPT, GPT-6, reasoning High, ~9m19s thinking,
 researched upstream Firestorm source + OpenXR spec + Monado/WiVRn docs):
 "Critique stereo VR plan" — https://chatgpt.com/c/6ad7fc11-90f8-83ea-9151-826ea8aba34c
