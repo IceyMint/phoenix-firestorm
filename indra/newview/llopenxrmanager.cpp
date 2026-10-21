@@ -446,6 +446,8 @@ struct OpenXRSwapchain
     XrSwapchain handle = XR_NULL_HANDLE;
     uint32_t width = 0;
     uint32_t height = 0;
+    int64_t format = 0;
+    uint32_t sample_count = 0;
     std::vector<XrSwapchainImageOpenGLKHR> images;
 };
 
@@ -918,6 +920,8 @@ bool LLOpenXRManager::initialize()
 
         swapchain.width = swapchain_info.width;
         swapchain.height = swapchain_info.height;
+        swapchain.format = swapchain_info.format;
+        swapchain.sample_count = swapchain_info.sampleCount;
 
         uint32_t image_count = 0;
         result = xrEnumerateSwapchainImages(swapchain.handle, 0, &image_count, nullptr);
@@ -1049,10 +1053,155 @@ void LLOpenXRManager::processEvents()
 #endif
 }
 
+
+#if LL_LINUX && LL_X11
+namespace
+{
+// P0-03: collects one xr_submit trace record across submitFrameMono's
+// many exit paths. Emits exactly once, from finish() or the destructor,
+// and only when a trace run is active. All timestamps are
+// LLOpenXRTrace::nowUs() (steady clock); OpenXR times are recorded raw
+// and labelled, never mixed with the steady clock.
+struct XrSubmitTrace
+{
+    bool tracing = false;
+    bool emitted = false;
+    std::string status = "no_session";
+    long long t_entry = 0;
+    long long t_wait_end = 0;
+    long long t_begin_end = 0;
+    long long t_locate_end = 0;
+    long long t_end_end = 0;
+    int wait_result = 0;
+    int begin_result = 0;
+    int locate_result = 0;
+    int end_result = 0;
+    long long predicted_display_time = 0;
+    long long predicted_display_period = 0;
+    bool should_render = false;
+    uint32_t located_view_count = 0;
+    unsigned long long view_state_flags = 0;
+    bool has_eye[2] = {false, false};
+    float eye_pos[2][3] = {};
+    float eye_quat[2][4] = {};
+    float eye_fov[2][4] = {};
+    bool using_pipeline_source = false;
+    int input_rect[4] = {0, 0, 0, 0};
+    int cropped_rect[4] = {0, 0, 0, 0};
+    float mono_fov[4] = {0.f, 0.f, 0.f, 0.f};
+    float mono_pos[3] = {0.f, 0.f, 0.f};
+    float mono_quat[4] = {0.f, 0.f, 0.f, 0.f};
+    uint32_t eye_swap_w[2] = {0, 0};
+    uint32_t eye_swap_h[2] = {0, 0};
+    long long eye_swap_format[2] = {0, 0};
+    uint32_t eye_swap_sample[2] = {0, 0};
+    bool eye_attempted[2] = {false, false};
+    int eye_acquire_result[2] = {0, 0};
+    int eye_wait_result[2] = {0, 0};
+    int eye_release_result[2] = {0, 0};
+    bool eye_fbo_complete[2] = {false, false};
+    bool eye_blit_done[2] = {false, false};
+    bool eye_submitted[2] = {false, false};
+    uint32_t submitted_view_count = 0;
+    uint32_t layer_count = 0;
+
+    static std::string f32(float v)
+    {
+        std::ostringstream oss;
+        oss << std::setprecision(9) << v;
+        return oss.str();
+    }
+
+    void finish(const std::string& final_status)
+    {
+        if (emitted)
+        {
+            return;
+        }
+        emitted = true;
+        status = final_status;
+        if (!tracing)
+        {
+            return;
+        }
+
+        std::ostringstream f;
+        f << "\"xr_frame_seq\":" << LLOpenXRTrace::nextXrFrameSeq();
+        f << ",\"status\":\"" << status << "\"";
+        f << ",\"t_entry_us\":" << t_entry;
+        f << ",\"t_wait_end_us\":" << t_wait_end;
+        f << ",\"t_begin_end_us\":" << t_begin_end;
+        f << ",\"t_locate_end_us\":" << t_locate_end;
+        f << ",\"t_end_end_us\":" << t_end_end;
+        f << ",\"wait_result\":" << wait_result;
+        f << ",\"begin_result\":" << begin_result;
+        f << ",\"locate_result\":" << locate_result;
+        f << ",\"end_result\":" << end_result;
+        f << ",\"predicted_display_time_xr_ns\":" << predicted_display_time;
+        f << ",\"predicted_display_period_xr_ns\":" << predicted_display_period;
+        f << ",\"should_render\":" << (should_render ? "true" : "false");
+        f << ",\"located_view_count\":" << located_view_count;
+        f << ",\"view_state_flags\":" << view_state_flags;
+        f << ",\"view_orientation_valid\":" << ((view_state_flags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) ? "true" : "false");
+        f << ",\"view_position_valid\":" << ((view_state_flags & XR_VIEW_STATE_POSITION_VALID_BIT) ? "true" : "false");
+        f << ",\"view_orientation_tracked\":" << ((view_state_flags & XR_VIEW_STATE_ORIENTATION_TRACKED_BIT) ? "true" : "false");
+        f << ",\"view_position_tracked\":" << ((view_state_flags & XR_VIEW_STATE_POSITION_TRACKED_BIT) ? "true" : "false");
+        for (int eye = 0; eye < 2; eye++)
+        {
+            if (!has_eye[eye])
+            {
+                continue;
+            }
+            f << ",\"eye" << eye << "_pos\":[" << f32(eye_pos[eye][0]) << "," << f32(eye_pos[eye][1]) << "," << f32(eye_pos[eye][2]) << "]";
+            f << ",\"eye" << eye << "_quat\":[" << f32(eye_quat[eye][0]) << "," << f32(eye_quat[eye][1]) << "," << f32(eye_quat[eye][2]) << "," << f32(eye_quat[eye][3]) << "]";
+            f << ",\"eye" << eye << "_fov\":[" << f32(eye_fov[eye][0]) << "," << f32(eye_fov[eye][1]) << "," << f32(eye_fov[eye][2]) << "," << f32(eye_fov[eye][3]) << "]";
+        }
+        for (int eye = 0; eye < 2; eye++)
+        {
+            if (!eye_attempted[eye])
+            {
+                continue;
+            }
+            f << ",\"eye" << eye << "_swap_w\":" << eye_swap_w[eye];
+            f << ",\"eye" << eye << "_swap_h\":" << eye_swap_h[eye];
+            f << ",\"eye" << eye << "_swap_format\":" << eye_swap_format[eye];
+            f << ",\"eye" << eye << "_swap_sample\":" << eye_swap_sample[eye];
+            f << ",\"eye" << eye << "_acquire_result\":" << eye_acquire_result[eye];
+            f << ",\"eye" << eye << "_wait_result\":" << eye_wait_result[eye];
+            f << ",\"eye" << eye << "_release_result\":" << eye_release_result[eye];
+            f << ",\"eye" << eye << "_fbo_complete\":" << (eye_fbo_complete[eye] ? "true" : "false");
+            f << ",\"eye" << eye << "_blit_done\":" << (eye_blit_done[eye] ? "true" : "false");
+            f << ",\"eye" << eye << "_submitted\":" << (eye_submitted[eye] ? "true" : "false");
+        }
+        f << ",\"using_pipeline_source\":" << (using_pipeline_source ? "true" : "false");
+        f << ",\"input_rect\":[" << input_rect[0] << "," << input_rect[1] << "," << input_rect[2] << "," << input_rect[3] << "]";
+        f << ",\"cropped_rect\":[" << cropped_rect[0] << "," << cropped_rect[1] << "," << cropped_rect[2] << "," << cropped_rect[3] << "]";
+        f << ",\"mono_fov\":[" << f32(mono_fov[0]) << "," << f32(mono_fov[1]) << "," << f32(mono_fov[2]) << "," << f32(mono_fov[3]) << "]";
+        f << ",\"mono_pos\":[" << f32(mono_pos[0]) << "," << f32(mono_pos[1]) << "," << f32(mono_pos[2]) << "]";
+        f << ",\"mono_quat\":[" << f32(mono_quat[0]) << "," << f32(mono_quat[1]) << "," << f32(mono_quat[2]) << "," << f32(mono_quat[3]) << "]";
+        f << ",\"submitted_view_count\":" << submitted_view_count;
+        f << ",\"layer_count\":" << layer_count;
+        LLOpenXRTrace::writeRecord("xr_submit", f.str());
+    }
+
+    ~XrSubmitTrace()
+    {
+        finish(status);
+    }
+};
+} // namespace
+#endif // LL_LINUX && LL_X11
+
 void LLOpenXRManager::submitFrameMono(const LLRect& source_rect)
 {
 #if LL_LINUX && LL_X11
     LLOpenXRTrace::flushIfDue();
+    XrSubmitTrace xr_trace;
+    xr_trace.tracing = LLOpenXRTrace::runActive();
+    if (xr_trace.tracing)
+    {
+        xr_trace.t_entry = LLOpenXRTrace::nowUs();
+    }
     static bool submit_entry_logged = false;
     if (!submit_entry_logged)
     {
@@ -1114,18 +1263,33 @@ void LLOpenXRManager::submitFrameMono(const LLRect& source_rect)
     frame_state.type = XR_TYPE_FRAME_STATE;
 
     XrResult result = xrWaitFrame(mImpl->session, &frame_wait_info, &frame_state);
+    xr_trace.wait_result = (int)result;
+    xr_trace.predicted_display_time = (long long)frame_state.predictedDisplayTime;
+    xr_trace.predicted_display_period = (long long)frame_state.predictedDisplayPeriod;
+    xr_trace.should_render = frame_state.shouldRender;
+    if (xr_trace.tracing)
+    {
+        xr_trace.t_wait_end = LLOpenXRTrace::nowUs();
+    }
     if (XR_FAILED(result))
     {
         openxr_warn("xrWaitFrame failed: " + format_xr_result(mImpl->instance, result));
+        xr_trace.finish("wait_failed");
         return;
     }
 
     XrFrameBeginInfo frame_begin_info{};
     frame_begin_info.type = XR_TYPE_FRAME_BEGIN_INFO;
     result = xrBeginFrame(mImpl->session, &frame_begin_info);
+    xr_trace.begin_result = (int)result;
+    if (xr_trace.tracing)
+    {
+        xr_trace.t_begin_end = LLOpenXRTrace::nowUs();
+    }
     if (XR_FAILED(result))
     {
         openxr_warn("xrBeginFrame failed: " + format_xr_result(mImpl->instance, result));
+        xr_trace.finish("begin_failed");
         return;
     }
 
@@ -1137,7 +1301,13 @@ void LLOpenXRManager::submitFrameMono(const LLRect& source_rect)
         frame_end_info.environmentBlendMode = mImpl->blend_mode;
         frame_end_info.layerCount = 0;
         frame_end_info.layers = nullptr;
-        xrEndFrame(mImpl->session, &frame_end_info);
+        xr_trace.end_result = (int)xrEndFrame(mImpl->session, &frame_end_info);
+        xr_trace.layer_count = 0;
+        if (xr_trace.tracing)
+        {
+            xr_trace.t_end_end = LLOpenXRTrace::nowUs();
+        }
+        xr_trace.finish("skipped_should_render");
         return;
     }
 
@@ -1158,9 +1328,17 @@ void LLOpenXRManager::submitFrameMono(const LLRect& source_rect)
         (uint32_t)mImpl->views.size(),
         &located_view_count,
         mImpl->views.data());
+    xr_trace.locate_result = (int)result;
+    xr_trace.located_view_count = located_view_count;
+    xr_trace.view_state_flags = (unsigned long long)view_state.viewStateFlags;
+    if (xr_trace.tracing)
+    {
+        xr_trace.t_locate_end = LLOpenXRTrace::nowUs();
+    }
     if (XR_FAILED(result) || located_view_count < 2)
     {
         openxr_warn("xrLocateViews failed: " + format_xr_result(mImpl->instance, result));
+        xr_trace.finish("locate_failed");
         mImpl->has_hmd_forward = false;
         mImpl->has_hmd_up = false;
         mImpl->has_left_eye_vertical_fov = false;
@@ -1207,6 +1385,22 @@ void LLOpenXRManager::submitFrameMono(const LLRect& source_rect)
     {
         mImpl->has_left_eye_vertical_fov = false;
         mImpl->has_left_eye_aspect = false;
+    }
+
+    for (uint32_t i = 0; i < usable_view_count && i < 2; ++i)
+    {
+        xr_trace.has_eye[i] = true;
+        xr_trace.eye_pos[i][0] = mImpl->views[i].pose.position.x;
+        xr_trace.eye_pos[i][1] = mImpl->views[i].pose.position.y;
+        xr_trace.eye_pos[i][2] = mImpl->views[i].pose.position.z;
+        xr_trace.eye_quat[i][0] = mImpl->views[i].pose.orientation.x;
+        xr_trace.eye_quat[i][1] = mImpl->views[i].pose.orientation.y;
+        xr_trace.eye_quat[i][2] = mImpl->views[i].pose.orientation.z;
+        xr_trace.eye_quat[i][3] = mImpl->views[i].pose.orientation.w;
+        xr_trace.eye_fov[i][0] = mImpl->views[i].fov.angleLeft;
+        xr_trace.eye_fov[i][1] = mImpl->views[i].fov.angleRight;
+        xr_trace.eye_fov[i][2] = mImpl->views[i].fov.angleDown;
+        xr_trace.eye_fov[i][3] = mImpl->views[i].fov.angleUp;
     }
 
     LLVector3 accumulated_forward;
@@ -1309,6 +1503,27 @@ void LLOpenXRManager::submitFrameMono(const LLRect& source_rect)
     const XrPosef mono_pose = xr_center_pose_from_views(mImpl->views[0], mImpl->views[1]);
     const XrFovf mono_fov = xr_centered_mono_fov_for_source_crop(left_eye_fov, submit_input_rect, submit_source_rect);
 
+    xr_trace.using_pipeline_source = using_pipeline_submit_source;
+    xr_trace.input_rect[0] = submit_input_rect.mLeft;
+    xr_trace.input_rect[1] = submit_input_rect.mBottom;
+    xr_trace.input_rect[2] = submit_input_rect.getWidth();
+    xr_trace.input_rect[3] = submit_input_rect.getHeight();
+    xr_trace.cropped_rect[0] = submit_source_rect.mLeft;
+    xr_trace.cropped_rect[1] = submit_source_rect.mBottom;
+    xr_trace.cropped_rect[2] = submit_source_rect.getWidth();
+    xr_trace.cropped_rect[3] = submit_source_rect.getHeight();
+    xr_trace.mono_fov[0] = mono_fov.angleLeft;
+    xr_trace.mono_fov[1] = mono_fov.angleRight;
+    xr_trace.mono_fov[2] = mono_fov.angleDown;
+    xr_trace.mono_fov[3] = mono_fov.angleUp;
+    xr_trace.mono_pos[0] = mono_pose.position.x;
+    xr_trace.mono_pos[1] = mono_pose.position.y;
+    xr_trace.mono_pos[2] = mono_pose.position.z;
+    xr_trace.mono_quat[0] = mono_pose.orientation.x;
+    xr_trace.mono_quat[1] = mono_pose.orientation.y;
+    xr_trace.mono_quat[2] = mono_pose.orientation.z;
+    xr_trace.mono_quat[3] = mono_pose.orientation.w;
+
     uint32_t submitted_view_count = 0;
     for (uint32_t eye = 0; eye < 2 && eye < (uint32_t)mImpl->swapchains.size(); ++eye)
     {
@@ -1322,7 +1537,14 @@ void LLOpenXRManager::submitFrameMono(const LLRect& source_rect)
         acquire_info.type = XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO;
 
         uint32_t image_index = 0;
+        xr_trace.eye_attempted[eye] = true;
+        xr_trace.eye_swap_w[eye] = swapchain.width;
+        xr_trace.eye_swap_h[eye] = swapchain.height;
+        xr_trace.eye_swap_format[eye] = (long long)swapchain.format;
+        xr_trace.eye_swap_sample[eye] = swapchain.sample_count;
         result = xrAcquireSwapchainImage(swapchain.handle, &acquire_info, &image_index);
+        xr_trace.eye_acquire_result[eye] = (int)result;
+        xr_trace.eye_submitted[eye] = false;
         if (XR_FAILED(result))
         {
             openxr_warn("xrAcquireSwapchainImage failed: " + format_xr_result(mImpl->instance, result));
@@ -1333,12 +1555,13 @@ void LLOpenXRManager::submitFrameMono(const LLRect& source_rect)
         wait_info.type = XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO;
         wait_info.timeout = XR_INFINITE_DURATION;
         result = xrWaitSwapchainImage(swapchain.handle, &wait_info);
+        xr_trace.eye_wait_result[eye] = (int)result;
         if (XR_FAILED(result))
         {
             openxr_warn("xrWaitSwapchainImage failed: " + format_xr_result(mImpl->instance, result));
             XrSwapchainImageReleaseInfo release_info{};
             release_info.type = XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO;
-            xrReleaseSwapchainImage(swapchain.handle, &release_info);
+            xr_trace.eye_release_result[eye] = (int)xrReleaseSwapchainImage(swapchain.handle, &release_info);
             continue;
         }
 
@@ -1347,8 +1570,11 @@ void LLOpenXRManager::submitFrameMono(const LLRect& source_rect)
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, mImpl->blit_fbo);
         glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, color_texture, 0);
 
-        if (glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE)
+        xr_trace.eye_fbo_complete[eye] =
+            (glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE);
+        if (xr_trace.eye_fbo_complete[eye])
         {
+            xr_trace.eye_blit_done[eye] = true;
             glBlitFramebuffer(
                 submit_source_rect.mLeft,
                 submit_source_rect.mBottom,
@@ -1370,7 +1596,8 @@ void LLOpenXRManager::submitFrameMono(const LLRect& source_rect)
 
         XrSwapchainImageReleaseInfo release_info{};
         release_info.type = XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO;
-        xrReleaseSwapchainImage(swapchain.handle, &release_info);
+        xr_trace.eye_release_result[eye] = (int)xrReleaseSwapchainImage(swapchain.handle, &release_info);
+        xr_trace.eye_submitted[eye] = true;
 
         XrCompositionLayerProjectionView& projection_view = layer_views[submitted_view_count];
         projection_view.pose = mono_pose;
@@ -1403,12 +1630,21 @@ void LLOpenXRManager::submitFrameMono(const LLRect& source_rect)
     frame_end_info.layerCount = (submitted_view_count > 0) ? 1 : 0;
     frame_end_info.layers = (submitted_view_count > 0) ? layers : nullptr;
 
+    xr_trace.submitted_view_count = submitted_view_count;
+    xr_trace.layer_count = frame_end_info.layerCount;
     result = xrEndFrame(mImpl->session, &frame_end_info);
+    xr_trace.end_result = (int)result;
+    if (xr_trace.tracing)
+    {
+        xr_trace.t_end_end = LLOpenXRTrace::nowUs();
+    }
     if (XR_FAILED(result))
     {
         openxr_warn("xrEndFrame failed: " + format_xr_result(mImpl->instance, result));
+        xr_trace.finish("end_failed");
         return;
     }
+    xr_trace.finish("submitted");
 
     mImpl->frame_submit_count++;
     if (mImpl->frame_submit_count == 1 || (mImpl->frame_submit_count % 300) == 0)
