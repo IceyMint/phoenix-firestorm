@@ -5882,6 +5882,23 @@ LLViewerObject* LLViewerWindow::cursorIntersect(S32 mouse_x, S32 mouse_y, F32 de
 
 // Returns unit vector relative to camera
 // indicating direction of point on screen x,y
+// P1-04 (Firestorm VR Phase 1) -- picking accuracy note:
+// This ray is built from the SYMMETRIC camera model: getView()
+// (the vertical FOV) plus the desktop world-view rect's centre and
+// aspect. It is the ray behind LLPickInfo::fetchResults() ->
+// cursorIntersect()/cursorIntersectIcon(), i.e. all mouse picking.
+// Under XR coherent optics (off-centre left-eye projection, P1-02/
+// P1-03) that model is only approximate: it ignores the frustum's
+// principal-point offset and derives the horizontal extent from
+// the window aspect instead of the eye's horizontal tangents, so
+// the pick ray diverges from the rendered ray increasingly toward
+// the edges -- worst toward the extended (left/down) edges.
+// Picking under XR is therefore DOCUMENTED AS APPROXIMATE, not
+// exact; an exact ray needs the inverse of the installed
+// off-centre projection plus a defined desktop-window -> eye-image
+// mapping, which is presentation work beyond Phase 1. With a
+// symmetric projection installed (desktop, legacy XR) this
+// construction is the correct one and is unchanged.
 LLVector3 LLViewerWindow::mouseDirectionGlobal(const S32 x, const S32 y) const
 {
     // find vertical field of view
@@ -5926,6 +5943,9 @@ LLVector3 LLViewerWindow::mousePointHUD(const S32 x, const S32 y) const
 
 // Returns unit vector relative to camera in camera space
 // indicating direction of point on screen x,y
+// P1-04: same symmetric-model caveat as mouseDirectionGlobal()
+// above -- approximate under XR off-centre optics; see the note
+// there.
 LLVector3 LLViewerWindow::mouseDirectionCamera(const S32 x, const S32 y) const
 {
     // find vertical field of view
