@@ -6,6 +6,8 @@
 
 #include <chrono>
 #include <cstdlib>
+#include <iomanip>
+#include <sstream>
 #include <deque>
 #include <fstream>
 #include <mutex>
@@ -32,6 +34,8 @@ struct TraceState
     unsigned long long xr_frame_seq = 0;
     unsigned long long render_seq = 0;
     LLOpenXRTrace::RenderProvenance render_provenance;
+    unsigned long long app_frame_token = 0;
+    LLOpenXRTrace::AppFrameContext app_frame_context;
     unsigned long long dropped_records = 0;
     unsigned long long written_records = 0;
     long long last_flush_us = 0;
@@ -290,23 +294,14 @@ std::string frame_record_unlocked(TraceState& state, const std::string& event,
     return ++state.render_seq;
 }
 
-/*static*/ void LLOpenXRTrace::stashRenderProvenance(unsigned long long render_seq, bool fov_valid,
-                                                      unsigned long long fov_generation, const float* fov_rad,
-                                                      bool offcenter_engaged)
+/*static*/ void LLOpenXRTrace::stashRenderProvenance(const RenderProvenance& provenance)
 {
     TraceState& state = trace_state();
     std::lock_guard<std::mutex> lock(state.mutex);
     // P1-03: no run_active gate -- the coherent submit path consumes
     // this snapshot functionally, with or without a trace run.
+    state.render_provenance = provenance;
     state.render_provenance.present = true;
-    state.render_provenance.render_seq = render_seq;
-    state.render_provenance.fov_valid = fov_valid;
-    state.render_provenance.fov_generation = fov_generation;
-    state.render_provenance.offcenter_engaged = offcenter_engaged;
-    for (int i = 0; i < 4; i++)
-    {
-        state.render_provenance.fov_rad[i] = fov_rad ? fov_rad[i] : 0.f;
-    }
 }
 
 /*static*/ bool LLOpenXRTrace::takeRenderProvenance(RenderProvenance& out)
@@ -320,6 +315,108 @@ std::string frame_record_unlocked(TraceState& state, const std::string& event,
     out = state.render_provenance;
     state.render_provenance = RenderProvenance();
     return true;
+}
+
+/*static*/ unsigned long long LLOpenXRTrace::nextAppFrameToken()
+{
+    TraceState& state = trace_state();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    // Process-monotonic and not reset by beginRun(): a token names
+    // one main-loop iteration uniquely for the whole trace file.
+    return ++state.app_frame_token;
+}
+
+/*static*/ void LLOpenXRTrace::beginAppFrame(unsigned long long app_frame_token)
+{
+    TraceState& state = trace_state();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    state.app_frame_context = AppFrameContext();
+    state.app_frame_context.present = true;
+    state.app_frame_context.app_frame_token = app_frame_token;
+    state.app_frame_context.t_mainloop_frame_start_us = now_us_unlocked(state);
+}
+
+/*static*/ void LLOpenXRTrace::markAppFrameIdleStart()
+{
+    TraceState& state = trace_state();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    if (state.app_frame_context.present)
+    {
+        state.app_frame_context.t_idle_start_us = now_us_unlocked(state);
+    }
+}
+
+/*static*/ void LLOpenXRTrace::markAppFrameIdleEnd()
+{
+    TraceState& state = trace_state();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    if (state.app_frame_context.present)
+    {
+        state.app_frame_context.t_idle_end_us = now_us_unlocked(state);
+    }
+}
+
+/*static*/ void LLOpenXRTrace::markAppFrameWorldRenderStart()
+{
+    TraceState& state = trace_state();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    if (state.app_frame_context.present)
+    {
+        state.app_frame_context.t_world_render_start_us = now_us_unlocked(state);
+    }
+}
+
+/*static*/ void LLOpenXRTrace::markAppFrameRenderEnd()
+{
+    TraceState& state = trace_state();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    if (state.app_frame_context.present)
+    {
+        state.app_frame_context.t_render_end_us = now_us_unlocked(state);
+    }
+}
+
+/*static*/ void LLOpenXRTrace::markAppFrameDisplayReturn()
+{
+    TraceState& state = trace_state();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    if (state.app_frame_context.present)
+    {
+        state.app_frame_context.t_display_return_us = now_us_unlocked(state);
+    }
+}
+
+/*static*/ bool LLOpenXRTrace::peekAppFrameContext(AppFrameContext& out)
+{
+    TraceState& state = trace_state();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    if (!state.app_frame_context.present)
+    {
+        return false;
+    }
+    out = state.app_frame_context;
+    return true;
+}
+
+/*static*/ unsigned long long LLOpenXRTrace::currentAppFrameToken()
+{
+    TraceState& state = trace_state();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    return state.app_frame_context.present ? state.app_frame_context.app_frame_token : 0;
+}
+
+/*static*/ std::string LLOpenXRTrace::placementFingerprint(const std::string& canonical_values)
+{
+    // FNV-1a 64-bit over the canonical value string.
+    unsigned long long hash = 1469598103934665603ULL;
+    for (char c : canonical_values)
+    {
+        hash ^= (unsigned long long)(unsigned char)c;
+        hash *= 1099511628211ULL;
+    }
+    std::ostringstream oss;
+    oss << std::hex << std::setfill('0') << std::setw(16) << hash;
+    return oss.str();
 }
 
 /*static*/ unsigned long long LLOpenXRTrace::nextXrFrameSeq()

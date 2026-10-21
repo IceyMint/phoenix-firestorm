@@ -237,7 +237,10 @@ struct XRRenderOpticsCapture
     bool fov_sample_valid = false;
     bool offcenter_engaged = false;   // P1-02: this render used the XR off-centre mode
     glm::mat4 world_gl_projection = glm::mat4(1.f);
+    glm::mat4 world_gl_view = glm::mat4(1.f);
     GLint world_gl_viewport[4] = {0, 0, 0, 0};
+    GLint world_gl_scissor[4] = {0, 0, 0, 0};
+    bool world_gl_scissor_enabled = false;
     F32 near_plane = 0.f;
     F32 far_plane = 0.f;
 };
@@ -346,20 +349,27 @@ void display_update_camera()
     // active. Single-use: submitFrameMono takes it exactly once.
     if (!gCubeSnapshot)
     {
-        float fov_rad[4] = {0.f, 0.f, 0.f, 0.f};
-        if (g_xr_render_optics_capture.fov_sample_valid)
-        {
-            fov_rad[0] = g_xr_render_optics_capture.fov_sample.left;
-            fov_rad[1] = g_xr_render_optics_capture.fov_sample.right;
-            fov_rad[2] = g_xr_render_optics_capture.fov_sample.down;
-            fov_rad[3] = g_xr_render_optics_capture.fov_sample.up;
-        }
-        LLOpenXRTrace::stashRenderProvenance(
-            0, g_xr_render_optics_capture.fov_sample_valid,
+        LLOpenXRTrace::RenderProvenance provenance;
+        provenance.render_seq = 0;
+        provenance.fov_valid = g_xr_render_optics_capture.fov_sample_valid;
+        provenance.fov_generation =
             g_xr_render_optics_capture.fov_sample_valid
                 ? g_xr_render_optics_capture.fov_sample.locate_generation
-                : 0,
-            fov_rad, xr_offcenter_engaged);
+                : 0;
+        if (g_xr_render_optics_capture.fov_sample_valid)
+        {
+            provenance.fov_rad[0] = g_xr_render_optics_capture.fov_sample.left;
+            provenance.fov_rad[1] = g_xr_render_optics_capture.fov_sample.right;
+            provenance.fov_rad[2] = g_xr_render_optics_capture.fov_sample.down;
+            provenance.fov_rad[3] = g_xr_render_optics_capture.fov_sample.up;
+        }
+        provenance.offcenter_engaged = xr_offcenter_engaged;
+        // P2-01: the producing iteration's token. The GL matrices are
+        // captured below (after setup3DRender) and are transferred by
+        // record_render_trace()'s re-stash when a trace run is
+        // active; the functional submit consumes only the FOV fields.
+        provenance.app_frame_token = LLOpenXRTrace::currentAppFrameToken();
+        LLOpenXRTrace::stashRenderProvenance(provenance);
     }
 
     gViewerWindow->setup3DRender();
@@ -376,7 +386,10 @@ void display_update_camera()
         // (The "projection" trace field comes from the camera's
         // calcProjection cache and cannot prove a GL render matrix.)
         g_xr_render_optics_capture.world_gl_projection = get_current_projection();
+        g_xr_render_optics_capture.world_gl_view = get_current_modelview();
         glGetIntegerv(GL_VIEWPORT, g_xr_render_optics_capture.world_gl_viewport);
+        glGetIntegerv(GL_SCISSOR_BOX, g_xr_render_optics_capture.world_gl_scissor);
+        g_xr_render_optics_capture.world_gl_scissor_enabled = glIsEnabled(GL_SCISSOR_TEST) == GL_TRUE;
         LLViewerCamera* xr_camera = LLViewerCamera::getInstance();
         g_xr_render_optics_capture.near_plane = xr_camera->getNear();
         g_xr_render_optics_capture.far_plane = xr_camera->getFar();
@@ -668,6 +681,10 @@ std::string trace_glm_mat4(const glm::mat4& m)
 
 void record_render_trace()
 {
+    // P2-01: the world render this record describes has just
+    // completed (record_render_trace is called immediately after
+    // renderFinalize()). Stage mark only.
+    LLOpenXRTrace::markAppFrameRenderEnd();
     if (!LLOpenXRTrace::runActive())
     {
         return;
@@ -684,6 +701,11 @@ void record_render_trace()
     fields << "\"frame_id\":" << LLFrameTimer::getFrameCount();
     const unsigned long long render_seq = LLOpenXRTrace::nextRenderSeq();
     fields << ",\"render_seq\":" << render_seq;
+    // P2-01: join this render to its main-loop iteration and label
+    // the frame-loop mode (P2-01 keeps the legacy render-then-submit
+    // order; the label is what the P2-02 gate will later flip).
+    fields << ",\"app_frame_token\":" << LLOpenXRTrace::currentAppFrameToken();
+    fields << ",\"frame_loop_mode\":\"legacy_after_render\"";
     fields << ",\"camera_mode\":" << (S32)gAgentCamera.getCameraMode();
     fields << ",\"camera_mouselook\":" << (gAgentCamera.cameraMouselook() ? "true" : "false");
     fields << ",\"look_at_type\":" << (S32)gAgentCamera.getLookAtType();
@@ -741,6 +763,12 @@ void record_render_trace()
     {
         fields << ",\"world_gl_projection\":" << trace_glm_mat4(optics.world_gl_projection);
         fields << ",\"world_gl_projection_order\":\"column_major_glm\"";
+        fields << ",\"world_gl_view\":" << trace_glm_mat4(optics.world_gl_view);
+        fields << ",\"world_gl_view_order\":\"column_major_glm\"";
+        fields << ",\"world_gl_scissor\":[" << optics.world_gl_scissor[0] << ","
+               << optics.world_gl_scissor[1] << "," << optics.world_gl_scissor[2] << ","
+               << optics.world_gl_scissor[3] << "]";
+        fields << ",\"world_gl_scissor_enabled\":" << (optics.world_gl_scissor_enabled ? "true" : "false");
         fields << ",\"world_gl_viewport\":[" << optics.world_gl_viewport[0] << ","
                << optics.world_gl_viewport[1] << "," << optics.world_gl_viewport[2] << ","
                << optics.world_gl_viewport[3] << "]";
@@ -750,7 +778,31 @@ void record_render_trace()
     else
     {
         fields << ",\"world_gl_projection\":null,\"world_gl_projection_order\":null";
+        fields << ",\"world_gl_view\":null,\"world_gl_view_order\":null";
+        fields << ",\"world_gl_scissor\":null,\"world_gl_scissor_enabled\":null";
         fields << ",\"world_gl_viewport\":null,\"xr_render_near\":null,\"xr_render_far\":null";
+    }
+    // P2-01: placement fingerprint of the rendered state. The
+    // canonical string is built from the trace's own f32
+    // serializations of the values recorded above; the fingerprint
+    // groups identical placements and never replaces the raw values.
+    std::string render_fingerprint;
+    if (optics.present)
+    {
+        const std::string canonical =
+            trace_glm_mat4(optics.world_gl_projection) + "|" + trace_glm_mat4(optics.world_gl_view) +
+            "|" + std::to_string(optics.world_gl_viewport[0]) + "," +
+            std::to_string(optics.world_gl_viewport[1]) + "," +
+            std::to_string(optics.world_gl_viewport[2]) + "," +
+            std::to_string(optics.world_gl_viewport[3]) + "|" + trace_f32(optics.near_plane) +
+            "|" + trace_f32(optics.far_plane) + "|" +
+            (optics.fov_sample_valid ? trace_fov4_rad(optics.fov_sample) : std::string("null"));
+        render_fingerprint = LLOpenXRTrace::placementFingerprint(canonical);
+        fields << ",\"placement_fingerprint_render\":\"" << render_fingerprint << "\"";
+    }
+    else
+    {
+        fields << ",\"placement_fingerprint_render\":null";
     }
     fields << ",\"world_render_rect\":[" << world_render_rect.mLeft << "," << world_render_rect.mBottom
            << "," << world_render_rect.getWidth() << "," << world_render_rect.getHeight() << "]";
@@ -788,18 +840,42 @@ void record_render_trace()
     // snapshot for the functional submit path; this re-stash only adds
     // the render_seq, which exists because a trace run is active.
     {
-        float fov_rad[4] = {0.f, 0.f, 0.f, 0.f};
+        LLOpenXRTrace::RenderProvenance provenance;
+        provenance.render_seq = render_seq;
+        provenance.fov_valid = optics.present && optics.fov_sample_valid;
+        provenance.fov_generation = optics.fov_sample_valid ? optics.fov_sample.locate_generation : 0;
         if (optics.fov_sample_valid)
         {
-            fov_rad[0] = optics.fov_sample.left;
-            fov_rad[1] = optics.fov_sample.right;
-            fov_rad[2] = optics.fov_sample.down;
-            fov_rad[3] = optics.fov_sample.up;
+            provenance.fov_rad[0] = optics.fov_sample.left;
+            provenance.fov_rad[1] = optics.fov_sample.right;
+            provenance.fov_rad[2] = optics.fov_sample.down;
+            provenance.fov_rad[3] = optics.fov_sample.up;
         }
-        LLOpenXRTrace::stashRenderProvenance(
-            render_seq, optics.present && optics.fov_sample_valid,
-            optics.fov_sample_valid ? optics.fov_sample.locate_generation : 0, fov_rad,
-            optics.offcenter_engaged);
+        provenance.offcenter_engaged = optics.offcenter_engaged;
+        // P2-01 / Amendment 4: transfer the render's true GL state and
+        // its iteration identity with its image, so the xr_submit
+        // record can state exactly which rendered state it submitted.
+        provenance.app_frame_token = LLOpenXRTrace::currentAppFrameToken();
+        if (optics.present)
+        {
+            provenance.has_world_gl = true;
+            const F32* proj = glm::value_ptr(optics.world_gl_projection);
+            const F32* view = glm::value_ptr(optics.world_gl_view);
+            for (int i = 0; i < 16; i++)
+            {
+                provenance.world_gl_projection[i] = proj[i];
+                provenance.world_gl_view[i] = view[i];
+            }
+            provenance.has_gl_rects = true;
+            for (int i = 0; i < 4; i++)
+            {
+                provenance.gl_viewport[i] = optics.world_gl_viewport[i];
+                provenance.gl_scissor[i] = optics.world_gl_scissor[i];
+            }
+            provenance.gl_scissor_enabled = optics.world_gl_scissor_enabled;
+            provenance.render_fingerprint = render_fingerprint;
+        }
+        LLOpenXRTrace::stashRenderProvenance(provenance);
     }
 }
 } // namespace
@@ -1183,6 +1259,9 @@ void display(bool rebuild, F32 zoom_factor, int subfield, bool for_snapshot)
         }
 
         stop_glerror();
+        // P2-01: the world render pass of this iteration starts here
+        // (camera setup first). Trace stage mark only.
+        LLOpenXRTrace::markAppFrameWorldRenderStart();
         display_update_camera();
         stop_glerror();
 

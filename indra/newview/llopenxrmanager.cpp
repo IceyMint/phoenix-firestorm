@@ -508,7 +508,23 @@ struct LLOpenXRManagerImpl
     F32 latest_left_eye_aspect = 0.f;
     bool has_left_eye_aspect = false;
     LLXRLeftEyeFovSample left_eye_fov_sample;
-    unsigned long long left_eye_fov_locate_generation = 0;
+    // P2-01: THE locate generation counter. Increments exactly once
+    // per successful xrLocateViews whose views pass the P0-06
+    // validity gates and are adopted as the manager's current pose /
+    // FOV sample. The FOV sample, the head's latest pose, and every
+    // trace generation field derive from this one counter, so a
+    // generation number names one locate unambiguously. (This
+    // replaces the P1-01 FOV-only counter; it mints at the same
+    // adoption point, so sample.locate_generation is unchanged in
+    // meaning.)
+    unsigned long long locate_generation = 0;
+    // Generation of the locate that produced latest_hmd_forward/up.
+    unsigned long long latest_pose_generation = 0;
+    // P2-01: the head path's most recent consumption of the pose
+    // (stamped by getHmdForward): which generation it used, and the
+    // app_frame_token of the iteration that used it.
+    unsigned long long head_consumed_pose_generation = 0;
+    unsigned long long head_consumed_app_frame_token = 0;
 };
 #endif
 
@@ -1164,12 +1180,177 @@ struct XrSubmitTrace
     float coherence_max_delta_deg = 0.f;
     bool has_blit_scale[2] = {false, false};
     float blit_scale[2][2] = {};
+    // P2-01: per-call stage start timestamps (the *_end stamps above
+    // are P0-03). All on the LLOpenXRTrace::nowUs() host monotonic
+    // clock; 0 = stage not reached.
+    long long t_wait_start = 0;
+    long long t_begin_start = 0;
+    long long t_locate_start = 0;
+    long long t_end_start = 0;
+    // P2-01: the XrTime the locate was performed at (the wait-returned
+    // frame's predictedDisplayTime, in the runtime's clock domain --
+    // never mixed with the host timestamps above).
+    bool has_locate_display_time = false;
+    long long locate_display_time = 0;
+    // P2-01: session state at this call (after processEvents).
+    bool has_session_state = false;
+    int session_state = 0;
+    bool has_pose_sample_valid = false;
+    bool pose_sample_valid = false;
+    // P2-01: pose generations (manager's single locate counter).
+    bool has_located_generation = false;
+    unsigned long long located_generation = 0;
+    bool has_head_generation = false;
+    unsigned long long head_generation = 0;
+    bool has_render_generation = false;
+    unsigned long long render_generation = 0;
+    bool has_layer_generation = false;
+    unsigned long long layer_generation = 0;
+    // P2-01: source identity/state transferred with the image.
+    unsigned long long source_app_frame_token = 0;
+    bool has_source_gl = false;
+    float source_world_gl_projection[16] = {};
+    float source_world_gl_view[16] = {};
+    bool has_source_gl_rects = false;
+    int source_gl_viewport[4] = {0, 0, 0, 0};
+    int source_gl_scissor[4] = {0, 0, 0, 0};
+    bool source_gl_scissor_enabled = false;
+    std::string source_render_fingerprint;
+    // P2-01: swapchain image index per eye (at acquire) and the blit
+    // rectangles per eye (source [left,bottom,w,h], dest [x,y,w,h];
+    // the filter is the glBlitFramebuffer literal, GL_LINEAR).
+    bool has_eye_image_index[2] = {false, false};
+    uint32_t eye_image_index[2] = {0, 0};
+    bool has_blit_rects[2] = {false, false};
+    int blit_src_rect[2][4] = {};
+    int blit_dst_rect[2][4] = {};
+    // P2-01 / Amendment 4: the exact submitted state, captured by
+    // captureEndFrame() immediately before each xrEndFrame.
+    bool has_submitted_state = false;
+    int submitted_layer_count = 0;
+    long long submitted_end_display_time = 0;
+    bool has_projection_layer = false;
+    std::string submitted_layer_space_type;
+    unsigned long long submitted_layer_space_id = 0;
+    uint32_t submitted_view_count_captured = 0;
+    bool submitted_view_present[2] = {false, false};
+    float submitted_view_pos[2][3] = {};
+    float submitted_view_quat[2][4] = {};
+    float submitted_view_fov[2][4] = {};
+    int submitted_view_rect[2][4] = {};
+    unsigned long long submitted_view_swapchain[2] = {0, 0};
+    bool has_submitted_image_index[2] = {false, false};
+    uint32_t submitted_view_image_index[2] = {0, 0};
+    bool has_submitted_pose_generation = false;
+    unsigned long long submitted_pose_generation = 0;
+    bool has_submitted_fov_generation = false;
+    unsigned long long submitted_fov_generation = 0;
+    std::string fp_layer;
+
+    // P2-01 / Amendment 4: capture the exact state about to be handed
+    // to xrEndFrame. Called IMMEDIATELY before each xrEndFrame in
+    // submitFrameMono; also stamps t_end_start. proj_layer is nullptr
+    // for zero-layer ends. Values are copied verbatim from the
+    // structures the runtime will receive -- nothing is recomputed,
+    // and layer values are never read back from the manager's caches.
+    void captureEndFrame(const XrFrameEndInfo& info, const XrCompositionLayerProjection* proj_layer,
+                         const char* space_type, unsigned long long space_id)
+    {
+        if (tracing)
+        {
+            t_end_start = LLOpenXRTrace::nowUs();
+        }
+        has_submitted_state = true;
+        submitted_layer_count = (int)info.layerCount;
+        submitted_end_display_time = (long long)info.displayTime;
+        if (info.layerCount == 0 || !proj_layer)
+        {
+            return;
+        }
+        has_projection_layer = true;
+        submitted_layer_space_type = space_type ? space_type : "";
+        submitted_layer_space_id = space_id;
+        const uint32_t count = std::min<uint32_t>(proj_layer->viewCount, 2);
+        // Layer views were appended in eye order for the eyes whose
+        // submission succeeded; map them back by that same order.
+        uint32_t view_index = 0;
+        for (uint32_t eye = 0; eye < 2 && view_index < count; eye++)
+        {
+            if (!eye_submitted[eye])
+            {
+                continue;
+            }
+            const XrCompositionLayerProjectionView& view = proj_layer->views[view_index];
+            submitted_view_present[view_index] = true;
+            submitted_view_pos[view_index][0] = view.pose.position.x;
+            submitted_view_pos[view_index][1] = view.pose.position.y;
+            submitted_view_pos[view_index][2] = view.pose.position.z;
+            submitted_view_quat[view_index][0] = view.pose.orientation.x;
+            submitted_view_quat[view_index][1] = view.pose.orientation.y;
+            submitted_view_quat[view_index][2] = view.pose.orientation.z;
+            submitted_view_quat[view_index][3] = view.pose.orientation.w;
+            submitted_view_fov[view_index][0] = view.fov.angleLeft;
+            submitted_view_fov[view_index][1] = view.fov.angleRight;
+            submitted_view_fov[view_index][2] = view.fov.angleDown;
+            submitted_view_fov[view_index][3] = view.fov.angleUp;
+            submitted_view_rect[view_index][0] = view.subImage.imageRect.offset.x;
+            submitted_view_rect[view_index][1] = view.subImage.imageRect.offset.y;
+            submitted_view_rect[view_index][2] = view.subImage.imageRect.extent.width;
+            submitted_view_rect[view_index][3] = view.subImage.imageRect.extent.height;
+            submitted_view_swapchain[view_index] = (unsigned long long)(uintptr_t)view.subImage.swapchain;
+            if (has_eye_image_index[eye])
+            {
+                has_submitted_image_index[view_index] = true;
+                submitted_view_image_index[view_index] = eye_image_index[eye];
+            }
+            view_index++;
+        }
+        submitted_view_count_captured = view_index;
+        if (tracing)
+        {
+            std::ostringstream canon;
+            canon << submitted_layer_space_type << "#" << submitted_layer_space_id;
+            for (uint32_t i = 0; i < view_index; i++)
+            {
+                canon << "|" << f32(submitted_view_pos[i][0]) << "," << f32(submitted_view_pos[i][1])
+                      << "," << f32(submitted_view_pos[i][2]) << "|" << f32(submitted_view_quat[i][0])
+                      << "," << f32(submitted_view_quat[i][1]) << "," << f32(submitted_view_quat[i][2])
+                      << "," << f32(submitted_view_quat[i][3]) << "|" << f32(submitted_view_fov[i][0])
+                      << "," << f32(submitted_view_fov[i][1]) << "," << f32(submitted_view_fov[i][2])
+                      << "," << f32(submitted_view_fov[i][3]) << "|" << submitted_view_rect[i][0] << ","
+                      << submitted_view_rect[i][1] << "," << submitted_view_rect[i][2] << ","
+                      << submitted_view_rect[i][3];
+            }
+            fp_layer = LLOpenXRTrace::placementFingerprint(canon.str());
+        }
+    }
 
     static std::string f32(float v)
     {
         std::ostringstream oss;
         oss << std::setprecision(9) << v;
         return oss.str();
+    }
+
+    // P2-01: a duration on the nowUs() clock, or "null" when either
+    // endpoint was never stamped (the stage was not reached).
+    static std::string dur_or_null(long long start, long long end)
+    {
+        if (start <= 0 || end < start)
+        {
+            return "null";
+        }
+        return std::to_string(end - start);
+    }
+
+    static std::string us_or_null(long long v)
+    {
+        return v > 0 ? std::to_string(v) : std::string("null");
+    }
+
+    static std::string gen_or_null(bool has, unsigned long long v)
+    {
+        return has ? std::to_string(v) : std::string("null");
     }
 
     void finish(const std::string& final_status)
@@ -1188,17 +1369,76 @@ struct XrSubmitTrace
         std::ostringstream f;
         f << "\"xr_frame_seq\":" << LLOpenXRTrace::nextXrFrameSeq();
         f << ",\"status\":\"" << status << "\"";
+        // P2-01: the frame's outcome under its contract name, the
+        // loop mode, and the join to this iteration's main-loop
+        // context (token + the stage stamps that exist by submit
+        // time; t_display_return_us lives on the app_frame record,
+        // which is written after display() returns).
+        f << ",\"frame_outcome\":\"" << status << "\"";
+        f << ",\"frame_loop_mode\":\"legacy_after_render\"";
+        {
+            LLOpenXRTrace::AppFrameContext app_ctx;
+            if (LLOpenXRTrace::peekAppFrameContext(app_ctx))
+            {
+                f << ",\"app_frame_token\":" << app_ctx.app_frame_token;
+                f << ",\"t_mainloop_frame_start_us\":" << app_ctx.t_mainloop_frame_start_us;
+                f << ",\"t_idle_start_us\":" << us_or_null(app_ctx.t_idle_start_us);
+                f << ",\"t_idle_end_us\":" << us_or_null(app_ctx.t_idle_end_us);
+                f << ",\"t_world_render_start_us\":" << us_or_null(app_ctx.t_world_render_start_us);
+                f << ",\"t_render_end_us\":" << us_or_null(app_ctx.t_render_end_us);
+            }
+            else
+            {
+                f << ",\"app_frame_token\":null,\"t_mainloop_frame_start_us\":null";
+                f << ",\"t_idle_start_us\":null,\"t_idle_end_us\":null";
+                f << ",\"t_world_render_start_us\":null,\"t_render_end_us\":null";
+            }
+        }
+        if (has_session_state)
+        {
+            f << ",\"session_state\":" << session_state;
+            f << ",\"session_state_name\":\"" << xr_session_state_name((XrSessionState)session_state) << "\"";
+        }
+        else
+        {
+            f << ",\"session_state\":null,\"session_state_name\":null";
+        }
+        f << ",\"pose_sample_valid\":"
+          << (has_pose_sample_valid ? (pose_sample_valid ? "true" : "false") : "null");
         f << ",\"t_entry_us\":" << t_entry;
         f << ",\"t_wait_end_us\":" << t_wait_end;
         f << ",\"t_begin_end_us\":" << t_begin_end;
         f << ",\"t_locate_end_us\":" << t_locate_end;
         f << ",\"t_end_end_us\":" << t_end_end;
+        // P2-01: stage start stamps + derived call durations (all
+        // nowUs() host monotonic; null when a stage was not reached).
+        f << ",\"t_wait_start_us\":" << t_wait_start;
+        f << ",\"t_begin_start_us\":" << t_begin_start;
+        f << ",\"t_locate_start_us\":" << t_locate_start;
+        f << ",\"t_end_start_us\":" << t_end_start;
+        f << ",\"wait_block_us\":" << dur_or_null(t_wait_start, t_wait_end);
+        f << ",\"begin_call_us\":" << dur_or_null(t_begin_start, t_begin_end);
+        f << ",\"locate_call_us\":" << dur_or_null(t_locate_start, t_locate_end);
+        f << ",\"end_call_us\":" << dur_or_null(t_end_start, t_end_end);
+        f << ",\"locate_to_end_us\":" << dur_or_null(t_locate_end, t_end_end);
         f << ",\"wait_result\":" << wait_result;
         f << ",\"begin_result\":" << begin_result;
         f << ",\"locate_result\":" << locate_result;
         f << ",\"end_result\":" << end_result;
         f << ",\"predicted_display_time_xr_ns\":" << predicted_display_time;
         f << ",\"predicted_display_period_xr_ns\":" << predicted_display_period;
+        // P2-01: the locate ran at the wait-returned frame's
+        // predictedDisplayTime (runtime clock domain). Cross-domain
+        // deltas between host us and XrTime ns require
+        // XR_KHR_convert_timespec_time, which is NOT enabled in this
+        // codebase (only XR_KHR_OPENGL_ENABLE is) -- they are null,
+        // never estimated, and no conversion extension is negotiated
+        // in this commit.
+        f << ",\"locate_display_time_xr_ns\":"
+          << (has_locate_display_time ? std::to_string(locate_display_time) : std::string("null"));
+        f << ",\"clock_domain_conversion_available\":false";
+        f << ",\"wait_return_xr_ns\":null,\"end_start_xr_ns\":null";
+        f << ",\"predicted_minus_wait_return_us\":null,\"end_start_minus_predicted_us\":null";
         f << ",\"should_render\":" << (should_render ? "true" : "false");
         f << ",\"located_view_count\":" << located_view_count;
         f << ",\"view_state_flags\":" << view_state_flags;
@@ -1232,6 +1472,10 @@ struct XrSubmitTrace
             f << ",\"eye" << eye << "_fbo_complete\":" << (eye_fbo_complete[eye] ? "true" : "false");
             f << ",\"eye" << eye << "_blit_done\":" << (eye_blit_done[eye] ? "true" : "false");
             f << ",\"eye" << eye << "_submitted\":" << (eye_submitted[eye] ? "true" : "false");
+            if (has_eye_image_index[eye])
+            {
+                f << ",\"eye" << eye << "_image_index\":" << eye_image_index[eye];
+            }
         }
         f << ",\"using_pipeline_source\":" << (using_pipeline_source ? "true" : "false");
         f << ",\"input_rect\":[" << input_rect[0] << "," << input_rect[1] << "," << input_rect[2] << "," << input_rect[3] << "]";
@@ -1285,6 +1529,29 @@ struct XrSubmitTrace
             f << ",\"xr_fov_delta_current_deg\":null";
         }
         f << ",\"xr_optics_source_valid\":" << ((has_render_source && render_fov_valid) ? "true" : "false");
+        // P2-01: pose generations, all from the manager's single
+        // locate counter. On the old loop they expose the
+        // architecture directly: the layer carries THIS call's
+        // locate, while the head and the render consumed the
+        // previous one (delta 1).
+        f << ",\"pose_generation_located\":" << gen_or_null(has_located_generation, located_generation);
+        f << ",\"pose_generation_used_by_head\":" << gen_or_null(has_head_generation, head_generation);
+        f << ",\"pose_generation_used_by_render\":" << gen_or_null(has_render_generation, render_generation);
+        f << ",\"pose_generation_used_by_layer\":" << gen_or_null(has_layer_generation, layer_generation);
+        f << ",\"render_generation_delta\":"
+          << ((has_located_generation && has_render_generation)
+                  ? std::to_string((long long)located_generation - (long long)render_generation)
+                  : std::string("null"));
+        f << ",\"layer_generation_delta\":"
+          << ((has_located_generation && has_layer_generation)
+                  ? std::to_string((long long)located_generation - (long long)layer_generation)
+                  : std::string("null"));
+        f << ",\"submitted_pose_generation\":" << gen_or_null(has_submitted_pose_generation, submitted_pose_generation);
+        f << ",\"submitted_fov_generation\":" << gen_or_null(has_submitted_fov_generation, submitted_fov_generation);
+        // The AvatarEyeFrame does not exist until P2-03; its token
+        // is null here -- app_frame_token (above) is the linkage
+        // available in P2-01.
+        f << ",\"avatar_eye_frame_token\":null";
         f << ",\"submitted_view_count\":" << submitted_view_count;
         f << ",\"layer_count\":" << layer_count;
         f << ",\"xr_optics_mode\":\"" << (optics_coherent ? "coherent" : "legacy") << "\"";
@@ -1306,6 +1573,131 @@ struct XrSubmitTrace
             {
                 f << ",\"eye" << eye << "_blit_scale\":[" << f32(blit_scale[eye][0]) << "," << f32(blit_scale[eye][1]) << "]";
             }
+        }
+        // P2-01 / Amendment 4: the exact submitted state (captured
+        // immediately before the xrEndFrame that consumed it), the
+        // source render's transferred GL state, the blit rectangles,
+        // and the four placement fingerprints. Raw values are
+        // recorded in full; fingerprints only group them.
+        f << ",\"has_submitted_state\":" << (has_submitted_state ? "true" : "false");
+        if (has_submitted_state)
+        {
+            f << ",\"submitted_layer_count\":" << submitted_layer_count;
+            f << ",\"submitted_end_display_time_xr_ns\":" << submitted_end_display_time;
+            f << ",\"submitted_has_projection_layer\":" << (has_projection_layer ? "true" : "false");
+            if (has_projection_layer)
+            {
+                f << ",\"layer_space_type\":\"" << submitted_layer_space_type << "\"";
+                f << ",\"layer_space_id\":" << submitted_layer_space_id;
+                for (uint32_t i = 0; i < submitted_view_count_captured; i++)
+                {
+                    f << ",\"submitted_view" << i << "_pos\":[" << f32(submitted_view_pos[i][0]) << "," << f32(submitted_view_pos[i][1]) << "," << f32(submitted_view_pos[i][2]) << "]";
+                    f << ",\"submitted_view" << i << "_quat\":[" << f32(submitted_view_quat[i][0]) << "," << f32(submitted_view_quat[i][1]) << "," << f32(submitted_view_quat[i][2]) << "," << f32(submitted_view_quat[i][3]) << "]";
+                    f << ",\"submitted_view" << i << "_fov\":[" << f32(submitted_view_fov[i][0]) << "," << f32(submitted_view_fov[i][1]) << "," << f32(submitted_view_fov[i][2]) << "," << f32(submitted_view_fov[i][3]) << "]";
+                    f << ",\"submitted_view" << i << "_rect\":[" << submitted_view_rect[i][0] << "," << submitted_view_rect[i][1] << "," << submitted_view_rect[i][2] << "," << submitted_view_rect[i][3] << "]";
+                    f << ",\"submitted_view" << i << "_swapchain\":" << submitted_view_swapchain[i];
+                    f << ",\"submitted_view" << i << "_image_index\":"
+                      << (has_submitted_image_index[i] ? std::to_string(submitted_view_image_index[i]) : std::string("null"));
+                }
+            }
+        }
+        f << ",\"source_app_frame_token\":" << source_app_frame_token;
+        if (has_source_gl)
+        {
+            f << ",\"source_world_gl_projection\":[";
+            for (int i = 0; i < 16; i++)
+            {
+                if (i > 0)
+                {
+                    f << ",";
+                }
+                f << f32(source_world_gl_projection[i]);
+            }
+            f << "]";
+            f << ",\"source_world_gl_view\":[";
+            for (int i = 0; i < 16; i++)
+            {
+                if (i > 0)
+                {
+                    f << ",";
+                }
+                f << f32(source_world_gl_view[i]);
+            }
+            f << "]";
+        }
+        else
+        {
+            f << ",\"source_world_gl_projection\":null,\"source_world_gl_view\":null";
+        }
+        if (has_source_gl_rects)
+        {
+            f << ",\"source_gl_viewport\":[" << source_gl_viewport[0] << "," << source_gl_viewport[1] << "," << source_gl_viewport[2] << "," << source_gl_viewport[3] << "]";
+            f << ",\"source_gl_scissor\":[" << source_gl_scissor[0] << "," << source_gl_scissor[1] << "," << source_gl_scissor[2] << "," << source_gl_scissor[3] << "]";
+            f << ",\"source_gl_scissor_enabled\":" << (source_gl_scissor_enabled ? "true" : "false");
+        }
+        else
+        {
+            f << ",\"source_gl_viewport\":null,\"source_gl_scissor\":null,\"source_gl_scissor_enabled\":null";
+        }
+        for (int eye = 0; eye < 2; eye++)
+        {
+            if (has_blit_rects[eye])
+            {
+                f << ",\"eye" << eye << "_blit_src_rect\":[" << blit_src_rect[eye][0] << "," << blit_src_rect[eye][1] << "," << blit_src_rect[eye][2] << "," << blit_src_rect[eye][3] << "]";
+                f << ",\"eye" << eye << "_blit_dst_rect\":[" << blit_dst_rect[eye][0] << "," << blit_dst_rect[eye][1] << "," << blit_dst_rect[eye][2] << "," << blit_dst_rect[eye][3] << "]";
+                f << ",\"eye" << eye << "_blit_filter\":\"LINEAR\"";
+            }
+        }
+        {
+            std::ostringstream src_canon;
+            src_canon << source_app_frame_token << "#"
+                      << (has_render_source ? std::to_string(render_seq_source) : std::string("null"))
+                      << "#" << input_rect[0] << "," << input_rect[1] << "," << input_rect[2] << "," << input_rect[3]
+                      << "#" << cropped_rect[0] << "," << cropped_rect[1] << "," << cropped_rect[2] << "," << cropped_rect[3]
+                      << "#";
+            if (has_source_gl_rects)
+            {
+                src_canon << source_gl_viewport[0] << "," << source_gl_viewport[1] << "," << source_gl_viewport[2] << "," << source_gl_viewport[3]
+                          << "|" << source_gl_scissor[0] << "," << source_gl_scissor[1] << "," << source_gl_scissor[2] << "," << source_gl_scissor[3];
+            }
+            else
+            {
+                src_canon << "null";
+            }
+            src_canon << "#";
+            for (int eye = 0; eye < 2; eye++)
+            {
+                if (eye > 0)
+                {
+                    src_canon << "|";
+                }
+                src_canon << (has_eye_image_index[eye] ? std::to_string(eye_image_index[eye]) : std::string("-"))
+                          << "@" << eye_swap_w[eye] << "x" << eye_swap_h[eye];
+            }
+            const std::string fp_source = LLOpenXRTrace::placementFingerprint(src_canon.str());
+            const std::string fp_submission = LLOpenXRTrace::placementFingerprint(
+                (source_render_fingerprint.empty() ? std::string("null") : source_render_fingerprint) +
+                "|" + (fp_layer.empty() ? std::string("null") : fp_layer) + "|" + fp_source);
+            f << ",\"placement_fingerprint_render\":";
+            if (source_render_fingerprint.empty())
+            {
+                f << "null";
+            }
+            else
+            {
+                f << "\"" << source_render_fingerprint << "\"";
+            }
+            f << ",\"placement_fingerprint_layer\":";
+            if (fp_layer.empty())
+            {
+                f << "null";
+            }
+            else
+            {
+                f << "\"" << fp_layer << "\"";
+            }
+            f << ",\"placement_fingerprint_source\":\"" << fp_source << "\"";
+            f << ",\"placement_fingerprint_submission\":\"" << fp_submission << "\"";
         }
         LLOpenXRTrace::writeRecord("xr_submit", f.str());
     }
@@ -1347,6 +1739,34 @@ void LLOpenXRManager::submitFrameMono(const LLRect& source_rect)
         for (int i = 0; i < 4; i++)
         {
             xr_trace.render_fov_rad[i] = render_provenance.fov_rad[i];
+        }
+        // P2-01: the generation the render consumed, and the source
+        // state transferred with its image (Amendment 4).
+        if (render_provenance.fov_valid && render_provenance.fov_generation > 0)
+        {
+            xr_trace.has_render_generation = true;
+            xr_trace.render_generation = render_provenance.fov_generation;
+        }
+        xr_trace.source_app_frame_token = render_provenance.app_frame_token;
+        xr_trace.source_render_fingerprint = render_provenance.render_fingerprint;
+        if (render_provenance.has_world_gl)
+        {
+            xr_trace.has_source_gl = true;
+            for (int i = 0; i < 16; i++)
+            {
+                xr_trace.source_world_gl_projection[i] = render_provenance.world_gl_projection[i];
+                xr_trace.source_world_gl_view[i] = render_provenance.world_gl_view[i];
+            }
+        }
+        if (render_provenance.has_gl_rects)
+        {
+            xr_trace.has_source_gl_rects = true;
+            for (int i = 0; i < 4; i++)
+            {
+                xr_trace.source_gl_viewport[i] = render_provenance.gl_viewport[i];
+                xr_trace.source_gl_scissor[i] = render_provenance.gl_scissor[i];
+            }
+            xr_trace.source_gl_scissor_enabled = render_provenance.gl_scissor_enabled;
         }
     }
     static bool submit_entry_logged = false;
@@ -1392,6 +1812,20 @@ void LLOpenXRManager::submitFrameMono(const LLRect& source_rect)
     }
 
     processEvents();
+    // P2-01: iteration context for this call's record. The head
+    // generation counts only when the head consumed the pose during
+    // THIS main-loop iteration (token match); a stale stamp from an
+    // earlier iteration is not this frame's head data.
+    xr_trace.has_session_state = true;
+    xr_trace.session_state = (int)mImpl->session_state;
+    xr_trace.pose_sample_valid = mImpl->left_eye_fov_sample.valid;
+    xr_trace.has_pose_sample_valid = true;
+    if (mImpl->head_consumed_app_frame_token != 0 &&
+        mImpl->head_consumed_app_frame_token == LLOpenXRTrace::currentAppFrameToken())
+    {
+        xr_trace.has_head_generation = true;
+        xr_trace.head_generation = mImpl->head_consumed_pose_generation;
+    }
     if (mDisabled || !mImpl->session_running)
     {
         return;
@@ -1409,6 +1843,10 @@ void LLOpenXRManager::submitFrameMono(const LLRect& source_rect)
     XrFrameState frame_state{};
     frame_state.type = XR_TYPE_FRAME_STATE;
 
+    if (xr_trace.tracing)
+    {
+        xr_trace.t_wait_start = LLOpenXRTrace::nowUs();
+    }
     XrResult result = xrWaitFrame(mImpl->session, &frame_wait_info, &frame_state);
     xr_trace.wait_result = (int)result;
     xr_trace.predicted_display_time = (long long)frame_state.predictedDisplayTime;
@@ -1427,6 +1865,10 @@ void LLOpenXRManager::submitFrameMono(const LLRect& source_rect)
 
     XrFrameBeginInfo frame_begin_info{};
     frame_begin_info.type = XR_TYPE_FRAME_BEGIN_INFO;
+    if (xr_trace.tracing)
+    {
+        xr_trace.t_begin_start = LLOpenXRTrace::nowUs();
+    }
     result = xrBeginFrame(mImpl->session, &frame_begin_info);
     xr_trace.begin_result = (int)result;
     if (xr_trace.tracing)
@@ -1448,6 +1890,7 @@ void LLOpenXRManager::submitFrameMono(const LLRect& source_rect)
         frame_end_info.environmentBlendMode = mImpl->blend_mode;
         frame_end_info.layerCount = 0;
         frame_end_info.layers = nullptr;
+        xr_trace.captureEndFrame(frame_end_info, nullptr, nullptr, 0);
         xr_trace.end_result = (int)xrEndFrame(mImpl->session, &frame_end_info);
         xr_trace.layer_count = 0;
         if (xr_trace.tracing)
@@ -1467,6 +1910,12 @@ void LLOpenXRManager::submitFrameMono(const LLRect& source_rect)
     XrViewState view_state{};
     view_state.type = XR_TYPE_VIEW_STATE;
 
+    if (xr_trace.tracing)
+    {
+        xr_trace.t_locate_start = LLOpenXRTrace::nowUs();
+    }
+    xr_trace.has_locate_display_time = true;
+    xr_trace.locate_display_time = (long long)view_locate_info.displayTime;
     uint32_t located_view_count = 0;
     result = xrLocateViews(
         mImpl->session,
@@ -1485,19 +1934,28 @@ void LLOpenXRManager::submitFrameMono(const LLRect& source_rect)
     if (XR_FAILED(result) || located_view_count < 2)
     {
         openxr_warn("xrLocateViews failed: " + format_xr_result(mImpl->instance, result));
-        xr_trace.finish("locate_failed");
         mImpl->has_hmd_forward = false;
         mImpl->has_hmd_up = false;
         mImpl->has_left_eye_vertical_fov = false;
         mImpl->has_left_eye_aspect = false;
         mImpl->left_eye_fov_sample.valid = false;
+        xr_trace.pose_sample_valid = false;
         XrFrameEndInfo frame_end_info{};
         frame_end_info.type = XR_TYPE_FRAME_END_INFO;
         frame_end_info.displayTime = frame_state.predictedDisplayTime;
         frame_end_info.environmentBlendMode = mImpl->blend_mode;
         frame_end_info.layerCount = 0;
         frame_end_info.layers = nullptr;
-        xrEndFrame(mImpl->session, &frame_end_info);
+        // P2-01: finish() moves after this zero-layer end so the
+        // record carries the submitted state and the end timestamps
+        // (trace-only reorder; the end call itself is unchanged).
+        xr_trace.captureEndFrame(frame_end_info, nullptr, nullptr, 0);
+        xr_trace.end_result = (int)xrEndFrame(mImpl->session, &frame_end_info);
+        if (xr_trace.tracing)
+        {
+            xr_trace.t_end_end = LLOpenXRTrace::nowUs();
+        }
+        xr_trace.finish("locate_failed");
         return;
     }
 
@@ -1523,16 +1981,33 @@ void LLOpenXRManager::submitFrameMono(const LLRect& source_rect)
         frame_end_info.environmentBlendMode = mImpl->blend_mode;
         frame_end_info.layerCount = 0;
         frame_end_info.layers = nullptr;
-        xrEndFrame(mImpl->session, &frame_end_info);
+        xr_trace.captureEndFrame(frame_end_info, nullptr, nullptr, 0);
+        xr_trace.end_result = (int)xrEndFrame(mImpl->session, &frame_end_info);
+        if (xr_trace.tracing)
+        {
+            xr_trace.t_end_end = LLOpenXRTrace::nowUs();
+        }
         mImpl->left_eye_fov_sample.valid = false;
+        xr_trace.pose_sample_valid = false;
         xr_trace.finish("invalid_view_state");
         return;
     }
 
     const uint32_t usable_view_count = std::min<uint32_t>(located_view_count, (uint32_t)mImpl->views.size());
+    // P2-01: the generation this call's locate mints once its views
+    // are adopted below (function scope: the submitted-layer
+    // generation fields at the final xrEndFrame derive from it).
+    unsigned long long this_locate_generation = 0;
     if (usable_view_count > 0)
     {
         const XrFovf& left_eye_fov = mImpl->views[0].fov;
+
+        // P2-01: the locate passed the validity gates and its views
+        // are adopted as the manager's current pose/FOV sample --
+        // mint its generation on the one counter.
+        this_locate_generation = ++mImpl->locate_generation;
+        xr_trace.has_located_generation = true;
+        xr_trace.located_generation = this_locate_generation;
         const F32 vertical_fov = left_eye_fov.angleUp - left_eye_fov.angleDown;
         if (std::isfinite(vertical_fov) && vertical_fov > 0.f)
         {
@@ -1573,7 +2048,7 @@ void LLOpenXRManager::submitFrameMono(const LLRect& source_rect)
             sample.right = left_eye_fov.angleRight;
             sample.down = left_eye_fov.angleDown;
             sample.up = left_eye_fov.angleUp;
-            sample.locate_generation = ++mImpl->left_eye_fov_locate_generation;
+            sample.locate_generation = this_locate_generation;
             sample.located_monotonic_us = LLOpenXRTrace::nowUs();
             sample.valid = true;
             mImpl->left_eye_fov_sample = sample;
@@ -1589,6 +2064,10 @@ void LLOpenXRManager::submitFrameMono(const LLRect& source_rect)
         mImpl->has_left_eye_aspect = false;
         mImpl->left_eye_fov_sample.valid = false;
     }
+
+    // P2-01: mirror the sample's post-locate validity for the record.
+    xr_trace.pose_sample_valid = mImpl->left_eye_fov_sample.valid;
+    xr_trace.has_pose_sample_valid = true;
 
     // P1-01: the manager's latest located left-eye sample, for the
     // xr_submit record's render-vs-latest-located comparison.
@@ -1629,6 +2108,7 @@ void LLOpenXRManager::submitFrameMono(const LLRect& source_rect)
     {
         mImpl->latest_hmd_forward = accumulated_forward;
         mImpl->has_hmd_forward = true;
+        mImpl->latest_pose_generation = this_locate_generation;
     }
     else
     {
@@ -1767,7 +2247,12 @@ void LLOpenXRManager::submitFrameMono(const LLRect& source_rect)
             frame_end_info.environmentBlendMode = mImpl->blend_mode;
             frame_end_info.layerCount = 0;
             frame_end_info.layers = nullptr;
-            xrEndFrame(mImpl->session, &frame_end_info);
+            xr_trace.captureEndFrame(frame_end_info, nullptr, nullptr, 0);
+            xr_trace.end_result = (int)xrEndFrame(mImpl->session, &frame_end_info);
+            if (xr_trace.tracing)
+            {
+                xr_trace.t_end_end = LLOpenXRTrace::nowUs();
+            }
             xr_trace.finish(strict_status);
             return;
         }
@@ -1809,7 +2294,12 @@ void LLOpenXRManager::submitFrameMono(const LLRect& source_rect)
             frame_end_info.environmentBlendMode = mImpl->blend_mode;
             frame_end_info.layerCount = 0;
             frame_end_info.layers = nullptr;
-            xrEndFrame(mImpl->session, &frame_end_info);
+            xr_trace.captureEndFrame(frame_end_info, nullptr, nullptr, 0);
+            xr_trace.end_result = (int)xrEndFrame(mImpl->session, &frame_end_info);
+            if (xr_trace.tracing)
+            {
+                xr_trace.t_end_end = LLOpenXRTrace::nowUs();
+            }
             xr_trace.finish("d13_empty_source");
             return;
         }
@@ -1895,6 +2385,11 @@ void LLOpenXRManager::submitFrameMono(const LLRect& source_rect)
         xr_trace.eye_swap_sample[eye] = swapchain.sample_count;
         result = xrAcquireSwapchainImage(swapchain.handle, &acquire_info, &image_index);
         xr_trace.eye_acquire_result[eye] = (int)result;
+        if (XR_SUCCEEDED(result))
+        {
+            xr_trace.has_eye_image_index[eye] = true;
+            xr_trace.eye_image_index[eye] = image_index;
+        }
         xr_trace.eye_submitted[eye] = false;
         if (XR_FAILED(result))
         {
@@ -1936,6 +2431,17 @@ void LLOpenXRManager::submitFrameMono(const LLRect& source_rect)
             xr_trace.has_blit_scale[eye] = true;
             xr_trace.blit_scale[eye][0] = (F32)swapchain.width / (F32)llmax(submit_source_rect.getWidth(), 1);
             xr_trace.blit_scale[eye][1] = (F32)swapchain.height / (F32)llmax(submit_source_rect.getHeight(), 1);
+            // P2-01: the blit actually performed for this eye
+            // (source rect, full-swapchain dest, GL_LINEAR filter).
+            xr_trace.has_blit_rects[eye] = true;
+            xr_trace.blit_src_rect[eye][0] = submit_source_rect.mLeft;
+            xr_trace.blit_src_rect[eye][1] = submit_source_rect.mBottom;
+            xr_trace.blit_src_rect[eye][2] = submit_source_rect.getWidth();
+            xr_trace.blit_src_rect[eye][3] = submit_source_rect.getHeight();
+            xr_trace.blit_dst_rect[eye][0] = 0;
+            xr_trace.blit_dst_rect[eye][1] = 0;
+            xr_trace.blit_dst_rect[eye][2] = (int)swapchain.width;
+            xr_trace.blit_dst_rect[eye][3] = (int)swapchain.height;
             glBlitFramebuffer(
                 submit_source_rect.mLeft,
                 submit_source_rect.mBottom,
@@ -2006,6 +2512,37 @@ void LLOpenXRManager::submitFrameMono(const LLRect& source_rect)
 
     xr_trace.submitted_view_count = submitted_view_count;
     xr_trace.layer_count = frame_end_info.layerCount;
+    // P2-01 / Amendment 4: capture the exact submitted state
+    // immediately before xrEndFrame hands it to the runtime. The
+    // submitted pose is this call's locate (mono_pose is built from
+    // this call's views); the submitted FOV is the render snapshot's
+    // generation in coherent mode and this locate's in legacy mode
+    // (fabricated from this locate's views).
+    if (submit_layer)
+    {
+        xr_trace.has_submitted_pose_generation = true;
+        xr_trace.submitted_pose_generation = this_locate_generation;
+        xr_trace.has_layer_generation = true;
+        xr_trace.layer_generation = this_locate_generation;
+        if (coherent_optics)
+        {
+            if (has_render_provenance && render_provenance.fov_valid)
+            {
+                xr_trace.has_submitted_fov_generation = true;
+                xr_trace.submitted_fov_generation = render_provenance.fov_generation;
+            }
+        }
+        else
+        {
+            xr_trace.has_submitted_fov_generation = true;
+            xr_trace.submitted_fov_generation = this_locate_generation;
+        }
+    }
+    // app_space is the session's XR_REFERENCE_SPACE_TYPE_LOCAL
+    // reference space (created in initialize()); its handle value is
+    // the space identity within the run.
+    xr_trace.captureEndFrame(frame_end_info, submit_layer ? &projection_layer : nullptr,
+                             "LOCAL", (unsigned long long)(uintptr_t)mImpl->app_space);
     result = xrEndFrame(mImpl->session, &frame_end_info);
     xr_trace.end_result = (int)result;
     if (xr_trace.tracing)
@@ -2042,7 +2579,17 @@ bool LLOpenXRManager::getHmdForward(LLVector3& out_forward) const
     }
 
     out_forward = mImpl->latest_hmd_forward;
-    return out_forward.normalize() > 0.f;
+    if (out_forward.normalize() > 0.f)
+    {
+        // P2-01: record the head path's consumption of the current
+        // pose sample (which locate generation it used, in which
+        // main-loop iteration). Trace evidence only; the returned
+        // value and its normalization are unchanged.
+        mImpl->head_consumed_pose_generation = mImpl->latest_pose_generation;
+        mImpl->head_consumed_app_frame_token = LLOpenXRTrace::currentAppFrameToken();
+        return true;
+    }
+    return false;
 #else
     (void)out_forward;
     return false;

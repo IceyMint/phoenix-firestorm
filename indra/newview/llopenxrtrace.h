@@ -90,11 +90,66 @@ public:
         unsigned long long fov_generation = 0;
         float fov_rad[4] = {0.f, 0.f, 0.f, 0.f};
         bool offcenter_engaged = false;
+        // P2-01: identity of the producing main-loop iteration and the
+        // render's true GL state, transferred with the image so the
+        // xr_submit record can state exactly which rendered state it
+        // submitted (Amendment 4). Matrices are glm column-major
+        // (value_ptr order), matching the render record's
+        // world_gl_projection / world_gl_view fields.
+        unsigned long long app_frame_token = 0;
+        bool has_world_gl = false;
+        float world_gl_projection[16] = {};
+        float world_gl_view[16] = {};
+        bool has_gl_rects = false;
+        int gl_viewport[4] = {0, 0, 0, 0};
+        int gl_scissor[4] = {0, 0, 0, 0};
+        bool gl_scissor_enabled = false;
+        // Placement fingerprint of the rendered state (see
+        // placementFingerprint()); empty when not computed.
+        std::string render_fingerprint;
     };
-    static void stashRenderProvenance(unsigned long long render_seq, bool fov_valid,
-                                      unsigned long long fov_generation, const float* fov_rad,
-                                      bool offcenter_engaged);
+    static void stashRenderProvenance(const RenderProvenance& provenance);
     static bool takeRenderProvenance(RenderProvenance& out);
+
+    // P2-01: functional identity + stage timestamps of the current
+    // main-loop iteration. LLAppViewer::doFrame() allocates one
+    // app_frame_token per iteration; nextAppFrameToken() is NOT gated
+    // on a trace run -- like the render-provenance channel, this is
+    // functional frame identity that later phases build on, and the
+    // token is process-monotonic so it stays unique across runs in
+    // one trace file. The stage marks record when idle(), the world
+    // render, and display() ran inside the iteration; the "render",
+    // "xr_submit" and per-iteration "app_frame" records carry the
+    // token so one iteration's records join exactly, never by
+    // sequence-number inference.
+    struct AppFrameContext
+    {
+        bool present = false;
+        unsigned long long app_frame_token = 0;
+        long long t_mainloop_frame_start_us = 0;
+        long long t_idle_start_us = 0;
+        long long t_idle_end_us = 0;
+        long long t_world_render_start_us = 0;
+        long long t_render_end_us = 0;
+        long long t_display_return_us = 0;
+    };
+    static unsigned long long nextAppFrameToken();
+    static void beginAppFrame(unsigned long long app_frame_token);
+    static void markAppFrameIdleStart();
+    static void markAppFrameIdleEnd();
+    static void markAppFrameWorldRenderStart();
+    static void markAppFrameRenderEnd();
+    static void markAppFrameDisplayReturn();
+    static bool peekAppFrameContext(AppFrameContext& out);
+    static unsigned long long currentAppFrameToken();
+
+    // P2-01: placement fingerprint -- FNV-1a 64 over a canonical
+    // string of numeric state values (floats serialized with the
+    // trace's own float32-reproducible formatting, 9 significant
+    // digits), returned as 16 lowercase hex digits. Fingerprints
+    // group identical placements for A/B analysis; the raw values
+    // are always recorded in full alongside, never replaced.
+    static std::string placementFingerprint(const std::string& canonical_values);
 };
 
 #endif // LL_LLOPENXRTRACE_H

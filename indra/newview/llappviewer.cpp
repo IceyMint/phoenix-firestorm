@@ -73,6 +73,7 @@
 #include "llviewerwindow.h"
 #include "llviewerdisplay.h"
 #include "llopenxrmanager.h"
+#include "llopenxrtrace.h"
 #include "llviewermedia.h"
 #include "llviewerparcelaskplay.h"
 #include "llviewerparcelmedia.h"
@@ -1589,6 +1590,11 @@ bool LLAppViewer::frame()
 
 bool LLAppViewer::doFrame()
 {
+    // P2-01: allocate this main-loop iteration's functional frame
+    // token (joins the iteration's render and xr_submit records in
+    // the trace; the precursor of the Phase 2 frame context). Cheap
+    // and unconditional, like the render-provenance channel.
+    LLOpenXRTrace::beginAppFrame(LLOpenXRTrace::nextAppFrameToken());
 #ifdef LL_DISCORD
     {
         LL_PROFILE_ZONE_NAMED("discord_callbacks");
@@ -1763,7 +1769,9 @@ bool LLAppViewer::doFrame()
                 {
                     LLPerfStats::RecordSceneTime T (LLPerfStats::StatType_t::RENDER_IDLE);
                     LL_PROFILE_ZONE_NAMED_CATEGORY_APP("df idle");
+                    LLOpenXRTrace::markAppFrameIdleStart();
                     idle();
+                    LLOpenXRTrace::markAppFrameIdleEnd();
                 }
 
                 {
@@ -1796,6 +1804,7 @@ bool LLAppViewer::doFrame()
                 gGLActive = true;
 
                 display();
+                LLOpenXRTrace::markAppFrameDisplayReturn();
 
                 if (LLStartUp::getStartupState() == STATE_STARTED) // <FS:Beq/> FIRE-34590 - Bugsplat caused by updating maps before world is loaded.
                 {
@@ -1818,6 +1827,32 @@ bool LLAppViewer::doFrame()
                 if (LLViewerStatsRecorder::instanceExists())
                 {
                     LLViewerStatsRecorder::instance().idle();
+                }
+            }
+
+            // P2-01: close out this iteration's trace context. The
+            // per-iteration "app_frame" record carries the main-loop
+            // stage timestamps -- including t_display_return_us,
+            // which cannot exist until display() has returned, after
+            // the iteration's xr_submit record was already written.
+            // An iteration whose token has no render or xr_submit
+            // record beside this one is a skipped render, visible
+            // here explicitly.
+            if (LLOpenXRTrace::runActive())
+            {
+                LLOpenXRTrace::AppFrameContext app_ctx;
+                if (LLOpenXRTrace::peekAppFrameContext(app_ctx))
+                {
+                    std::ostringstream app_fields;
+                    app_fields << "\"app_frame_token\":" << app_ctx.app_frame_token;
+                    app_fields << ",\"frame_loop_mode\":\"legacy_after_render\"";
+                    app_fields << ",\"t_mainloop_frame_start_us\":" << app_ctx.t_mainloop_frame_start_us;
+                    app_fields << ",\"t_idle_start_us\":" << app_ctx.t_idle_start_us;
+                    app_fields << ",\"t_idle_end_us\":" << app_ctx.t_idle_end_us;
+                    app_fields << ",\"t_world_render_start_us\":" << app_ctx.t_world_render_start_us;
+                    app_fields << ",\"t_render_end_us\":" << app_ctx.t_render_end_us;
+                    app_fields << ",\"t_display_return_us\":" << app_ctx.t_display_return_us;
+                    LLOpenXRTrace::writeRecord("app_frame", app_fields.str());
                 }
             }
         }
