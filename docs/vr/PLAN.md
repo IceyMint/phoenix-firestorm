@@ -42,6 +42,19 @@ spacing). Concretely:
   avatar looks right, the user looks right. This holds until an
   eye-tracking headset exists, at which point physical eye tracking
   is intended to take over the gaze role.
+  Two cautions from the round-3 concurrence (both accepted):
+  (a) FEEDBACK LOOP: the look-at system must never chase its own
+  tail — resolve the look-at target and animation ONCE per frame,
+  then sample the resulting eye orientation and marker positions into
+  the AvatarEyeFrame; never re-resolve per eye, and never let the
+  camera update feed back into the gaze target within the frame.
+  Also verify HMD rotation is not double-counted via head + gaze.
+  (b) LIMITS: the head's ±72° clamp applies to the head alone; the
+  gaze offset is separately bounded by the avatar's own eye-motion
+  limits (eyes naturally rotate relative to the head, so the composed
+  camera may exceed the head-only angle — that is correct, not a
+  clamp violation). Watch for saccade-driven camera motion discomfort
+  in testing.
 - Fallbacks (skeleton eye joints, sagittal mirroring) are DIAGNOSTIC or
   explicitly-selected emergency modes only — never an automatic route
   into stereo. Stereo requires both markers, full stop.
@@ -69,6 +82,18 @@ spacing). Concretely:
 Camera/FOV traces, frame-timing capture, color-patch (sRGB) diagnostic,
 record actual render dimensions vs swapchain dimensions. Exit: measurable
 optical, timing and color baselines; no behaviour change.
+Test priorities for the Quest 3 symptoms (round-3 review, in order):
+(1) calibrated grid rendered with the runtime's actual left-eye
+XrFovf tangents — peripheral geometry baseline; (2) remove synthetic
+FOV and center crop, verify full source-to-target viewport coverage;
+(3) log rendered projection, submitted FOV, submitted pose and located
+pose TOGETHER to catch compositor disagreement; (4) stationary-head
+vs moving-head grid comparison — separate projection swim from
+pose/reprojection swim; (5) gaze-driven camera tested independently of
+HMD rotation (feedback/double-count check). A temporary visible border
+at the exact per-eye source extent is a useful diagnostic for where
+coverage is lost (source render vs compositor mapping) — diagnostic
+only, not a feature.
 Also in Phase 0, fix three validity defects already present in the
 current source (found in round-2 review, verified against the tree):
 (1) submitFrameMono() must never submit a partial projection layer —

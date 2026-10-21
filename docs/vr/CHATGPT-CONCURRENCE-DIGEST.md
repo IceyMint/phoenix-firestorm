@@ -1,4 +1,23 @@
-# ChatGPT round 2 — concurrence review (2026-10-20)
+# ChatGPT rounds 2–3 — concurrence reviews (2026-10-20)
+
+## Round 3 addendum — Rule #7 CONCURRED (GPT-6, High)
+ChatGPT confirmed Rule #7 as documented (avatar gaze moves the
+camera; head rotation composed with eye-gaze offset; markers supply
+positions including eyeball-rotation movement) — no blocking
+objection, B2 closed as a design decision. Two cautions, both folded
+into PLAN.md: (a) camera–gaze FEEDBACK LOOP — resolve look-at once per
+frame, sample into the AvatarEyeFrame, never re-resolve per eye or
+feed the camera back into the gaze target; check HMD rotation is not
+double-counted through head + gaze; (b) LIMITS — the ±72° clamp binds
+the head alone, the gaze offset is bounded by the avatar's own
+eye-motion limits; the composed view may exceed the head-only angle,
+correctly. On the Quest 3 symptoms it concurred that optical geometry
+is the first priority and supplied the 5-step test order now in
+PLAN.md Phase 0 (calibrated grid with real tangents; remove synthetic
+FOV/crop and verify coverage; joint logging of rendered vs submitted
+vs located; stationary vs moving head; gaze independent of HMD). It
+also confirmed: Quest 3 has no eye tracking, phase sequence unchanged,
+no architectural redesign warranted.
 
 Same conversation as round 1 (GPT-6, reasoning High). ChatGPT read the
 design docs on branch `vr/stereo-design` and the actual VR source on
