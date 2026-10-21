@@ -1,6 +1,10 @@
 # Firestorm-Snowy VR — stereo & proper-projection plan (living document)
 
-Status: revised plan after external critique (2026-10-20). Design rules in
+Status: IMPLEMENTATION AUTHORIZED (Leah, 2026-10-20 22:28 — "Let's get
+the kick off going"). Work model as before: ChatGPT consults (briefs,
+specs, reviews), Muse leads/implements/verifies, Codex available over
+SSH for heavy work, Muse has SSH access to the PC as needed. Revised
+plan after external critique (2026-10-20). Design rules in
 `DESIGN-RULES.md` govern everything here; where this plan and the rules
 disagree, the rules win.
 
@@ -115,6 +119,12 @@ against the Phase 0 diagnostic. Head/animation rules unchanged.
 Exit: left-eye image geometrically correct, no crop/resample.
 
 ### Phase 2 — Timing + compositor policy
+Also in Phase 2: RECENTER (Leah, 2026-10-20: "yah it's needed"). A
+deliberate user action (key and/or chat command alongside the /xr
+toggle) that resets the HMD calibration pose (the base yaw/pitch/roll
+the clamp measures from) to the headset's current orientation —
+today calibration is silently whatever direction the user faces on
+the first frame, with no way to redo it.
 XR frame ownership moves before the avatar animation update and out of
 swap(): WaitFrame -> LocateViews(predictedDisplayTime) -> clamp ->
 animate/resolve joints ONCE -> freeze head anchor -> BeginFrame ->
@@ -188,6 +198,17 @@ policy), session-loss/disconnect recovery, desktop mirror polish.
   edge geometry and view coverage first; Phase 1 fills the panel with
   correct asymmetric tangents — never crop/zoom-to-fill.
 - Compositor policy choice (Phase 2 experiments decide).
+- Desktop mirror while in VR: RESOLVED (Leah, 2026-10-20). The user
+  does not work from the desktop view while in the headset — the
+  mirror stays a left-eye mirror (spectators/recording), no separate
+  desktop render is required. Her own in-headset desktop access is
+  via WiVRn's virtual monitor, a runtime feature, not viewer scope.
+- VR UI: its own LATER track (Leah, 2026-10-20: "yah it's really
+  needed but we can focus on that after working out the view"). Hard
+  constraint when it comes: OUT OF THE WAY — minimal, unobtrusive,
+  not a floating desktop clone. (Leah's aside that this might
+  eventually argue for a much larger viewer rework is noted as
+  sentiment, not a directive.)
 - Build rules: COMPLETE as recorded (Leah, 2026-10-20: "that's all
   the build rules — everything that you saw in the bash history").
   The full procedure lives in the BUILD-RULES notes from the

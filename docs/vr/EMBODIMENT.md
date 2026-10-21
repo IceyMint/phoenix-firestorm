@@ -77,9 +77,10 @@ A deliberate "step into the avatar" transition (desktop third-person
 → fade through to the cornea) when VR enables, instead of a hard cut.
 Cheap; outsized presence payoff per ChatGPT's ranking.
 
-### S9 — View blinking synced to avatar blinks — KILLED as a default
-Involuntary view blackouts judged a comfort risk. (Designer's
-prerogative: Leah may resurrect it as an opt-in experiment.)
+### S9 — View blinking synced to avatar blinks — KILLED
+Involuntary view blackouts judged a comfort risk. DESIGNER RULING
+(Leah, 2026-10-20): "I'm fine with no blink" — settled, not
+resurrecting.
 
 ### S10 — Own shadow & reflections — PURSUE
 Your shadow correct and visible from first person (grounding);
@@ -111,8 +112,8 @@ reflections/mirrors showing your face where SL's systems allow.
 5. S3 — gaze interaction
 
 ## Status
-Menu presented to Leah 2026-10-20. Her picks/overrules pending —
-she is the designer; verdicts above are recommendations. Nothing here
-is implementation-authorized yet (discussion phase, as with the
-stereo plan; S1a and the Phase 0 work are the natural first "go"
-candidates).
+IMPLEMENTATION AUTHORIZED (Leah, 2026-10-20 22:28). Kickoff order:
+Phase 0 (stereo plan) and S1a run first, in parallel — both are
+measurement/audit work. S9 is settled dead (designer ruling above).
+VR UI is deferred to its own track after the view work (see PLAN.md),
+with an out-of-the-way constraint.
