@@ -291,18 +291,18 @@ std::string frame_record_unlocked(TraceState& state, const std::string& event,
 }
 
 /*static*/ void LLOpenXRTrace::stashRenderProvenance(unsigned long long render_seq, bool fov_valid,
-                                                      unsigned long long fov_generation, const float* fov_rad)
+                                                      unsigned long long fov_generation, const float* fov_rad,
+                                                      bool offcenter_engaged)
 {
     TraceState& state = trace_state();
     std::lock_guard<std::mutex> lock(state.mutex);
-    if (!state.run_active)
-    {
-        return;
-    }
+    // P1-03: no run_active gate -- the coherent submit path consumes
+    // this snapshot functionally, with or without a trace run.
     state.render_provenance.present = true;
     state.render_provenance.render_seq = render_seq;
     state.render_provenance.fov_valid = fov_valid;
     state.render_provenance.fov_generation = fov_generation;
+    state.render_provenance.offcenter_engaged = offcenter_engaged;
     for (int i = 0; i < 4; i++)
     {
         state.render_provenance.fov_rad[i] = fov_rad ? fov_rad[i] : 0.f;

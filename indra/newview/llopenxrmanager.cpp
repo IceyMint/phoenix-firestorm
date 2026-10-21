@@ -37,6 +37,7 @@ namespace
 {
 constexpr const char* OPENXR_MONO_ENV = "FS_OPENXR_MONO";
 constexpr const char* OPENXR_LOG_ENV = "FS_OPENXR_LOG_FILE";
+constexpr const char* OPENXR_P1_OPTICS_ENV = "FS_OPENXR_P1_OPTICS_EXPERIMENTAL";
 
 bool is_openxr_mono_requested()
 {
@@ -54,6 +55,32 @@ bool is_openxr_mono_requested()
 
     return true;
 }
+
+bool xr_coherent_optics_enabled()
+{
+    // P1-03: coherent optics are the default. Only an explicit,
+    // parseable false disables them (the legacy Phase 0 A/B override)
+    // -- the same default-on convention as the FS_OPENXR_DECOUPLED_
+    // RENDER / FS_OPENXR_NATIVE_RES readers.
+    std::string value = LLStringUtil::getenv(OPENXR_P1_OPTICS_ENV);
+    if (value.empty())
+    {
+        return true;
+    }
+
+    bool requested = true;
+    if (LLStringUtil::convertToBOOL(value, requested))
+    {
+        return requested;
+    }
+
+    return true;
+}
+}
+
+/*static*/ bool LLOpenXRManager::coherentOpticsEnabled()
+{
+    return xr_coherent_optics_enabled();
 }
 
 #if LL_LINUX && LL_X11
@@ -258,7 +285,11 @@ bool xr_fov_aspect(const XrFovf& fov, F32& out_aspect)
     return std::isfinite(out_aspect) && out_aspect > 0.f;
 }
 
-LLRect center_crop_rect_to_aspect(const LLRect& source_rect, F32 target_aspect)
+// P1-03: the Phase 0 centre-crop and FOV-fabrication helpers survive
+// VERBATIM under legacy_* names, called ONLY from submitFrameMono's
+// legacy branch (the FS_OPENXR_P1_OPTICS_EXPERIMENTAL=0 A/B override).
+// The coherent path never crops and never fabricates an FOV.
+LLRect legacy_center_crop_rect_to_aspect(const LLRect& source_rect, F32 target_aspect)
 {
     if (!std::isfinite(target_aspect) || target_aspect <= 0.f)
     {
@@ -292,7 +323,7 @@ LLRect center_crop_rect_to_aspect(const LLRect& source_rect, F32 target_aspect)
     return cropped_rect;
 }
 
-XrFovf xr_centered_mono_fov_for_source_crop(const XrFovf& reference_view_fov,
+XrFovf legacy_xr_centered_mono_fov_for_source_crop(const XrFovf& reference_view_fov,
                                             const LLRect& full_source_rect,
                                             const LLRect& cropped_source_rect)
 {
@@ -1124,6 +1155,15 @@ struct XrSubmitTrace
     // P1-01: manager's latest located left-eye sample at submit time.
     bool has_latest_located = false;
     float latest_located_fov_rad[4] = {0.f, 0.f, 0.f, 0.f};
+    // P1-03: optics mode of this submission and strict-coherence
+    // evidence. blit_scale is [eye][x,y] = swapchain extent / source
+    // extent of the blit that copied the submitted image; the right
+    // eye's scale is recorded separately, never folded into the left.
+    bool optics_coherent = false;
+    bool has_coherence_delta = false;
+    float coherence_max_delta_deg = 0.f;
+    bool has_blit_scale[2] = {false, false};
+    float blit_scale[2][2] = {};
 
     static std::string f32(float v)
     {
@@ -1247,6 +1287,26 @@ struct XrSubmitTrace
         f << ",\"xr_optics_source_valid\":" << ((has_render_source && render_fov_valid) ? "true" : "false");
         f << ",\"submitted_view_count\":" << submitted_view_count;
         f << ",\"layer_count\":" << layer_count;
+        f << ",\"xr_optics_mode\":\"" << (optics_coherent ? "coherent" : "legacy") << "\"";
+        if (optics_coherent)
+        {
+            f << ",\"xr_coherence_max_delta_deg\":";
+            if (has_coherence_delta)
+            {
+                f << f32(coherence_max_delta_deg);
+            }
+            else
+            {
+                f << "null";
+            }
+        }
+        for (int eye = 0; eye < 2; eye++)
+        {
+            if (has_blit_scale[eye])
+            {
+                f << ",\"eye" << eye << "_blit_scale\":[" << f32(blit_scale[eye][0]) << "," << f32(blit_scale[eye][1]) << "]";
+            }
+        }
         LLOpenXRTrace::writeRecord("xr_submit", f.str());
     }
 
@@ -1268,22 +1328,25 @@ void LLOpenXRManager::submitFrameMono(const LLRect& source_rect)
     {
         xr_trace.t_entry = LLOpenXRTrace::nowUs();
     }
-    if (xr_trace.tracing)
+    // P1-01/P1-03: the image this call submits is the most recently
+    // completed render; take the provenance stashed for that render.
+    // The take is single-use and happens whether or not a trace run
+    // is active: in coherent mode the snapshot is the submission's
+    // source of truth, not just trace evidence. Never inferred from
+    // frame ids.
+    LLOpenXRTrace::RenderProvenance render_provenance;
+    const bool has_render_provenance = LLOpenXRTrace::takeRenderProvenance(render_provenance);
+    const bool coherent_optics = LLOpenXRManager::coherentOpticsEnabled();
+    xr_trace.optics_coherent = coherent_optics;
+    if (xr_trace.tracing && has_render_provenance)
     {
-        // P1-01: the image this call submits is the most recently
-        // completed render; take the provenance stashed when that
-        // render's record was emitted. Never inferred from frame ids.
-        LLOpenXRTrace::RenderProvenance provenance;
-        if (LLOpenXRTrace::takeRenderProvenance(provenance))
+        xr_trace.has_render_source = true;
+        xr_trace.render_seq_source = render_provenance.render_seq;
+        xr_trace.render_fov_valid = render_provenance.fov_valid;
+        xr_trace.render_fov_generation = render_provenance.fov_generation;
+        for (int i = 0; i < 4; i++)
         {
-            xr_trace.has_render_source = true;
-            xr_trace.render_seq_source = provenance.render_seq;
-            xr_trace.render_fov_valid = provenance.fov_valid;
-            xr_trace.render_fov_generation = provenance.fov_generation;
-            for (int i = 0; i < 4; i++)
-            {
-                xr_trace.render_fov_rad[i] = provenance.fov_rad[i];
-            }
+            xr_trace.render_fov_rad[i] = render_provenance.fov_rad[i];
         }
     }
     static bool submit_entry_logged = false;
@@ -1595,9 +1658,10 @@ void LLOpenXRManager::submitFrameMono(const LLRect& source_rect)
 
     LLRect submit_input_rect = source_rect;
     bool using_pipeline_submit_source = false;
+    const LLRenderTarget* xr_submit_source = nullptr;
     if (LLRenderTarget::sUseFBO)
     {
-        const LLRenderTarget* xr_submit_source = gPipeline.getXRSubmitSource();
+        xr_submit_source = gPipeline.getXRSubmitSource();
         if (xr_submit_source && xr_submit_source->isComplete() &&
             xr_submit_source->getNumTextures() > 0 &&
             xr_submit_source->getWidth() > 0 && xr_submit_source->getHeight() > 0)
@@ -1634,7 +1698,81 @@ void LLOpenXRManager::submitFrameMono(const LLRect& source_rect)
         }
     }
 
-    if (!using_pipeline_submit_source)
+    if (coherent_optics)
+    {
+        // P1-03 strict coherence: the submitted image must be the
+        // native-extent pipeline render whose off-centre projection
+        // used the snapshot FOV, and that FOV must still agree with
+        // the currently located left-eye FOV (the sample this call's
+        // own xrLocateViews just cached). Any doubt ends the frame
+        // with ZERO layers -- never the desktop backbuffer, never a
+        // fabricated or freshly located substitute FOV. The rejection
+        // is the frame's trace status, so it is visible in evidence.
+        const char* strict_status = nullptr;
+        if (!has_render_provenance)
+        {
+            strict_status = "strict_no_snapshot";
+        }
+        else if (!render_provenance.fov_valid || render_provenance.fov_generation == 0)
+        {
+            strict_status = "strict_snapshot_invalid";
+        }
+        else if (!render_provenance.offcenter_engaged)
+        {
+            strict_status = "strict_render_not_offcenter";
+        }
+        else if (!mImpl->left_eye_fov_sample.valid)
+        {
+            strict_status = "strict_no_current_sample";
+        }
+        else
+        {
+            const LLXRLeftEyeFovSample& current_sample = mImpl->left_eye_fov_sample;
+            const float current_rad[4] = {current_sample.left, current_sample.right,
+                                          current_sample.down, current_sample.up};
+            float max_delta_rad = 0.f;
+            for (int i = 0; i < 4; i++)
+            {
+                max_delta_rad = std::max(max_delta_rad,
+                                         std::fabs(render_provenance.fov_rad[i] - current_rad[i]));
+            }
+            xr_trace.has_coherence_delta = true;
+            xr_trace.coherence_max_delta_deg = max_delta_rad * 57.29577951308232f;
+            if (xr_trace.coherence_max_delta_deg > 0.05f)
+            {
+                strict_status = "strict_fov_drift";
+            }
+        }
+        if (!strict_status && !using_pipeline_submit_source)
+        {
+            strict_status = "strict_no_pipeline_source";
+        }
+        if (!strict_status && !mImpl->swapchains.empty())
+        {
+            const OpenXRSwapchain& left_swapchain = mImpl->swapchains[0];
+            if (submit_input_rect.mLeft != 0 || submit_input_rect.mBottom != 0 ||
+                submit_input_rect.getWidth() != (S32)left_swapchain.width ||
+                submit_input_rect.getHeight() != (S32)left_swapchain.height)
+            {
+                strict_status = "strict_extent_mismatch";
+            }
+        }
+        if (strict_status)
+        {
+            openxr_warn(std::string("OpenXR coherent submit rejected (") + strict_status +
+                        "); submitting no layer.");
+            XrFrameEndInfo frame_end_info{};
+            frame_end_info.type = XR_TYPE_FRAME_END_INFO;
+            frame_end_info.displayTime = frame_state.predictedDisplayTime;
+            frame_end_info.environmentBlendMode = mImpl->blend_mode;
+            frame_end_info.layerCount = 0;
+            frame_end_info.layers = nullptr;
+            xrEndFrame(mImpl->session, &frame_end_info);
+            xr_trace.finish(strict_status);
+            return;
+        }
+    }
+    else if (!using_pipeline_submit_source)
     {
         glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
 
@@ -1677,20 +1815,43 @@ void LLOpenXRManager::submitFrameMono(const LLRect& source_rect)
         }
     }
 
-    // Mono submit uses one rendered viewpoint duplicated to both eyes.
-    // Keep submit projection independent from desktop window size by center-cropping
-    // the source image to runtime aspect when needed.
-    const XrFovf& left_eye_fov = mImpl->views[0].fov;
-    F32 runtime_aspect = 0.f;
-    if (!xr_fov_aspect(left_eye_fov, runtime_aspect))
-    {
-        const F32 source_width = llmax((F32)submit_input_rect.getWidth(), 1.f);
-        const F32 source_height = llmax((F32)submit_input_rect.getHeight(), 1.f);
-        runtime_aspect = source_width / source_height;
-    }
-    const LLRect submit_source_rect = center_crop_rect_to_aspect(submit_input_rect, runtime_aspect);
+    // Mono submit uses one rendered viewpoint duplicated to both eyes
+    // (the averaged centre pose is unchanged in both modes).
     const XrPosef mono_pose = xr_center_pose_from_views(mImpl->views[0], mImpl->views[1]);
-    const XrFovf mono_fov = xr_centered_mono_fov_for_source_crop(left_eye_fov, submit_input_rect, submit_source_rect);
+    LLRect submit_source_rect;
+    XrFovf mono_fov{};
+    if (coherent_optics)
+    {
+        // P1-03: no crop, no fabricated FOV. The source is the full
+        // native left-eye extent (the strict gates above verified it
+        // matches the left swapchain, so input_rect == cropped_rect
+        // and the left blit is 1.000 by construction), and the
+        // submitted FOV is the render's own snapshot, exactly. Both
+        // eyes receive this FOV (mono-right duplication policy).
+        submit_source_rect = submit_input_rect;
+        mono_fov.angleLeft = render_provenance.fov_rad[0];
+        mono_fov.angleRight = render_provenance.fov_rad[1];
+        mono_fov.angleDown = render_provenance.fov_rad[2];
+        mono_fov.angleUp = render_provenance.fov_rad[3];
+    }
+    else
+    {
+        // Legacy Phase 0 path (FS_OPENXR_P1_OPTICS_EXPERIMENTAL=0):
+        // keep submit projection independent from desktop window size
+        // by center-cropping the source image to runtime aspect when
+        // needed, with a symmetric FOV fabricated for the cropped
+        // region. Preserved verbatim for A/B comparison.
+        const XrFovf& left_eye_fov = mImpl->views[0].fov;
+        F32 runtime_aspect = 0.f;
+        if (!xr_fov_aspect(left_eye_fov, runtime_aspect))
+        {
+            const F32 source_width = llmax((F32)submit_input_rect.getWidth(), 1.f);
+            const F32 source_height = llmax((F32)submit_input_rect.getHeight(), 1.f);
+            runtime_aspect = source_width / source_height;
+        }
+        submit_source_rect = legacy_center_crop_rect_to_aspect(submit_input_rect, runtime_aspect);
+        mono_fov = legacy_xr_centered_mono_fov_for_source_crop(left_eye_fov, submit_input_rect, submit_source_rect);
+    }
 
     xr_trace.using_pipeline_source = using_pipeline_submit_source;
     xr_trace.input_rect[0] = submit_input_rect.mLeft;
@@ -1767,6 +1928,14 @@ void LLOpenXRManager::submitFrameMono(const LLRect& source_rect)
         if (xr_trace.eye_fbo_complete[eye])
         {
             xr_trace.eye_blit_done[eye] = true;
+            // P1-03: record the copy's scale per eye (swapchain extent
+            // over source extent). The left eye is 1.000 by
+            // construction in coherent mode; a differently sized right
+            // swapchain shows its own scale here, never folded into
+            // the left figure.
+            xr_trace.has_blit_scale[eye] = true;
+            xr_trace.blit_scale[eye][0] = (F32)swapchain.width / (F32)llmax(submit_source_rect.getWidth(), 1);
+            xr_trace.blit_scale[eye][1] = (F32)swapchain.height / (F32)llmax(submit_source_rect.getHeight(), 1);
             glBlitFramebuffer(
                 submit_source_rect.mLeft,
                 submit_source_rect.mBottom,
@@ -1981,6 +2150,40 @@ bool LLOpenXRManager::getRecommendedRenderSize(S32& out_width, S32& out_height) 
     out_width = max_width;
     out_height = max_height;
     return true;
+#else
+    (void)out_width;
+    (void)out_height;
+    return false;
+#endif
+}
+
+bool LLOpenXRManager::getLeftEyeRenderSize(S32& out_width, S32& out_height) const
+{
+#if LL_LINUX && LL_X11
+    if (!mImpl)
+    {
+        return false;
+    }
+
+    // P1-03: the LEFT eye's extent -- the left swapchain once it
+    // exists, else the left view's recommended size. Never the max
+    // over both eyes (that is getRecommendedRenderSize, legacy only).
+    if (!mImpl->swapchains.empty())
+    {
+        out_width = (S32)mImpl->swapchains[0].width;
+        out_height = (S32)mImpl->swapchains[0].height;
+    }
+    else if (!mImpl->config_views.empty())
+    {
+        out_width = (S32)mImpl->config_views[0].recommendedImageRectWidth;
+        out_height = (S32)mImpl->config_views[0].recommendedImageRectHeight;
+    }
+    else
+    {
+        return false;
+    }
+
+    return out_width > 0 && out_height > 0;
 #else
     (void)out_width;
     (void)out_height;

@@ -339,7 +339,12 @@ bool get_openxr_native_resolution(U32& out_width, U32& out_height)
 
     S32 xr_width = 0;
     S32 xr_height = 0;
-    if (!LLOpenXRManager::instance().getRecommendedRenderSize(xr_width, xr_height))
+    // P1-03: coherent optics sizes the render targets at the LEFT
+    // eye's extent; the legacy path keeps the max-over-both-eyes size.
+    const bool have_xr_size = LLOpenXRManager::coherentOpticsEnabled()
+        ? LLOpenXRManager::instance().getLeftEyeRenderSize(xr_width, xr_height)
+        : LLOpenXRManager::instance().getRecommendedRenderSize(xr_width, xr_height);
+    if (!have_xr_size)
     {
         return false;
     }

@@ -70,12 +70,18 @@ public:
     static unsigned long long nextRenderSeq();
 
     // P1-01: FOV provenance of the most recently completed render,
-    // transferred explicitly to the xr_submit record that submits that
+    // transferred explicitly to the submission that submits that
     // render's image (association is NEVER inferred from frame
-    // numbers). stashRenderProvenance() is called when a render record
-    // is emitted; takeRenderProvenance() is called once by the submit
-    // path and clears the stash. fov_rad order is the XrFovf order
-    // [left, right, down, up], signed radians.
+    // numbers). P1-03: the channel is FUNCTIONAL, not trace-only --
+    // display_update_camera() stashes every main-world render's
+    // snapshot whether or not a trace run is active (with render_seq
+    // 0 when untraced; record_render_trace() re-stashes with the real
+    // render_seq when a run is active), and takeRenderProvenance() is
+    // called once by the submit path and clears the stash (single
+    // use: a stale snapshot can never be submitted twice). fov_rad
+    // order is the XrFovf order [left, right, down, up], signed
+    // radians. offcenter_engaged records whether the render actually
+    // installed the XR off-centre projection with this FOV.
     struct RenderProvenance
     {
         bool present = false;
@@ -83,9 +89,11 @@ public:
         bool fov_valid = false;
         unsigned long long fov_generation = 0;
         float fov_rad[4] = {0.f, 0.f, 0.f, 0.f};
+        bool offcenter_engaged = false;
     };
     static void stashRenderProvenance(unsigned long long render_seq, bool fov_valid,
-                                      unsigned long long fov_generation, const float* fov_rad);
+                                      unsigned long long fov_generation, const float* fov_rad,
+                                      bool offcenter_engaged);
     static bool takeRenderProvenance(RenderProvenance& out);
 };
 

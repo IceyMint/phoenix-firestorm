@@ -343,6 +343,29 @@ LLRect get_openxr_decoupled_world_render_rect(const LLRect& world_rect)
         return world_rect;
     }
 
+    // P1-03: coherent optics renders the full native LEFT-eye extent.
+    // The off-centre frustum carries the FOV, so there is no
+    // tangent-aspect crop of the render rect here (the legacy sizing
+    // below still centre-crops to the located aspect). Falls through
+    // to the legacy sizing when no XR session/size is available.
+    if (LLOpenXRManager::coherentOpticsEnabled())
+    {
+        LLOpenXRManager& xr_manager = LLOpenXRManager::instance();
+        S32 xr_left_width = 0;
+        S32 xr_left_height = 0;
+        if (xr_manager.isSessionRunning() &&
+            xr_manager.getLeftEyeRenderSize(xr_left_width, xr_left_height) &&
+            xr_left_width > 0 && xr_left_height > 0)
+        {
+            LLRect native_rect = world_rect;
+            native_rect.mLeft = 0;
+            native_rect.mBottom = 0;
+            native_rect.mRight = xr_left_width;
+            native_rect.mTop = xr_left_height;
+            return native_rect;
+        }
+    }
+
     LLOpenXRManager& openxr = LLOpenXRManager::instance();
     F32 xr_aspect = 0.f;
     bool have_xr_aspect = openxr.getLeftEyeAspect(xr_aspect) && std::isfinite(xr_aspect) && xr_aspect > 0.f;

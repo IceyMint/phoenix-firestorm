@@ -46,6 +46,20 @@ public:
     bool getLeftEyeFovSample(LLXRLeftEyeFovSample& out_sample) const;
     bool getLeftEyeAspect(F32& out_aspect) const;
     bool getRecommendedRenderSize(S32& out_width, S32& out_height) const;
+    // P1-03: the LEFT eye's render extent (left swapchain size, or the
+    // left view's recommended size before swapchains exist). The mono
+    // render and its submission are sized by this in coherent mode --
+    // never by the max over both eyes.
+    bool getLeftEyeRenderSize(S32& out_width, S32& out_height) const;
+    // P1-03: coherent XR optics (off-centre render driven by the
+    // per-render FOV snapshot + snapshot submission at the native
+    // left-eye extent) are the DEFAULT whenever XR mono is active.
+    // FS_OPENXR_P1_OPTICS_EXPERIMENTAL set to a false value
+    // ("0"/"false"/"no"/"off") selects the legacy Phase 0 path exactly
+    // (symmetric render, centre crop, fabricated symmetric FOV) for
+    // A/B comparison; unset, empty, true or unparseable values keep
+    // the coherent default.
+    static bool coherentOpticsEnabled();
     void setMonoEnabled(bool enabled);
     bool isMonoEnabled() const;
     bool isSessionRunning() const;

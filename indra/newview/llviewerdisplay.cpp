@@ -243,28 +243,12 @@ struct XRRenderOpticsCapture
 };
 XRRenderOpticsCapture g_xr_render_optics_capture;
 
-// P1-02: experimental gate for the XR off-centre optics. DEFAULT
-// DISABLED: unset, empty, or unparseable all mean the legacy
-// symmetric path. The gate is only ever activated together with the
-// P1-03 submission change; nothing in P1-02 turns it on.
-constexpr const char* OPENXR_P1_OPTICS_EXPERIMENTAL_ENV = "FS_OPENXR_P1_OPTICS_EXPERIMENTAL";
-
-bool xr_p1_optics_experimental()
-{
-    const std::string value = LLStringUtil::getenv(OPENXR_P1_OPTICS_EXPERIMENTAL_ENV);
-    if (value.empty())
-    {
-        return false;
-    }
-
-    bool requested = false;
-    if (LLStringUtil::convertToBOOL(value, requested))
-    {
-        return requested;
-    }
-
-    return false;
-}
+// P1-02 put the XR off-centre optics behind the
+// FS_OPENXR_P1_OPTICS_EXPERIMENTAL gate, default disabled. P1-03
+// activates them together with the coherent submission: the gate is
+// now evaluated in one place, LLOpenXRManager::coherentOpticsEnabled(),
+// and only an explicit false value selects the legacy symmetric path
+// (the A/B override). See llopenxrmanager.h.
 } // namespace
 
 void display_update_camera()
@@ -334,22 +318,48 @@ void display_update_camera()
             LLOpenXRManager::instance().getLeftEyeFovSample(g_xr_render_optics_capture.fov_sample);
     }
 
-    // P1-02: with the experimental gate on and a valid located sample,
-    // engage the XR off-centre optical mode for THIS main-world camera
-    // setup only, and clear it immediately after setup3DRender()
-    // returns, so the mode can never leak into another pass (cube
-    // snapshots, selection, previews, HUD, desktop). Gate off, cube
-    // snapshot, or no valid sample: the render stays legacy symmetric
-    // and the trace shows it (see record_render_trace()).
+    // P1-02/P1-03: with coherent optics enabled (the default; the
+    // legacy override is FS_OPENXR_P1_OPTICS_EXPERIMENTAL=0) and a
+    // valid located sample, engage the XR off-centre optical mode for
+    // THIS main-world camera setup only, and clear it immediately
+    // after setup3DRender() returns, so the mode can never leak into
+    // another pass (cube snapshots, selection, previews, HUD,
+    // desktop). Legacy override, cube snapshot, or no valid sample:
+    // the render stays legacy symmetric and the trace shows it (see
+    // record_render_trace()).
     LLViewerCamera* camera = LLViewerCamera::getInstance();
     bool xr_offcenter_engaged = false;
     if (!gCubeSnapshot && g_xr_render_optics_capture.fov_sample_valid &&
-        xr_p1_optics_experimental())
+        LLOpenXRManager::coherentOpticsEnabled())
     {
         const LLXRLeftEyeFovSample& sample = g_xr_render_optics_capture.fov_sample;
         xr_offcenter_engaged = camera->setProjectionModeXROffCenter(
             tanf(sample.left), tanf(sample.right), tanf(sample.down), tanf(sample.up));
         g_xr_render_optics_capture.offcenter_engaged = xr_offcenter_engaged;
+    }
+
+    // P1-03: stash this render's optics snapshot for the submission
+    // that follows in swap(). This is the FUNCTIONAL channel (the
+    // coherent submit consumes the snapshot as its source of truth),
+    // so it is not gated on a trace run; record_render_trace() later
+    // re-stashes the same snapshot with the render_seq when a run is
+    // active. Single-use: submitFrameMono takes it exactly once.
+    if (!gCubeSnapshot)
+    {
+        float fov_rad[4] = {0.f, 0.f, 0.f, 0.f};
+        if (g_xr_render_optics_capture.fov_sample_valid)
+        {
+            fov_rad[0] = g_xr_render_optics_capture.fov_sample.left;
+            fov_rad[1] = g_xr_render_optics_capture.fov_sample.right;
+            fov_rad[2] = g_xr_render_optics_capture.fov_sample.down;
+            fov_rad[3] = g_xr_render_optics_capture.fov_sample.up;
+        }
+        LLOpenXRTrace::stashRenderProvenance(
+            0, g_xr_render_optics_capture.fov_sample_valid,
+            g_xr_render_optics_capture.fov_sample_valid
+                ? g_xr_render_optics_capture.fov_sample.locate_generation
+                : 0,
+            fov_rad, xr_offcenter_engaged);
     }
 
     gViewerWindow->setup3DRender();
@@ -694,13 +704,14 @@ void record_render_trace()
 
     // P1-01/P1-02: XR optics provenance for this render. The mode
     // label states which projection the render actually used:
-    // "xr_offcenter" only when the P1-02 gate was on, a valid sample
-    // existed, and display_update_camera() engaged the off-centre
-    // mode for this render's camera setup (the used-FOV fields then
-    // carry that sample). Otherwise "legacy_symmetric" with null
-    // used-FOV fields; a gate-on frame without a valid sample falls
-    // back to legacy for that frame, visible here as legacy_symmetric
-    // with xr_render_fov_valid=false below.
+    // "xr_offcenter" only when coherent optics were enabled (the
+    // P1-03 default; legacy override FS_OPENXR_P1_OPTICS_EXPERIMENTAL=0),
+    // a valid sample existed, and display_update_camera() engaged the
+    // off-centre mode for this render's camera setup (the used-FOV
+    // fields then carry that sample). Otherwise "legacy_symmetric"
+    // with null used-FOV fields; a coherent-mode frame without a
+    // valid sample falls back to legacy for that frame, visible here
+    // as legacy_symmetric with xr_render_fov_valid=false below.
     const XRRenderOpticsCapture& optics = g_xr_render_optics_capture;
     fields << ",\"xr_projection_mode\":\"" << (optics.offcenter_engaged ? "xr_offcenter" : "legacy_symmetric") << "\"";
     if (optics.present && optics.fov_sample_valid)
@@ -773,6 +784,9 @@ void record_render_trace()
 
     // P1-01: transfer this render's FOV provenance with its image; the
     // xr_submit record for the submission of THIS render takes it.
+    // P1-03: display_update_camera() already stashed this same
+    // snapshot for the functional submit path; this re-stash only adds
+    // the render_seq, which exists because a trace run is active.
     {
         float fov_rad[4] = {0.f, 0.f, 0.f, 0.f};
         if (optics.fov_sample_valid)
@@ -784,7 +798,8 @@ void record_render_trace()
         }
         LLOpenXRTrace::stashRenderProvenance(
             render_seq, optics.present && optics.fov_sample_valid,
-            optics.fov_sample_valid ? optics.fov_sample.locate_generation : 0, fov_rad);
+            optics.fov_sample_valid ? optics.fov_sample.locate_generation : 0, fov_rad,
+            optics.offcenter_engaged);
     }
 }
 } // namespace
