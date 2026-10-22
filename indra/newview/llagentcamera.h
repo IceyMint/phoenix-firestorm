@@ -31,6 +31,8 @@
 #include "llhudeffectlookat.h"      // EPointAtType
 #include "llhudeffectpointat.h"     // ELookAtType
 
+#include <string>  // P2-03a: ViewpointOverrideEyeState point name
+
 class LLPickInfo;
 class LLVOAvatarSelf;
 class LLControlVariable;
@@ -136,6 +138,31 @@ public:
     LLVector3 getCurrentCameraOffset();
     LLVector3d getCurrentFocusOffset();
     LLQuaternion getCurrentAvatarRotation();
+    // P2-03a: one-call snapshot of the viewpoint-override eye
+    // state for the OpenXR AvatarEyeFrame freeze. Value object
+    // only -- no object pointers escape, and nothing here changes
+    // camera or head-control behavior.
+    enum class EViewpointOverrideRightSource : U8
+    {
+        NONE,
+        ATTACHMENT_MARKER,
+        AMBIGUOUS,
+        WRONG_ATTACH_POINT
+    };
+    struct ViewpointOverrideEyeState
+    {
+        bool left_valid = false;
+        LLVector3 left_pos_agent;
+        // Diagnostic only: name of the attachment point holding
+        // the finder-selected left object (lookup unchanged).
+        std::string left_point_name;
+        bool right_valid = false;
+        LLVector3 right_pos_agent;
+        EViewpointOverrideRightSource right_source = EViewpointOverrideRightSource::NONE;
+        bool head_valid = false;
+        LLQuaternion head_world;
+    };
+    bool getViewpointOverrideEyeState(ViewpointOverrideEyeState& out) const;
     bool isJoystickCameraUsed();
     void setInitSitRot(LLQuaternion sit_rot) { mInitSitRot = sit_rot; };
     void rotateToInitSitRot();

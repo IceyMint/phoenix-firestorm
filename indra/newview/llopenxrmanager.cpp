@@ -20,6 +20,8 @@
 #include <openxr/openxr_platform.h>
 
 #include "llviewerdisplay.h"
+#include "llagentcamera.h"
+#include "llviewercamera.h"
 #include "pipeline.h"
 #include "llviewerwindow.h"
 #include "llwindowsdl.h"
@@ -768,6 +770,14 @@ struct LLOpenXRManagerImpl
         int begin_result = 0;
         int locate_result = 0;
         int session_state = 0;
+        // P2-03a: the frozen AvatarEyeFrame + the frame-owned
+        // render receipt (see llopenxrmanager.h). eye_frame_frozen
+        // states the freeze ran (the struct's valid flag states
+        // whether it succeeded); render_receipt is registered by
+        // the display path and consumed by the paced submit.
+        LLXRAvatarEyeFrame eye_frame;
+        bool eye_frame_frozen = false;
+        LLXRWorldRenderReceipt render_receipt;
     };
     XRFrameContext paced_frame;
     // P2-01: the head path's most recent consumption of the pose
@@ -1593,6 +1603,34 @@ struct XrSubmitTrace
     unsigned long long submitted_fov_generation = 0;
     std::string fp_layer;
 
+    // P2-03a: frozen AvatarEyeFrame + render-receipt state
+    // (paced records only; has_ stays false on legacy records and
+    // none of these fields are emitted there). The runtime views'
+    // FOVs already ride in eye_fov[][] above.
+    bool has_avatar_eye = false;
+    unsigned long long avatar_eye_frame_token = 0;
+    bool avatar_eye_valid = false;
+    std::string avatar_eye_invalid_reason;
+    unsigned long long avatar_eye_locate_generation = 0;
+    unsigned long long avatar_eye_head_pose_generation = 0;
+    long long avatar_eye_predicted_display_time = 0;
+    bool avatar_eye_left_cornea_valid = false;
+    float avatar_eye_left_cornea[3] = {0.f, 0.f, 0.f};
+    bool avatar_eye_right_cornea_valid = false;
+    float avatar_eye_right_cornea[3] = {0.f, 0.f, 0.f};
+    std::string avatar_eye_right_cornea_source;
+    std::string avatar_eye_left_cornea_point;
+    float avatar_eye_resolved_head_quat[4] = {0.f, 0.f, 0.f, 1.f};
+    float avatar_eye_resolved_camera_quat[4] = {0.f, 0.f, 0.f, 1.f};
+    bool avatar_eye_gaze_verified = false;
+    float avatar_eye_requested_near_far[2] = {0.f, 0.f};
+    int avatar_eye_target_extent[2] = {0, 0};
+    bool has_render_receipt = false;
+    unsigned long long receipt_token = 0;
+    unsigned long long receipt_locate_generation = 0;
+    bool receipt_consumed = false;
+    bool receipt_completed = false;
+    std::string receipt_validation_status;
     // P2-01 / Amendment 4: capture the exact state about to be handed
     // to xrEndFrame. Called IMMEDIATELY before each xrEndFrame in
     // submitFrameMono; also stamps t_end_start. proj_layer is nullptr
@@ -2062,6 +2100,49 @@ struct XrSubmitTrace
             f << ",\"placement_fingerprint_source\":\"" << fp_source << "\"";
             f << ",\"placement_fingerprint_submission\":\"" << fp_submission << "\"";
         }
+        if (has_avatar_eye)
+        {
+            f << ",\"avatar_eye_frame_token\":" << avatar_eye_frame_token;
+            f << ",\"avatar_eye_frame_valid\":" << (avatar_eye_valid ? "true" : "false");
+            f << ",\"avatar_eye_frame_invalid_reason\":\"" << avatar_eye_invalid_reason << "\"";
+            f << ",\"avatar_eye_locate_generation\":" << avatar_eye_locate_generation;
+            f << ",\"avatar_eye_head_pose_generation\":" << avatar_eye_head_pose_generation;
+            f << ",\"avatar_eye_predicted_display_time_xr_ns\":" << avatar_eye_predicted_display_time;
+            f << ",\"avatar_eye_left_cornea_agent\":[" << avatar_eye_left_cornea[0]
+              << "," << avatar_eye_left_cornea[1] << "," << avatar_eye_left_cornea[2] << "]";
+            f << ",\"avatar_eye_left_cornea_valid\":" << (avatar_eye_left_cornea_valid ? "true" : "false");
+            if (avatar_eye_right_cornea_valid)
+            {
+                f << ",\"avatar_eye_right_cornea_agent\":[" << avatar_eye_right_cornea[0]
+                  << "," << avatar_eye_right_cornea[1] << "," << avatar_eye_right_cornea[2] << "]";
+            }
+            else
+            {
+                f << ",\"avatar_eye_right_cornea_agent\":null";
+            }
+            f << ",\"avatar_eye_right_cornea_valid\":" << (avatar_eye_right_cornea_valid ? "true" : "false");
+            f << ",\"avatar_eye_right_cornea_source\":\"" << avatar_eye_right_cornea_source << "\"";
+            f << ",\"avatar_eye_left_cornea_point\":\"" << avatar_eye_left_cornea_point << "\"";
+            f << ",\"avatar_eye_resolved_head_quat\":[" << avatar_eye_resolved_head_quat[0]
+              << "," << avatar_eye_resolved_head_quat[1] << "," << avatar_eye_resolved_head_quat[2]
+              << "," << avatar_eye_resolved_head_quat[3] << "]";
+            f << ",\"avatar_eye_resolved_camera_quat\":[" << avatar_eye_resolved_camera_quat[0]
+              << "," << avatar_eye_resolved_camera_quat[1] << "," << avatar_eye_resolved_camera_quat[2]
+              << "," << avatar_eye_resolved_camera_quat[3] << "]";
+            f << ",\"avatar_eye_gaze_composition_verified\":" << (avatar_eye_gaze_verified ? "true" : "false");
+            f << ",\"avatar_eye_requested_near_far\":[" << avatar_eye_requested_near_far[0]
+              << "," << avatar_eye_requested_near_far[1] << "]";
+            f << ",\"avatar_eye_target_extent\":[" << avatar_eye_target_extent[0]
+              << "," << avatar_eye_target_extent[1] << "]";
+        }
+        if (has_render_receipt)
+        {
+            f << ",\"render_receipt_token\":" << receipt_token;
+            f << ",\"render_receipt_locate_generation\":" << receipt_locate_generation;
+            f << ",\"render_receipt_completed\":" << (receipt_completed ? "true" : "false");
+            f << ",\"render_receipt_consumed\":" << (receipt_consumed ? "true" : "false");
+            f << ",\"render_receipt_validation_status\":\"" << receipt_validation_status << "\"";
+        }
         LLOpenXRTrace::writeRecord("xr_submit", f.str());
     }
 
@@ -2188,6 +2269,56 @@ unsigned long long adopt_located_views(LLOpenXRManagerImpl& impl,
 // preserved). The head generation counts only when the head
 // consumed the pose during the context's own iteration (token
 // match), exactly as on the legacy path.
+// P2-03a: copy the frozen eye frame + receipt state into an
+// xr_submit collector (paced records only).
+static void fill_avatar_eye_trace(XrSubmitTrace& tr,
+                                  const LLXRAvatarEyeFrame& eye,
+                                  bool has_eye,
+                                  const LLXRWorldRenderReceipt& receipt,
+                                  bool has_receipt)
+{
+    tr.has_avatar_eye = has_eye;
+    if (has_eye)
+    {
+        tr.avatar_eye_frame_token = eye.app_frame_token;
+        tr.avatar_eye_valid = eye.valid;
+        tr.avatar_eye_invalid_reason = eye.invalid_reason;
+        tr.avatar_eye_locate_generation = eye.locate_generation;
+        tr.avatar_eye_head_pose_generation = eye.head_consumed_pose_generation;
+        tr.avatar_eye_predicted_display_time = eye.predicted_display_time_xr_ns;
+        tr.avatar_eye_left_cornea_valid = eye.left_cornea_valid;
+        tr.avatar_eye_left_cornea[0] = eye.left_cornea_agent.mV[0];
+        tr.avatar_eye_left_cornea[1] = eye.left_cornea_agent.mV[1];
+        tr.avatar_eye_left_cornea[2] = eye.left_cornea_agent.mV[2];
+        tr.avatar_eye_right_cornea_valid = eye.right_cornea_valid;
+        tr.avatar_eye_right_cornea[0] = eye.right_cornea_agent.mV[0];
+        tr.avatar_eye_right_cornea[1] = eye.right_cornea_agent.mV[1];
+        tr.avatar_eye_right_cornea[2] = eye.right_cornea_agent.mV[2];
+        tr.avatar_eye_right_cornea_source = eye.right_cornea_source;
+        tr.avatar_eye_left_cornea_point = eye.left_cornea_point;
+        tr.avatar_eye_resolved_head_quat[0] = eye.resolved_head_world.mQ[0];
+        tr.avatar_eye_resolved_head_quat[1] = eye.resolved_head_world.mQ[1];
+        tr.avatar_eye_resolved_head_quat[2] = eye.resolved_head_world.mQ[2];
+        tr.avatar_eye_resolved_head_quat[3] = eye.resolved_head_world.mQ[3];
+        tr.avatar_eye_resolved_camera_quat[0] = eye.resolved_camera_world.mQ[0];
+        tr.avatar_eye_resolved_camera_quat[1] = eye.resolved_camera_world.mQ[1];
+        tr.avatar_eye_resolved_camera_quat[2] = eye.resolved_camera_world.mQ[2];
+        tr.avatar_eye_resolved_camera_quat[3] = eye.resolved_camera_world.mQ[3];
+        tr.avatar_eye_gaze_verified = eye.gaze_composition_verified;
+        tr.avatar_eye_requested_near_far[0] = eye.requested_near;
+        tr.avatar_eye_requested_near_far[1] = eye.requested_far;
+        tr.avatar_eye_target_extent[0] = eye.target_width;
+        tr.avatar_eye_target_extent[1] = eye.target_height;
+    }
+    tr.has_render_receipt = has_receipt;
+    if (has_receipt)
+    {
+        tr.receipt_token = receipt.app_frame_token;
+        tr.receipt_locate_generation = receipt.source_locate_generation;
+        tr.receipt_consumed = receipt.consumed;
+    }
+}
+
 XrSubmitTrace make_paced_trace(const LLOpenXRManagerImpl& impl,
                                const LLOpenXRManagerImpl::XRFrameContext& frame_ctx)
 {
@@ -2216,7 +2347,14 @@ XrSubmitTrace make_paced_trace(const LLOpenXRManagerImpl& impl,
     tr.has_session_state = true;
     tr.session_state = frame_ctx.session_state;
     tr.has_pose_sample_valid = true;
-    tr.pose_sample_valid = impl.left_eye_fov_sample.valid;
+    // P2-03a (review C3): fields describing what this paced frame
+    // consumed are sourced from the frame-owned frozen snapshot
+    // when the freeze ran -- the mutable cache may already hold
+    // a later locate by the time the record is written.
+    const LLXRLeftEyeFovSample& trace_sample =
+        frame_ctx.eye_frame_frozen ? frame_ctx.eye_frame.fov_sample
+                                   : impl.left_eye_fov_sample;
+    tr.pose_sample_valid = trace_sample.valid;
     tr.optics_coherent = LLOpenXRManager::coherentOpticsEnabled();
     if (frame_ctx.located_generation > 0)
     {
@@ -2228,13 +2366,13 @@ XrSubmitTrace make_paced_trace(const LLOpenXRManagerImpl& impl,
         tr.has_head_generation = true;
         tr.head_generation = impl.head_consumed_pose_generation;
     }
-    if (impl.left_eye_fov_sample.valid)
+    if (trace_sample.valid)
     {
         tr.has_latest_located = true;
-        tr.latest_located_fov_rad[0] = impl.left_eye_fov_sample.left;
-        tr.latest_located_fov_rad[1] = impl.left_eye_fov_sample.right;
-        tr.latest_located_fov_rad[2] = impl.left_eye_fov_sample.down;
-        tr.latest_located_fov_rad[3] = impl.left_eye_fov_sample.up;
+        tr.latest_located_fov_rad[0] = trace_sample.left;
+        tr.latest_located_fov_rad[1] = trace_sample.right;
+        tr.latest_located_fov_rad[2] = trace_sample.down;
+        tr.latest_located_fov_rad[3] = trace_sample.up;
     }
     const uint32_t usable_view_count = std::min<uint32_t>(frame_ctx.located_view_count,
                                                           (uint32_t)frame_ctx.located_views.size());
@@ -2253,6 +2391,8 @@ XrSubmitTrace make_paced_trace(const LLOpenXRManagerImpl& impl,
         tr.eye_fov[i][2] = frame_ctx.located_views[i].fov.angleDown;
         tr.eye_fov[i][3] = frame_ctx.located_views[i].fov.angleUp;
     }
+    fill_avatar_eye_trace(tr, frame_ctx.eye_frame, frame_ctx.eye_frame_frozen,
+                          frame_ctx.render_receipt, frame_ctx.render_receipt.present);
     return tr;
 }
 } // namespace
@@ -2356,7 +2496,57 @@ void LLOpenXRManager::submitFrameMonoImpl(const LLRect& source_rect, bool paced)
     // source of truth, not just trace evidence. Never inferred from
     // frame ids.
     LLOpenXRTrace::RenderProvenance render_provenance;
-    const bool has_render_provenance = LLOpenXRTrace::takeRenderProvenance(render_provenance);
+    bool has_render_provenance = false;
+    // P2-03a: on the paced path the display path registers a
+    // frame-owned render receipt instead of stashing provenance;
+    // translate it into the provenance shape so every downstream
+    // consumer (trace population, readiness, strict coherence,
+    // submitted FOV) reads one structure. The legacy path takes
+    // the stash exactly as before.
+    LLXRWorldRenderReceipt frame_receipt;
+    bool has_frame_receipt = false;
+    LLXRAvatarEyeFrame frame_eye;
+    bool has_frame_eye = false;
+    if (paced)
+    {
+        has_frame_eye = getAvatarEyeFrame(frame_eye);
+        if (peekRenderReceipt(frame_receipt) &&
+            frame_receipt.app_frame_token == LLOpenXRTrace::currentAppFrameToken())
+        {
+            has_frame_receipt = true;
+            render_provenance.present = true;
+            render_provenance.render_seq = frame_receipt.render_seq;
+            render_provenance.fov_valid = frame_receipt.fov_valid;
+            render_provenance.fov_generation = frame_receipt.source_locate_generation;
+            for (int i = 0; i < 4; i++)
+            {
+                render_provenance.fov_rad[i] = frame_receipt.fov_rad[i];
+            }
+            render_provenance.offcenter_engaged = frame_receipt.offcenter_engaged;
+            render_provenance.app_frame_token = frame_receipt.app_frame_token;
+            render_provenance.has_world_gl = frame_receipt.has_world_gl;
+            for (int i = 0; i < 16; i++)
+            {
+                render_provenance.world_gl_projection[i] = frame_receipt.world_gl_projection[i];
+                render_provenance.world_gl_view[i] = frame_receipt.world_gl_view[i];
+            }
+            render_provenance.has_gl_rects = frame_receipt.has_gl_rects;
+            for (int i = 0; i < 4; i++)
+            {
+                render_provenance.gl_viewport[i] = frame_receipt.gl_viewport[i];
+                render_provenance.gl_scissor[i] = frame_receipt.gl_scissor[i];
+            }
+            render_provenance.gl_scissor_enabled = frame_receipt.gl_scissor_enabled;
+            render_provenance.render_fingerprint = frame_receipt.render_fingerprint;
+            has_render_provenance = true;
+        }
+        fill_avatar_eye_trace(xr_trace, frame_eye, has_frame_eye,
+                              frame_receipt, has_frame_receipt);
+    }
+    else
+    {
+        has_render_provenance = LLOpenXRTrace::takeRenderProvenance(render_provenance);
+    }
     const bool coherent_optics = LLOpenXRManager::coherentOpticsEnabled();
     xr_trace.optics_coherent = coherent_optics;
     if (xr_trace.tracing && has_render_provenance)
@@ -2442,7 +2632,11 @@ void LLOpenXRManager::submitFrameMonoImpl(const LLRect& source_rect, bool paced)
     // earlier iteration is not this frame's head data.
     xr_trace.has_session_state = true;
     xr_trace.session_state = (int)mImpl->session_state;
-    xr_trace.pose_sample_valid = mImpl->left_eye_fov_sample.valid;
+    // P2-03a (review C3): on the paced path the record's sample
+    // validity describes the frozen frame, not the live cache.
+    xr_trace.pose_sample_valid =
+        (paced && has_frame_eye) ? frame_eye.fov_sample.valid
+                                 : mImpl->left_eye_fov_sample.valid;
     xr_trace.has_pose_sample_valid = true;
     if (mImpl->head_consumed_app_frame_token != 0 &&
         mImpl->head_consumed_app_frame_token == LLOpenXRTrace::currentAppFrameToken())
@@ -2714,15 +2908,21 @@ void LLOpenXRManager::submitFrameMonoImpl(const LLRect& source_rect, bool paced)
             xr_trace.has_located_generation = true;
             xr_trace.located_generation = frame_ctx.located_generation;
         }
-        xr_trace.pose_sample_valid = mImpl->left_eye_fov_sample.valid;
+        // P2-03a (review C3): frozen sourcing, as in
+        // make_paced_trace -- these fields describe the sample
+        // this frame froze and consumed.
+        const LLXRLeftEyeFovSample& submit_sample =
+            has_frame_eye ? frame_eye.fov_sample
+                          : mImpl->left_eye_fov_sample;
+        xr_trace.pose_sample_valid = submit_sample.valid;
         xr_trace.has_pose_sample_valid = true;
-        if (mImpl->left_eye_fov_sample.valid)
+        if (submit_sample.valid)
         {
             xr_trace.has_latest_located = true;
-            xr_trace.latest_located_fov_rad[0] = mImpl->left_eye_fov_sample.left;
-            xr_trace.latest_located_fov_rad[1] = mImpl->left_eye_fov_sample.right;
-            xr_trace.latest_located_fov_rad[2] = mImpl->left_eye_fov_sample.down;
-            xr_trace.latest_located_fov_rad[3] = mImpl->left_eye_fov_sample.up;
+            xr_trace.latest_located_fov_rad[0] = submit_sample.left;
+            xr_trace.latest_located_fov_rad[1] = submit_sample.right;
+            xr_trace.latest_located_fov_rad[2] = submit_sample.down;
+            xr_trace.latest_located_fov_rad[3] = submit_sample.up;
         }
         {
             const uint32_t usable_view_count = std::min<uint32_t>(located_view_count,
@@ -2756,7 +2956,10 @@ void LLOpenXRManager::submitFrameMonoImpl(const LLRect& source_rect, bool paced)
         // with zero layers; a previous frame's image is never
         // reused.
         if (!has_render_provenance || render_provenance.app_frame_token != frame_ctx.token ||
-            LLOpenXRTrace::lastWorldRenderCompletedToken() != frame_ctx.token)
+            frame_receipt.consumed ||
+            frame_receipt.source_locate_generation != frame_ctx.located_generation ||
+            LLOpenXRTrace::lastWorldRenderCompletedToken() != frame_ctx.token ||
+            !consumeRenderReceipt(frame_ctx.token))
         {
             XrFrameEndInfo frame_end_info{};
             frame_end_info.type = XR_TYPE_FRAME_END_INFO;
@@ -2780,9 +2983,18 @@ void LLOpenXRManager::submitFrameMonoImpl(const LLRect& source_rect, bool paced)
                 xr_trace.t_end_end = LLOpenXRTrace::nowUs();
             }
             mImpl->paced_frame.ended = true;
+            xr_trace.receipt_validation_status = "source_not_ready";
             xr_trace.finish("paced_source_not_ready");
             return;
         }
+        // Readiness proven for THIS frame's own render: the
+        // receipt was consumed atomically by the checked API in
+        // the condition above, so it can never authorize a
+        // second submit. Validation status is NOT set here --
+        // the coherent checks below decide it (review m2).
+        frame_receipt.consumed = true;
+        xr_trace.receipt_consumed = true;
+        xr_trace.receipt_completed = true;
     }
 
     GLint previous_read_fbo = 0;
@@ -2861,13 +3073,15 @@ void LLOpenXRManager::submitFrameMonoImpl(const LLRect& source_rect, bool paced)
         {
             strict_status = "strict_render_not_offcenter";
         }
-        else if (!mImpl->left_eye_fov_sample.valid)
+        else if (paced ? !(has_frame_eye && frame_eye.fov_sample.valid)
+                       : !mImpl->left_eye_fov_sample.valid)
         {
             strict_status = "strict_no_current_sample";
         }
         else
         {
-            const LLXRLeftEyeFovSample& current_sample = mImpl->left_eye_fov_sample;
+            const LLXRLeftEyeFovSample& current_sample =
+                paced ? frame_eye.fov_sample : mImpl->left_eye_fov_sample;
             const float current_rad[4] = {current_sample.left, current_sample.right,
                                           current_sample.down, current_sample.up};
             float max_delta_rad = 0.f;
@@ -2878,9 +3092,59 @@ void LLOpenXRManager::submitFrameMonoImpl(const LLRect& source_rect, bool paced)
             }
             xr_trace.has_coherence_delta = true;
             xr_trace.coherence_max_delta_deg = max_delta_rad * 57.29577951308232f;
-            if (xr_trace.coherence_max_delta_deg > 0.05f)
+            // P2-03a: on the paced path the delta (receipt FOV
+            // vs this frame's frozen located sample) is RECORDED
+            // but no longer rejects -- there is no second locate
+            // for it to drift against (design review Q2).
+            if (!paced && xr_trace.coherence_max_delta_deg > 0.05f)
             {
                 strict_status = "strict_fov_drift";
+            }
+        }
+        if (!strict_status && paced)
+        {
+            // P2-03a independent-fact check (fix 1): the near plane
+            // the render ACTUALLY installed is derived from the
+            // receipt's captured GL projection -- read from real GL
+            // state after setup3DRender(), not the camera's near
+            // field copied twice -- and must equal the frozen
+            // requested near. Far is recorded, not enforced --
+            // display legitimately adjusts it. Column-major glm
+            // order: m[10] = -(f+n)/(f-n), m[14] = -2fn/(f-n),
+            // so near = m[14] / (m[10] - 1).
+            bool near_agrees = false;
+            if (has_frame_receipt && has_frame_eye && frame_receipt.has_world_gl)
+            {
+                const float gl_m10 = frame_receipt.world_gl_projection[10];
+                const float gl_m14 = frame_receipt.world_gl_projection[14];
+                const float denom = gl_m10 - 1.0f;
+                if (std::fabs(denom) > 1e-6f)
+                {
+                    const float derived_near = gl_m14 / denom;
+                    const float near_tolerance = std::max(0.0001f,
+                        frame_eye.requested_near * 0.01f);
+                    near_agrees = (derived_near > 0.f) &&
+                        (std::fabs(derived_near - frame_eye.requested_near) <=
+                            near_tolerance);
+                }
+            }
+            if (!near_agrees)
+            {
+                strict_status = "avatar_eye_projection_mismatch";
+            }
+        }
+        if (!strict_status && paced)
+        {
+            // P2-03a source-extent agreement (design review M2):
+            // the receipt's measured source extent (the world-
+            // render view rect swap() submits from, captured at
+            // registration) must equal the frozen target extent.
+            // The swapchain extent check below is retained.
+            if (!has_frame_receipt || !has_frame_eye ||
+                frame_receipt.source_width != frame_eye.target_width ||
+                frame_receipt.source_height != frame_eye.target_height)
+            {
+                strict_status = "avatar_eye_source_extent_mismatch";
             }
         }
         if (!strict_status && !using_pipeline_submit_source)
@@ -2912,6 +3176,7 @@ void LLOpenXRManager::submitFrameMonoImpl(const LLRect& source_rect, bool paced)
             if (paced)
             {
                 mImpl->paced_frame.ended = true;
+                xr_trace.receipt_validation_status = strict_status;
             }
             if (xr_trace.tracing)
             {
@@ -2919,6 +3184,13 @@ void LLOpenXRManager::submitFrameMonoImpl(const LLRect& source_rect, bool paced)
             }
             xr_trace.finish(strict_status);
             return;
+        }
+        if (paced)
+        {
+            // Coherent validation passed on the paced path
+            // (review m2): only NOW is the receipt's
+            // validation status "ok".
+            xr_trace.receipt_validation_status = "ok";
         }
     }
     else if (!using_pipeline_submit_source)
@@ -3481,6 +3753,303 @@ void LLOpenXRManager::beginPacedFrame()
 #endif
 }
 
+#if LL_LINUX && LL_X11
+// P2-03a: freeze the AvatarEyeFrame for a waited paced frame.
+// Runs at the post-idle seam (from beginPacedFrameAfterIdle),
+// after idle()'s single look-at/animation resolve and before
+// xrBeginFrame. Everything the paced render and submit will
+// consume is copied OUT of the manager's mutable caches and the
+// avatar's live state here, exactly once. Failures are named and
+// fail closed: the caller routes them into the existing pending
+// zero-layer mechanism. Nothing here recalibrates, reuses a stale
+// pose, or touches head control.
+static void freeze_avatar_eye_frame(LLOpenXRManagerImpl& impl,
+                                    LLOpenXRManagerImpl::XRFrameContext& frame_ctx)
+{
+    LLXRAvatarEyeFrame& eye = frame_ctx.eye_frame;
+    eye = LLXRAvatarEyeFrame();
+    eye.app_frame_token = frame_ctx.token;
+    eye.locate_generation = frame_ctx.located_generation;
+    eye.head_consumed_pose_generation =
+        (impl.head_consumed_app_frame_token == frame_ctx.token)
+            ? impl.head_consumed_pose_generation
+            : 0;
+    eye.predicted_display_time_xr_ns =
+        (long long)frame_ctx.frame_state.predictedDisplayTime;
+    eye.view_state_flags = (unsigned int)frame_ctx.view_state.viewStateFlags;
+    eye.coherent_optics = LLOpenXRManager::coherentOpticsEnabled();
+
+    if (!frame_ctx.pending_end_status.empty())
+    {
+        // shouldRender=false / locate failed / invalid view state:
+        // the frame already owes a zero-layer end; the snapshot
+        // records why and nothing further is consumed.
+        eye.invalid_reason = frame_ctx.pending_end_status;
+        frame_ctx.eye_frame_frozen = true;
+        return;
+    }
+
+    // FOV: this frame's located sample, copied at the seam.
+    eye.fov_sample = impl.left_eye_fov_sample;
+    eye.vertical_fov_valid = impl.has_left_eye_vertical_fov;
+    if (eye.vertical_fov_valid)
+    {
+        eye.vertical_fov_rad = impl.latest_left_eye_vertical_fov;
+    }
+    if (!eye.fov_sample.valid)
+    {
+        eye.invalid_reason = "avatar_eye_left_fov_invalid";
+        frame_ctx.eye_frame_frozen = true;
+        return;
+    }
+
+    // Consumer-generation validation (design review M1): the
+    // frozen sample must BE this frame's locate; a head
+    // consumption stamped for this iteration must be of the same
+    // generation (a zero stamp means the head path did not
+    // consume this iteration -- recorded, not a failure).
+    if (frame_ctx.located_generation == 0 ||
+        eye.fov_sample.locate_generation != frame_ctx.located_generation)
+    {
+        eye.invalid_reason = "avatar_eye_generation_mismatch";
+        frame_ctx.eye_frame_frozen = true;
+        return;
+    }
+    if (eye.head_consumed_pose_generation != 0 &&
+        eye.head_consumed_pose_generation != frame_ctx.located_generation)
+    {
+        eye.invalid_reason = "avatar_eye_head_generation_mismatch";
+        frame_ctx.eye_frame_frozen = true;
+        return;
+    }
+
+    // Avatar anatomy + resolved head rotation: ONE const accessor
+    // call returning a value object (no pointers escape).
+    LLAgentCamera::ViewpointOverrideEyeState eye_state;
+    if (!gAgentCamera.getViewpointOverrideEyeState(eye_state))
+    {
+        eye.invalid_reason = "avatar_eye_avatar_invalid";
+        frame_ctx.eye_frame_frozen = true;
+        return;
+    }
+    eye.left_cornea_valid = eye_state.left_valid;
+    eye.left_cornea_agent = eye_state.left_pos_agent;
+    eye.left_cornea_point = eye_state.left_point_name;
+    eye.right_cornea_valid = eye_state.right_valid;
+    eye.right_cornea_agent = eye_state.right_pos_agent;
+    switch (eye_state.right_source)
+    {
+    case LLAgentCamera::EViewpointOverrideRightSource::ATTACHMENT_MARKER:
+        eye.right_cornea_source = "attachment_marker";
+        break;
+    case LLAgentCamera::EViewpointOverrideRightSource::AMBIGUOUS:
+        eye.right_cornea_source = "ambiguous";
+        break;
+    case LLAgentCamera::EViewpointOverrideRightSource::WRONG_ATTACH_POINT:
+        eye.right_cornea_source = "wrong_attach_point";
+        break;
+    default:
+        eye.right_cornea_source = "none";
+        break;
+    }
+    eye.head_valid = eye_state.head_valid;
+    eye.resolved_head_world = eye_state.head_world;
+    if (!eye.left_cornea_valid)
+    {
+        eye.invalid_reason = "avatar_eye_left_anchor_missing";
+        frame_ctx.eye_frame_frozen = true;
+        return;
+    }
+    if (!eye.head_valid)
+    {
+        eye.invalid_reason = "avatar_eye_orientation_invalid";
+        frame_ctx.eye_frame_frozen = true;
+        return;
+    }
+
+    // Camera orientation as resolved by idle(), kept distinct
+    // from the head rotation (gaze composition is unproven).
+    LLViewerCamera* camera = LLViewerCamera::getInstance();
+    eye.resolved_camera_world = camera->getQuaternion();
+    // Orientation validation (design review M3): a captured
+    // quaternion is evidence only if every component is finite
+    // and its magnitude is nondegenerate. Anything else fails
+    // closed with the named orientation reason.
+    {
+        auto quat_usable = [](const LLQuaternion& q) {
+            F32 sumsq = 0.f;
+            for (int i = 0; i < 4; i++)
+            {
+                if (!std::isfinite(q.mQ[i]))
+                {
+                    return false;
+                }
+                sumsq += q.mQ[i] * q.mQ[i];
+            }
+            return sumsq > 0.25f && sumsq < 4.f;
+        };
+        if (!quat_usable(eye.resolved_head_world) ||
+            !quat_usable(eye.resolved_camera_world))
+        {
+            eye.invalid_reason = "avatar_eye_orientation_invalid";
+            frame_ctx.eye_frame_frozen = true;
+            return;
+        }
+    }
+    eye.camera_valid = true;
+    eye.requested_near = camera->getNear();
+    eye.requested_far = gAgentCamera.mDrawDistance;
+
+    S32 target_w = 0;
+    S32 target_h = 0;
+    if (!LLOpenXRManager::instance().getLeftEyeRenderSize(target_w, target_h) ||
+        target_w <= 0 || target_h <= 0)
+    {
+        eye.invalid_reason = "avatar_eye_extent_invalid";
+        frame_ctx.eye_frame_frozen = true;
+        return;
+    }
+    eye.target_width = (int)target_w;
+    eye.target_height = (int)target_h;
+
+    eye.valid = true;
+    frame_ctx.eye_frame_frozen = true;
+}
+#endif // LL_LINUX && LL_X11
+
+bool LLOpenXRManager::getAvatarEyeFrame(LLXRAvatarEyeFrame& out) const
+{
+#if LL_LINUX && LL_X11
+    if (!mImpl || !mImpl->paced_frame.eye_frame_frozen)
+    {
+        return false;
+    }
+    out = mImpl->paced_frame.eye_frame;
+    return true;
+#else
+    (void)out;
+    return false;
+#endif
+}
+
+void LLOpenXRManager::noteRenderReceipt(const LLXRWorldRenderReceipt& receipt)
+{
+#if LL_LINUX && LL_X11
+    if (!mImpl)
+    {
+        return;
+    }
+    LLOpenXRManagerImpl::XRFrameContext& frame_ctx = mImpl->paced_frame;
+    // Lifecycle ownership (design review M4): registration only
+    // for the active, begun, unended frame the receipt names,
+    // and never after that frame's receipt was consumed.
+    if (!frame_ctx.active || !frame_ctx.begun || frame_ctx.ended ||
+        receipt.app_frame_token != frame_ctx.token ||
+        frame_ctx.render_receipt.consumed)
+    {
+        return;
+    }
+    LLXRWorldRenderReceipt& stored = frame_ctx.render_receipt;
+    if (!stored.present)
+    {
+        stored = receipt;
+        stored.present = true;
+        return;
+    }
+    if (receipt.base_complete && !stored.base_complete)
+    {
+        // The authoritative base registration replaces a partial
+        // trace-only one, preserving any render_seq /
+        // fingerprint the trace update already merged.
+        const unsigned long long kept_seq = stored.render_seq;
+        const std::string kept_fingerprint = stored.render_fingerprint;
+        stored = receipt;
+        stored.present = true;
+        if (stored.render_seq == 0)
+        {
+            stored.render_seq = kept_seq;
+        }
+        if (stored.render_fingerprint.empty())
+        {
+            stored.render_fingerprint = kept_fingerprint;
+        }
+        return;
+    }
+    // Merge the record_render_trace() update for the same token:
+    // render_seq, fingerprint and any GL state it carries.
+    if (receipt.render_seq != 0)
+    {
+        stored.render_seq = receipt.render_seq;
+    }
+    if (!receipt.render_fingerprint.empty())
+    {
+        stored.render_fingerprint = receipt.render_fingerprint;
+    }
+    if (receipt.has_world_gl)
+    {
+        stored.has_world_gl = true;
+        std::memcpy(stored.world_gl_projection, receipt.world_gl_projection,
+                    sizeof(stored.world_gl_projection));
+        std::memcpy(stored.world_gl_view, receipt.world_gl_view,
+                    sizeof(stored.world_gl_view));
+    }
+    if (receipt.has_gl_rects)
+    {
+        stored.has_gl_rects = true;
+        std::memcpy(stored.gl_viewport, receipt.gl_viewport, sizeof(stored.gl_viewport));
+        std::memcpy(stored.gl_scissor, receipt.gl_scissor, sizeof(stored.gl_scissor));
+        stored.gl_scissor_enabled = receipt.gl_scissor_enabled;
+    }
+    if (receipt.actual_near != 0.f)
+    {
+        stored.actual_near = receipt.actual_near;
+    }
+    if (receipt.actual_far != 0.f)
+    {
+        stored.actual_far = receipt.actual_far;
+    }
+#endif
+}
+
+bool LLOpenXRManager::peekRenderReceipt(LLXRWorldRenderReceipt& out) const
+{
+#if LL_LINUX && LL_X11
+    if (!mImpl || !mImpl->paced_frame.render_receipt.present)
+    {
+        return false;
+    }
+    out = mImpl->paced_frame.render_receipt;
+    return true;
+#else
+    (void)out;
+    return false;
+#endif
+}
+
+bool LLOpenXRManager::consumeRenderReceipt(unsigned long long token)
+{
+#if LL_LINUX && LL_X11
+    if (!mImpl)
+    {
+        return false;
+    }
+    LLOpenXRManagerImpl::XRFrameContext& frame_ctx = mImpl->paced_frame;
+    if (!frame_ctx.active || !frame_ctx.begun || frame_ctx.ended ||
+        frame_ctx.token != token ||
+        !frame_ctx.render_receipt.present ||
+        !frame_ctx.render_receipt.base_complete ||
+        frame_ctx.render_receipt.consumed)
+    {
+        return false;
+    }
+    frame_ctx.render_receipt.consumed = true;
+    return true;
+#else
+    (void)token;
+    return false;
+#endif
+}
+
 void LLOpenXRManager::beginPacedFrameAfterIdle()
 {
 #if LL_LINUX && LL_X11
@@ -3495,6 +4064,23 @@ void LLOpenXRManager::beginPacedFrameAfterIdle()
     // happens. Pending zero-layer outcomes (shouldRender=false,
     // locate failure, invalid view state) are resolved at this
     // point too, so such frames never reach the render path.
+    // P2-03a: freeze the AvatarEyeFrame first (post-resolve,
+    // pre-BeginFrame). A freeze failure on an otherwise renderable
+    // frame joins the pending zero-layer outcomes so the waited
+    // frame still gets its balanced begin + zero-layer end here.
+    if (mImpl)
+    {
+        LLOpenXRManagerImpl::XRFrameContext& frame_ctx = mImpl->paced_frame;
+        if (frame_ctx.active && !frame_ctx.ended && frame_ctx.wait_succeeded &&
+            !frame_ctx.eye_frame_frozen)
+        {
+            freeze_avatar_eye_frame(*mImpl, frame_ctx);
+            if (!frame_ctx.eye_frame.valid && frame_ctx.pending_end_status.empty())
+            {
+                frame_ctx.pending_end_status = frame_ctx.eye_frame.invalid_reason;
+            }
+        }
+    }
     beginPacedFrameForRender();
 #endif
 }

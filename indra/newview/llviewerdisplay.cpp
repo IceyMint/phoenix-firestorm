@@ -297,8 +297,26 @@ void display_update_camera()
     // When OpenXR mono is active, match the desktop render projection to the
     // runtime's left-eye vertical FOV to reduce perceived warping in-headset.
     static bool openxr_fov_override_active = false;
+    // P2-03a: on the paced path this render consumes the frozen
+    // AvatarEyeFrame (FOV sample + vertical FOV), never the
+    // manager's mutable pose/FOV caches.
+    LLXRAvatarEyeFrame xr_eye_frame;
+    const bool xr_paced_selected =
+        LLOpenXRManager::instance().isPacedFrameLoopSelected();
+    const bool xr_has_eye_frame =
+        xr_paced_selected &&
+        LLOpenXRManager::instance().getAvatarEyeFrame(xr_eye_frame) &&
+        xr_eye_frame.valid;
+    LLXRWorldRenderReceipt xr_receipt;
+    bool xr_receipt_pending = false;
     F32 openxr_left_eye_fov = 0.f;
-    if (LLOpenXRManager::instance().getLeftEyeVerticalFov(openxr_left_eye_fov))
+    if (xr_has_eye_frame && xr_eye_frame.vertical_fov_valid)
+    {
+        LLViewerCamera::getInstance()->setViewNoBroadcast(xr_eye_frame.vertical_fov_rad);
+        openxr_fov_override_active = true;
+    }
+    else if (!xr_paced_selected &&
+             LLOpenXRManager::instance().getLeftEyeVerticalFov(openxr_left_eye_fov))
     {
         LLViewerCamera::getInstance()->setViewNoBroadcast(openxr_left_eye_fov);
         openxr_fov_override_active = true;
@@ -317,8 +335,24 @@ void display_update_camera()
     {
         g_xr_render_optics_capture = XRRenderOpticsCapture();
         g_xr_render_optics_capture.present = true;
-        g_xr_render_optics_capture.fov_sample_valid =
-            LLOpenXRManager::instance().getLeftEyeFovSample(g_xr_render_optics_capture.fov_sample);
+        if (xr_has_eye_frame)
+        {
+            g_xr_render_optics_capture.fov_sample = xr_eye_frame.fov_sample;
+            g_xr_render_optics_capture.fov_sample_valid = xr_eye_frame.fov_sample.valid;
+        }
+        else if (!xr_paced_selected)
+        {
+            g_xr_render_optics_capture.fov_sample_valid =
+                LLOpenXRManager::instance().getLeftEyeFovSample(g_xr_render_optics_capture.fov_sample);
+        }
+        else
+        {
+            // Paced selected but no valid frozen frame: consume
+            // NO sample (review m1) -- never the mutable caches.
+            // The frame zero-layers at the manager; the desktop
+            // render proceeds without an XR sample this frame.
+            g_xr_render_optics_capture.fov_sample_valid = false;
+        }
     }
 
     // P1-02/P1-03: with coherent optics enabled (the default; the
@@ -364,12 +398,34 @@ void display_update_camera()
             provenance.fov_rad[3] = g_xr_render_optics_capture.fov_sample.up;
         }
         provenance.offcenter_engaged = xr_offcenter_engaged;
+        if (xr_has_eye_frame)
+        {
+            // P2-03a: paced path -- the frame's receipt is
+            // registered after the GL capture below; the
+            // provenance stash is skipped for this render.
+            xr_receipt.app_frame_token = xr_eye_frame.app_frame_token;
+            xr_receipt.source_locate_generation =
+                xr_eye_frame.fov_sample.valid ? xr_eye_frame.fov_sample.locate_generation : 0;
+            xr_receipt.fov_valid = provenance.fov_valid;
+            for (int i = 0; i < 4; i++)
+            {
+                xr_receipt.fov_rad[i] = provenance.fov_rad[i];
+            }
+            xr_receipt.offcenter_engaged = xr_offcenter_engaged;
+            xr_receipt_pending = true;
+        }
         // P2-01: the producing iteration's token. The GL matrices are
         // captured below (after setup3DRender) and are transferred by
         // record_render_trace()'s re-stash when a trace run is
         // active; the functional submit consumes only the FOV fields.
         provenance.app_frame_token = LLOpenXRTrace::currentAppFrameToken();
-        LLOpenXRTrace::stashRenderProvenance(provenance);
+        if (!xr_paced_selected)
+        {
+            // Legacy path only (review C1): a paced-selected
+            // render never writes the legacy provenance stash,
+            // even when its frozen frame is invalid.
+            LLOpenXRTrace::stashRenderProvenance(provenance);
+        }
     }
 
     gViewerWindow->setup3DRender();
@@ -393,6 +449,41 @@ void display_update_camera()
         LLViewerCamera* xr_camera = LLViewerCamera::getInstance();
         g_xr_render_optics_capture.near_plane = xr_camera->getNear();
         g_xr_render_optics_capture.far_plane = xr_camera->getFar();
+        if (xr_receipt_pending)
+        {
+            // P2-03a: complete the frame's receipt with the true
+            // GL state this render installed, and register it
+            // with the manager (frame-owned; consumed once by
+            // the paced submit).
+            const F32* proj = glm::value_ptr(g_xr_render_optics_capture.world_gl_projection);
+            const F32* view = glm::value_ptr(g_xr_render_optics_capture.world_gl_view);
+            xr_receipt.has_world_gl = true;
+            for (int i = 0; i < 16; i++)
+            {
+                xr_receipt.world_gl_projection[i] = proj[i];
+                xr_receipt.world_gl_view[i] = view[i];
+            }
+            xr_receipt.has_gl_rects = true;
+            for (int i = 0; i < 4; i++)
+            {
+                xr_receipt.gl_viewport[i] = g_xr_render_optics_capture.world_gl_viewport[i];
+                xr_receipt.gl_scissor[i] = g_xr_render_optics_capture.world_gl_scissor[i];
+            }
+            xr_receipt.gl_scissor_enabled = g_xr_render_optics_capture.world_gl_scissor_enabled;
+            xr_receipt.actual_near = g_xr_render_optics_capture.near_plane;
+            xr_receipt.actual_far = g_xr_render_optics_capture.far_plane;
+            // M2: this is the authoritative base registration;
+            // record the measured source extent -- the same
+            // world-render view rect swap() will submit from.
+            xr_receipt.base_complete = true;
+            {
+                const LLRect& source_rect = gViewerWindow->getWorldRenderViewRectRaw();
+                xr_receipt.source_width = source_rect.getWidth();
+                xr_receipt.source_height = source_rect.getHeight();
+            }
+            LLOpenXRManager::instance().noteRenderReceipt(xr_receipt);
+            xr_receipt_pending = false;
+        }
     }
 
     if (!gCubeSnapshot)
@@ -840,6 +931,15 @@ void record_render_trace()
         fields << ",\"avatar_render_rot\":" << trace_quat(gAgentAvatarp->getRenderRotation());
     }
 
+    {
+        LLXRAvatarEyeFrame eye_frame;
+        if (LLOpenXRManager::instance().getAvatarEyeFrame(eye_frame))
+        {
+            fields << ",\"avatar_eye_frame_token\":" << eye_frame.app_frame_token;
+            fields << ",\"avatar_eye_frame_valid\":" << (eye_frame.valid ? "true" : "false");
+        }
+    }
+
     LLOpenXRTrace::writeRecord("render", fields.str());
 
     // P1-01: transfer this render's FOV provenance with its image; the
@@ -883,7 +983,28 @@ void record_render_trace()
             provenance.gl_scissor_enabled = optics.world_gl_scissor_enabled;
             provenance.render_fingerprint = render_fingerprint;
         }
-        LLOpenXRTrace::stashRenderProvenance(provenance);
+        if (LLOpenXRManager::instance().isPacedFrameLoopSelected())
+        {
+            // P2-03a: paced path -- merge the render_seq /
+            // fingerprint update into the frame's receipt
+            // instead of re-stashing provenance (the base
+            // receipt, with FOV + GL, was registered by
+            // display_update_camera()).
+            LLXRAvatarEyeFrame eye_frame;
+            if (LLOpenXRManager::instance().getAvatarEyeFrame(eye_frame) &&
+                eye_frame.app_frame_token == provenance.app_frame_token)
+            {
+                LLXRWorldRenderReceipt receipt;
+                receipt.app_frame_token = eye_frame.app_frame_token;
+                receipt.render_seq = render_seq;
+                receipt.render_fingerprint = render_fingerprint;
+                LLOpenXRManager::instance().noteRenderReceipt(receipt);
+            }
+        }
+        else
+        {
+            LLOpenXRTrace::stashRenderProvenance(provenance);
+        }
     }
 }
 } // namespace

@@ -127,6 +127,7 @@ F32 distance_between_vectors(const LLVector3& a, const LLVector3& b)
 namespace
 {
 constexpr const char* VIEWPOINT_OVERRIDE_ATTACHMENT_NAME = "viewpoint_override";
+constexpr const char* VIEWPOINT_OVERRIDE_RIGHT_ATTACHMENT_NAME = "viewpoint_override_right";
 constexpr const char* VIEWPOINT_OVERRIDE_DISABLE_HEAD_ANIMS_KEY = "FSViewpointOverrideDisableHeadAnims";
 constexpr const char* VIEWPOINT_OVERRIDE_INSTANT_HEAD_ROT_KEY = "FSViewpointOverrideInstantHeadRot";
 constexpr const char* VIEWPOINT_OVERRIDE_HEAD_ROLL_KEY = "FSViewpointOverrideHeadRoll";
@@ -264,6 +265,96 @@ bool getViewpointOverrideHmdYawPitchRoll(F32& out_yaw, F32& out_pitch, F32& out_
 }
 
 } // namespace
+
+// P2-03a: defined OUTSIDE the anonymous namespace above -- a
+// member-function definition must live in a namespace that
+// encloses the class (review round 1, B1). The internal-
+// linkage finder and constants above remain visible in this
+// translation unit.
+bool LLAgentCamera::getViewpointOverrideEyeState(ViewpointOverrideEyeState& out) const
+{
+    out = ViewpointOverrideEyeState();
+    if (gAgentAvatarp.isNull() || !gAgentAvatarp->isValid())
+    {
+        return false;
+    }
+
+    if (LLViewerObject* left_object = findViewpointOverrideMesh())
+    {
+        out.left_valid = true;
+        out.left_pos_agent = left_object->getRenderPosition();
+        // Diagnostic only (design review m3): which attachment
+        // point holds the object the existing finder selected --
+        // found by pointer identity in the point lists, NOT a
+        // second name lookup; the finder's choice is unchanged.
+        for (const auto& attachment : gAgentAvatarp->mAttachmentPoints)
+        {
+            const auto& point = attachment.second;
+            if (!point)
+            {
+                continue;
+            }
+            for (const auto& attached_object : point->mAttachedObjects)
+            {
+                if (attached_object.get() == left_object)
+                {
+                    out.left_point_name = point->getName();
+                }
+            }
+        }
+    }
+
+    // Right cornea: the viewpoint_override_right prim, and only
+    // when worn on the Right Eyeball attachment point (the point
+    // named "Right Eyeball", hanging from the mEyeRight joint).
+    // A same-named prim anywhere else is not the right eye, and
+    // duplicates are ambiguous rather than first-wins. Absence
+    // is normal in mono and never an error.
+    int right_matches = 0;
+    for (const auto& attachment : gAgentAvatarp->mAttachmentPoints)
+    {
+        const auto& point = attachment.second;
+        if (!point)
+        {
+            continue;
+        }
+        const bool on_right_eyeball =
+            point->getName() == "Right Eyeball" ||
+            (point->getParent() && point->getParent()->getName() == "mEyeRight");
+        for (const auto& attached_object : point->mAttachedObjects)
+        {
+            LLViewerObject* object = attached_object.get();
+            if (!object || object->getAttachmentItemName() != VIEWPOINT_OVERRIDE_RIGHT_ATTACHMENT_NAME)
+            {
+                continue;
+            }
+            right_matches++;
+            if (on_right_eyeball && right_matches == 1)
+            {
+                out.right_valid = true;
+                out.right_pos_agent = object->getRenderPosition();
+                out.right_source = EViewpointOverrideRightSource::ATTACHMENT_MARKER;
+            }
+            else if (!on_right_eyeball &&
+                     out.right_source == EViewpointOverrideRightSource::NONE)
+            {
+                out.right_source = EViewpointOverrideRightSource::WRONG_ATTACH_POINT;
+            }
+        }
+    }
+    if (right_matches > 1)
+    {
+        out.right_valid = false;
+        out.right_source = EViewpointOverrideRightSource::AMBIGUOUS;
+    }
+
+    if (gAgentAvatarp->mHeadp)
+    {
+        out.head_valid = true;
+        out.head_world = gAgentAvatarp->mHeadp->getWorldRotation();
+    }
+    return true;
+}
 
 static bool isDisableCameraConstraints()
 {

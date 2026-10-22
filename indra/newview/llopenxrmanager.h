@@ -11,6 +11,7 @@
 
 #include "llrect.h"
 #include "v3math.h"
+#include "llquaternion.h"
 
 #include <memory>
 #include <string>
@@ -31,6 +32,89 @@ struct LLXRLeftEyeFovSample
     unsigned long long locate_generation = 0;
     long long located_monotonic_us = 0;
     bool valid = false;
+};
+
+// P2-03a: the frozen per-frame eye/camera inputs for the paced
+// loop (AvatarEyeFrame in the Phase 2 contract). Captured ONCE in
+// beginPacedFrameAfterIdle() -- after idle()'s single animation
+// resolve, before xrBeginFrame -- and never modified afterwards.
+// The paced render consumes THIS, never the manager's mutable
+// pose/FOV caches. valid=false carries a named invalid_reason and
+// the frame ends with zero layers; a missing RIGHT cornea never
+// invalidates mono (right_cornea_valid=false, source recorded).
+struct LLXRAvatarEyeFrame
+{
+    bool valid = false;
+    std::string invalid_reason;
+    unsigned long long app_frame_token = 0;
+    unsigned long long locate_generation = 0;
+    unsigned long long head_consumed_pose_generation = 0;
+    long long predicted_display_time_xr_ns = 0;
+    unsigned int view_state_flags = 0;
+    // The located left-eye FOV sample as frozen at the seam, plus
+    // the derived vertical FOV the desktop-path override consumes.
+    LLXRLeftEyeFovSample fov_sample;
+    float vertical_fov_rad = 0.f;
+    bool vertical_fov_valid = false;
+    // Avatar anatomy: cornea prim render positions, agent space.
+    bool left_cornea_valid = false;
+    LLVector3 left_cornea_agent;
+    bool right_cornea_valid = false;
+    LLVector3 right_cornea_agent;
+    // attachment_marker | none | ambiguous | wrong_attach_point
+    std::string right_cornea_source;
+    // Diagnostic: name of the attachment point holding the
+    // finder-selected left marker (the lookup is unchanged).
+    std::string left_cornea_point;
+    // Resolved head orientation (avatar side) and the camera
+    // orientation as resolved by idle() -- recorded separately:
+    // gaze composition into the camera is NOT proven at the
+    // setAxes() site, so this flag stays false in P2-03a and the
+    // two quaternions are never conflated.
+    bool head_valid = false;
+    LLQuaternion resolved_head_world;
+    bool camera_valid = false;
+    LLQuaternion resolved_camera_world;
+    bool gaze_composition_verified = false;
+    float requested_near = 0.f;
+    float requested_far = 0.f;
+    int target_width = 0;
+    int target_height = 0;
+    bool coherent_optics = false;
+};
+
+// P2-03a: measured render output for one paced frame -- the
+// receipt the display path registers and the paced submit
+// consumes exactly once. Deliberately separate from the frozen
+// inputs: freezing intent is not proof of what rendered. The
+// functional completion proof remains the independent
+// LLOpenXRTrace world-render completion token (P2-02).
+struct LLXRWorldRenderReceipt
+{
+    bool present = false;
+    bool base_complete = false;
+    bool consumed = false;
+    unsigned long long app_frame_token = 0;
+    unsigned long long source_locate_generation = 0;
+    unsigned long long render_seq = 0;
+    bool fov_valid = false;
+    float fov_rad[4] = {0.f, 0.f, 0.f, 0.f};
+    bool offcenter_engaged = false;
+    bool has_world_gl = false;
+    float world_gl_projection[16] = {};
+    float world_gl_view[16] = {};
+    bool has_gl_rects = false;
+    int gl_viewport[4] = {0, 0, 0, 0};
+    int gl_scissor[4] = {0, 0, 0, 0};
+    bool gl_scissor_enabled = false;
+    float actual_near = 0.f;
+    float actual_far = 0.f;
+    // Measured source extent of the rendered image (M2): the
+    // world-render view rect the submit blits from, captured at
+    // registration; compared against the frozen target extent.
+    int source_width = 0;
+    int source_height = 0;
+    std::string render_fingerprint;
 };
 
 struct LLOpenXRManagerImpl;
@@ -63,6 +147,24 @@ public:
     void beginPacedFrameAfterIdle();
     void submitPacedFrameMono(const LLRect& source_rect);
     void closePacedFrameIfOpen(const char* status);
+    // P2-03a: the active paced frame's frozen AvatarEyeFrame
+    // (false when no paced frame is frozen). The struct's own
+    // valid flag states whether the freeze succeeded.
+    bool getAvatarEyeFrame(LLXRAvatarEyeFrame& out) const;
+    // P2-03a: the display path registers what it actually
+    // rendered for a paced frame; stored only when the receipt's
+    // token matches the active, unended frame context. A second
+    // registration for the same token merges (render_seq /
+    // fingerprint arrive with record_render_trace()).
+    void noteRenderReceipt(const LLXRWorldRenderReceipt& receipt);
+    // P2-03a: the paced submit peeks the active frame's receipt
+    // (no state change); consumption is consumeRenderReceipt().
+    bool peekRenderReceipt(LLXRWorldRenderReceipt& out) const;
+    // The ONLY way to consume the active frame's receipt
+    // (review M4): checked -- active, begun, unended, token
+    // match, present, unconsumed -- and atomic. False when no
+    // receipt may be consumed for that token.
+    bool consumeRenderReceipt(unsigned long long token);
     bool hasOpenPacedFrame() const;
     bool getHmdForward(LLVector3& out_forward) const;
     bool getHmdUp(LLVector3& out_up) const;
