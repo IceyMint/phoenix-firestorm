@@ -13,6 +13,7 @@
 #include "v3math.h"
 
 #include <memory>
+#include <string>
 
 // P1-01: one located left-eye FOV sample. Cached by submitFrameMono
 // after a successful xrLocateViews that passed the P0-06 validity
@@ -40,6 +41,29 @@ public:
     static LLOpenXRManager& instance();
 
     void submitFrameMono(const LLRect& source_rect);
+    // P2-02: runtime-paced frame loop, gated by
+    // FS_OPENXR_P2_FRAME_LOOP=1 (default OFF in this commit; P2-03
+    // flips the default). When selected, beginPacedFrame() runs the
+    // session events + xrWaitFrame + xrLocateViews for the iteration
+    // BEFORE LLAppViewer::idle() and publishes the located pose/FOV
+    // snapshot for idle() to consume; submitPacedFrameMono() (called
+    // from swap(), on the render path) begins the frame if needed,
+    // blits this iteration's own render and ends it;
+    // closePacedFrameIfOpen() is the main-loop fallback that closes
+    // any still-open waited frame with zero layers. The legacy
+    // submitFrameMono() path is untouched when the gate is off, and
+    // the 2x2 A/B matrix (loop x optics) is preserved: this gate is
+    // independent of coherentOpticsEnabled().
+    static bool pacedFrameLoopEnabled();
+    bool isPacedFrameLoopSelected() const;
+    void beginPacedFrame();
+    // P2-02: contract-order begin point -- called by
+    // LLAppViewer::doFrame() after idle() and before display():
+    // begins the waited frame (resolving pending zero-layer ends).
+    void beginPacedFrameAfterIdle();
+    void submitPacedFrameMono(const LLRect& source_rect);
+    void closePacedFrameIfOpen(const char* status);
+    bool hasOpenPacedFrame() const;
     bool getHmdForward(LLVector3& out_forward) const;
     bool getHmdUp(LLVector3& out_up) const;
     bool getLeftEyeVerticalFov(F32& out_vertical_fov_radians) const;
@@ -88,6 +112,19 @@ private:
     bool initialize();
     void processEvents();
     bool isMonoRequested() const;
+    // P2-02: shared initialization for both submit loops (one
+    // attempt, then the Linux session-handle check).
+    bool ensureInitializedForFrame();
+    // P2-02: the common submit body. paced=false is the legacy
+    // Phase 0/1 loop exactly (wait/begin/locate after the render);
+    // paced=true consumes the XRFrameContext beginPacedFrame()
+    // waited on and located before idle().
+    void submitFrameMonoImpl(const LLRect& source_rect, bool paced);
+    // P2-02: post-idle xrBeginFrame for the paced context (resolves
+    // pending zero-layer ends); zero-layer end + trace for a begun
+    // paced frame. Both are no-ops off Linux/X11.
+    bool beginPacedFrameForRender();
+    bool endPacedFrameZeroLayer(const std::string& status);
 
 private:
     std::unique_ptr<LLOpenXRManagerImpl> mImpl;

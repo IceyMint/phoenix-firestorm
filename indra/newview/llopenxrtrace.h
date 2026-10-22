@@ -135,6 +135,13 @@ public:
         long long t_world_render_start_us = 0;
         long long t_render_end_us = 0;
         long long t_display_return_us = 0;
+        // P2-02: which frame loop produced this iteration --
+        // "legacy_after_render" (the Phase 0/1 loop, the default) or
+        // "paced_pre_idle" (FS_OPENXR_P2_FRAME_LOOP=1). Set by
+        // LLOpenXRManager::beginPacedFrame() through
+        // setAppFrameLoopMode(); the app_frame, render and xr_submit
+        // records all read the label from here.
+        std::string frame_loop_mode = "legacy_after_render";
         // P2-01B: diagnostic fixed-cadence state of this iteration,
         // stamped by LLAppViewer::doFrame() when the cadence lock
         // paced the iteration's start (see
@@ -156,8 +163,18 @@ public:
     static void markAppFrameDisplayReturn();
     static void setAppFrameDiagCadence(float target_hz, bool has_achieved_interval,
                                        long long achieved_interval_us, long long deadline_miss_us);
+    static void setAppFrameLoopMode(const std::string& mode);
     static bool peekAppFrameContext(AppFrameContext& out);
     static unsigned long long currentAppFrameToken();
+    // P2-02: functional (not trace-gated) world-render completion
+    // marker: display() records, on its main present path after
+    // render_ui(), the app_frame_token whose world render +
+    // post-processing completed, so the paced submit can
+    // prove the image it is about to submit was actually rendered
+    // by the current frame -- the camera-step provenance stash
+    // alone (written before the render) cannot prove that.
+    static void markWorldRenderCompleted(unsigned long long app_frame_token);
+    static unsigned long long lastWorldRenderCompletedToken();
 
     // P2-01: placement fingerprint -- FNV-1a 64 over a canonical
     // string of numeric state values (floats serialized with the

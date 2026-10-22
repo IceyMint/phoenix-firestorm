@@ -36,6 +36,7 @@ struct TraceState
     LLOpenXRTrace::RenderProvenance render_provenance;
     unsigned long long app_frame_token = 0;
     LLOpenXRTrace::AppFrameContext app_frame_context;
+    unsigned long long last_world_render_completed_token = 0;
     unsigned long long dropped_records = 0;
     unsigned long long written_records = 0;
     long long last_flush_us = 0;
@@ -403,6 +404,30 @@ std::string frame_record_unlocked(TraceState& state, const std::string& event,
         state.app_frame_context.diag_achieved_interval_us = achieved_interval_us;
         state.app_frame_context.diag_deadline_miss_us = deadline_miss_us;
     }
+}
+
+/*static*/ void LLOpenXRTrace::setAppFrameLoopMode(const std::string& mode)
+{
+    TraceState& state = trace_state();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    if (state.app_frame_context.present)
+    {
+        state.app_frame_context.frame_loop_mode = mode;
+    }
+}
+
+/*static*/ void LLOpenXRTrace::markWorldRenderCompleted(unsigned long long app_frame_token)
+{
+    TraceState& state = trace_state();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    state.last_world_render_completed_token = app_frame_token;
+}
+
+/*static*/ unsigned long long LLOpenXRTrace::lastWorldRenderCompletedToken()
+{
+    TraceState& state = trace_state();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    return state.last_world_render_completed_token;
 }
 
 /*static*/ bool LLOpenXRTrace::peekAppFrameContext(AppFrameContext& out)

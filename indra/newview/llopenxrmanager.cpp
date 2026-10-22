@@ -44,6 +44,7 @@ constexpr const char* OPENXR_LOG_ENV = "FS_OPENXR_LOG_FILE";
 constexpr const char* OPENXR_P1_OPTICS_ENV = "FS_OPENXR_P1_OPTICS_EXPERIMENTAL";
 constexpr const char* OPENXR_DIAG_CADENCE_ENV = "FS_OPENXR_DIAG_FIXED_CADENCE_HZ";
 constexpr const char* OPENXR_DIAG_MARKER_ENV = "FS_OPENXR_DIAG_FRAME_MARKER";
+constexpr const char* OPENXR_P2_FRAME_LOOP_ENV = "FS_OPENXR_P2_FRAME_LOOP";
 
 bool is_openxr_mono_requested()
 {
@@ -121,23 +122,50 @@ bool diag_frame_marker_requested()
     return true;
 }
 
-// P2-01B: legacy-loop gate hook for the diagnostic cadence lock.
-// The frame-loop mode is a compile-time fact in this commit -- the
-// legacy after-render loop is the only loop that exists -- and the
-// lock is a legacy-loop diagnostic by contract. When P2-02
-// introduces the runtime-paced loop, this helper is where a
-// loop-mode selector plugs in: the lock engages only in legacy
-// mode, and the new loop's entry points never call
-// diagPaceFrameStart() at all (its xrWaitFrame IS the pacing).
+// P2-02: FS_OPENXR_P2_FRAME_LOOP gate reader. The paced loop is
+// opt-in in this commit -- explicit true only; unset, empty, false
+// or unparseable all keep the legacy loop (P2-03 flips the
+// default). Launch-time configuration, read on each call like the
+// other FS_OPENXR_* readers.
+bool xr_paced_frame_loop_requested()
+{
+    std::string value = LLStringUtil::getenv(OPENXR_P2_FRAME_LOOP_ENV);
+    if (value.empty())
+    {
+        return false;
+    }
+
+    bool result = false;
+    if (LLStringUtil::convertToBOOL(value, result))
+    {
+        return result;
+    }
+
+    return false;
+}
+
+// P2-01B: legacy-loop gate hook for the diagnostic cadence lock,
+// updated for P2-02: the lock engages only when the paced loop is
+// NOT selected -- the paced loop is paced by its own xrWaitFrame,
+// and the lock is a legacy-loop diagnostic by contract.
 bool xr_diag_frame_loop_is_legacy()
 {
-    return true;
+    // Aligned with isPacedFrameLoopSelected(): the paced loop runs
+    // only when the gate is on AND mono XR is requested; in every
+    // other case the legacy loop is what actually runs and the
+    // cadence lock may engage.
+    return !LLOpenXRManager::instance().isPacedFrameLoopSelected();
 }
 }
 
 /*static*/ bool LLOpenXRManager::coherentOpticsEnabled()
 {
     return xr_coherent_optics_enabled();
+}
+
+/*static*/ bool LLOpenXRManager::pacedFrameLoopEnabled()
+{
+    return xr_paced_frame_loop_requested();
 }
 
 /*static*/ F32 LLOpenXRManager::diagFixedCadenceHz()
@@ -697,6 +725,51 @@ struct LLOpenXRManagerImpl
     unsigned long long locate_generation = 0;
     // Generation of the locate that produced latest_hmd_forward/up.
     unsigned long long latest_pose_generation = 0;
+    // P2-02: the manager-owned frame context of the runtime-paced
+    // loop (FS_OPENXR_P2_FRAME_LOOP=1). One main-loop iteration's XR
+    // frame lives here from beginPacedFrame() (session events,
+    // xrWaitFrame, xrLocateViews, snapshot publish -- all before
+    // idle()) through xrBeginFrame (after idle) to the submit on
+    // the render path or the main-loop fallback close. It replaces
+    // the trace stash as the functional owner of frame identity on
+    // the paced path: token, frame state, located views and their
+    // generation, lifecycle flags, and the stage timestamps the
+    // xr_submit record is built from. The legacy loop never
+    // touches it.
+    struct XRFrameContext
+    {
+        bool active = false;
+        unsigned long long token = 0;
+        XrFrameState frame_state{};
+        XrViewState view_state{};
+        std::vector<XrView> located_views;
+        uint32_t located_view_count = 0;
+        bool locate_attempted = false;
+        unsigned long long located_generation = 0;
+        bool wait_succeeded = false;
+        bool begin_attempted = false;
+        bool begun = false;
+        bool ended = false;
+        bool views_valid = false;
+        // Zero-layer end owed at begin time (shouldRender=false,
+        // locate_failed, invalid_view_state); empty when the frame
+        // is a normal render frame.
+        std::string pending_end_status;
+        // xr_submit trace scalars (LLOpenXRTrace::nowUs() domain).
+        bool tracing = false;
+        long long t_entry = 0;
+        long long t_wait_start = 0;
+        long long t_wait_end = 0;
+        long long t_begin_start = 0;
+        long long t_begin_end = 0;
+        long long t_locate_start = 0;
+        long long t_locate_end = 0;
+        int wait_result = 0;
+        int begin_result = 0;
+        int locate_result = 0;
+        int session_state = 0;
+    };
+    XRFrameContext paced_frame;
     // P2-01: the head path's most recent consumption of the pose
     // (stamped by getHmdForward): which generation it used, and the
     // app_frame_token of the iteration that used it.
@@ -1326,7 +1399,9 @@ void LLOpenXRManager::processEvents()
                             hz_stream << diag_cadence_hz;
                             trace_extra_fields = "\"diag_cadence_target_hz\":" + hz_stream.str();
                         }
-                        const unsigned int trace_run = LLOpenXRTrace::beginRun("legacy_mono", trace_extra_fields);
+                        const unsigned int trace_run = LLOpenXRTrace::beginRun(
+                            LLOpenXRManager::pacedFrameLoopEnabled() ? "paced_pre_idle_mono" : "legacy_mono",
+                            trace_extra_fields);
                         openxr_info("OpenXR trace run " + std::to_string(trace_run) +
                                     " -> " + LLOpenXRTrace::traceFilePath());
                     }
@@ -1646,7 +1721,15 @@ struct XrSubmitTrace
         // time; t_display_return_us lives on the app_frame record,
         // which is written after display() returns).
         f << ",\"frame_outcome\":\"" << status << "\"";
-        f << ",\"frame_loop_mode\":\"legacy_after_render\"";
+        {
+            LLOpenXRTrace::AppFrameContext mode_ctx;
+            std::string loop_mode = "legacy_after_render";
+            if (LLOpenXRTrace::peekAppFrameContext(mode_ctx) && !mode_ctx.frame_loop_mode.empty())
+            {
+                loop_mode = mode_ctx.frame_loop_mode;
+            }
+            f << ",\"frame_loop_mode\":\"" << loop_mode << "\"";
+        }
         {
             LLOpenXRTrace::AppFrameContext app_ctx;
             if (LLOpenXRTrace::peekAppFrameContext(app_ctx))
@@ -1987,10 +2070,276 @@ struct XrSubmitTrace
         finish(status);
     }
 };
+
+// P2-02: adopt one located view set as the manager's current pose /
+// FOV sample -- generation mint on the one locate counter, FOV
+// caches + provenance sample, head forward/up. Extracted verbatim
+// from submitFrameMono's legacy adoption block so the paced loop's
+// pre-idle locate adopts identically to the legacy loop's
+// after-render one. Callers have already applied the P0-06 validity
+// gates. Returns the minted locate generation (0 when no view was
+// usable).
+unsigned long long adopt_located_views(LLOpenXRManagerImpl& impl,
+                                       const std::vector<XrView>& views,
+                                       uint32_t usable_view_count)
+{
+    unsigned long long this_locate_generation = 0;
+    if (usable_view_count > 0)
+    {
+        const XrFovf& left_eye_fov = views[0].fov;
+
+        // The locate passed the validity gates and its views are
+        // adopted as the manager's current pose/FOV sample -- mint
+        // its generation on the one counter.
+        this_locate_generation = ++impl.locate_generation;
+        const F32 vertical_fov = left_eye_fov.angleUp - left_eye_fov.angleDown;
+        if (std::isfinite(vertical_fov) && vertical_fov > 0.f)
+        {
+            impl.latest_left_eye_vertical_fov = vertical_fov;
+            impl.has_left_eye_vertical_fov = true;
+        }
+        else
+        {
+            impl.has_left_eye_vertical_fov = false;
+        }
+
+        const F32 horizontal_extent = tanf(left_eye_fov.angleRight) + tanf(-left_eye_fov.angleLeft);
+        const F32 vertical_extent = tanf(left_eye_fov.angleUp) + tanf(-left_eye_fov.angleDown);
+        const F32 aspect = horizontal_extent / llmax(vertical_extent, 0.00001f);
+        if (std::isfinite(aspect) && aspect > 0.f)
+        {
+            impl.latest_left_eye_aspect = aspect;
+            impl.has_left_eye_aspect = true;
+        }
+        else
+        {
+            impl.has_left_eye_aspect = false;
+        }
+
+        // Cache the full located left-eye FOV as a provenance
+        // sample. Only a locate that passed the P0-06 validity gate
+        // and yields finite angles with positive extent counts as a
+        // valid replacement (locate_generation increments); anything
+        // else invalidates the sample. Never synthetic.
+        const bool fov_angles_finite =
+            std::isfinite(left_eye_fov.angleLeft) && std::isfinite(left_eye_fov.angleRight) &&
+            std::isfinite(left_eye_fov.angleDown) && std::isfinite(left_eye_fov.angleUp);
+        if (fov_angles_finite && std::isfinite(vertical_fov) && vertical_fov > 0.f &&
+            (left_eye_fov.angleRight - left_eye_fov.angleLeft) > 0.f)
+        {
+            LLXRLeftEyeFovSample sample;
+            sample.left = left_eye_fov.angleLeft;
+            sample.right = left_eye_fov.angleRight;
+            sample.down = left_eye_fov.angleDown;
+            sample.up = left_eye_fov.angleUp;
+            sample.locate_generation = this_locate_generation;
+            sample.located_monotonic_us = LLOpenXRTrace::nowUs();
+            sample.valid = true;
+            impl.left_eye_fov_sample = sample;
+        }
+        else
+        {
+            impl.left_eye_fov_sample.valid = false;
+        }
+    }
+    else
+    {
+        impl.has_left_eye_vertical_fov = false;
+        impl.has_left_eye_aspect = false;
+        impl.left_eye_fov_sample.valid = false;
+    }
+
+    LLVector3 accumulated_forward;
+    LLVector3 accumulated_up;
+    for (uint32_t i = 0; i < usable_view_count; ++i)
+    {
+        accumulated_forward += xr_forward_from_orientation(views[i].pose.orientation);
+        accumulated_up += xr_up_from_orientation(views[i].pose.orientation);
+    }
+
+    if (usable_view_count > 0 && accumulated_forward.normalize() > 0.f)
+    {
+        impl.latest_hmd_forward = accumulated_forward;
+        impl.has_hmd_forward = true;
+        impl.latest_pose_generation = this_locate_generation;
+    }
+    else
+    {
+        impl.has_hmd_forward = false;
+    }
+
+    if (usable_view_count > 0 && accumulated_up.normalize() > 0.f)
+    {
+        impl.latest_hmd_up = accumulated_up;
+        impl.has_hmd_up = true;
+    }
+    else
+    {
+        impl.has_hmd_up = false;
+    }
+
+    return this_locate_generation;
+}
+
+// P2-02: build the xr_submit trace collector for a paced frame from
+// its XRFrameContext (used by the zero-layer ends and the begin /
+// wait failure records; the paced submit path itself fills its
+// collector inline so the render provenance taken at its entry is
+// preserved). The head generation counts only when the head
+// consumed the pose during the context's own iteration (token
+// match), exactly as on the legacy path.
+XrSubmitTrace make_paced_trace(const LLOpenXRManagerImpl& impl,
+                               const LLOpenXRManagerImpl::XRFrameContext& frame_ctx)
+{
+    XrSubmitTrace tr;
+    tr.tracing = frame_ctx.tracing;
+    tr.t_entry = frame_ctx.t_entry;
+    tr.t_wait_start = frame_ctx.t_wait_start;
+    tr.t_wait_end = frame_ctx.t_wait_end;
+    tr.t_begin_start = frame_ctx.t_begin_start;
+    tr.t_begin_end = frame_ctx.t_begin_end;
+    tr.t_locate_start = frame_ctx.t_locate_start;
+    tr.t_locate_end = frame_ctx.t_locate_end;
+    tr.wait_result = frame_ctx.wait_result;
+    tr.begin_result = frame_ctx.begin_result;
+    tr.locate_result = frame_ctx.locate_result;
+    tr.predicted_display_time = (long long)frame_ctx.frame_state.predictedDisplayTime;
+    tr.predicted_display_period = (long long)frame_ctx.frame_state.predictedDisplayPeriod;
+    tr.should_render = frame_ctx.frame_state.shouldRender;
+    // Only claim a locate display time when a locate was actually
+    // attempted for this frame (never on shouldRender=false or
+    // wait_failed records).
+    tr.has_locate_display_time = frame_ctx.locate_attempted;
+    tr.locate_display_time = (long long)frame_ctx.frame_state.predictedDisplayTime;
+    tr.located_view_count = frame_ctx.located_view_count;
+    tr.view_state_flags = (unsigned long long)frame_ctx.view_state.viewStateFlags;
+    tr.has_session_state = true;
+    tr.session_state = frame_ctx.session_state;
+    tr.has_pose_sample_valid = true;
+    tr.pose_sample_valid = impl.left_eye_fov_sample.valid;
+    tr.optics_coherent = LLOpenXRManager::coherentOpticsEnabled();
+    if (frame_ctx.located_generation > 0)
+    {
+        tr.has_located_generation = true;
+        tr.located_generation = frame_ctx.located_generation;
+    }
+    if (frame_ctx.token != 0 && impl.head_consumed_app_frame_token == frame_ctx.token)
+    {
+        tr.has_head_generation = true;
+        tr.head_generation = impl.head_consumed_pose_generation;
+    }
+    if (impl.left_eye_fov_sample.valid)
+    {
+        tr.has_latest_located = true;
+        tr.latest_located_fov_rad[0] = impl.left_eye_fov_sample.left;
+        tr.latest_located_fov_rad[1] = impl.left_eye_fov_sample.right;
+        tr.latest_located_fov_rad[2] = impl.left_eye_fov_sample.down;
+        tr.latest_located_fov_rad[3] = impl.left_eye_fov_sample.up;
+    }
+    const uint32_t usable_view_count = std::min<uint32_t>(frame_ctx.located_view_count,
+                                                          (uint32_t)frame_ctx.located_views.size());
+    for (uint32_t i = 0; i < usable_view_count && i < 2; ++i)
+    {
+        tr.has_eye[i] = true;
+        tr.eye_pos[i][0] = frame_ctx.located_views[i].pose.position.x;
+        tr.eye_pos[i][1] = frame_ctx.located_views[i].pose.position.y;
+        tr.eye_pos[i][2] = frame_ctx.located_views[i].pose.position.z;
+        tr.eye_quat[i][0] = frame_ctx.located_views[i].pose.orientation.x;
+        tr.eye_quat[i][1] = frame_ctx.located_views[i].pose.orientation.y;
+        tr.eye_quat[i][2] = frame_ctx.located_views[i].pose.orientation.z;
+        tr.eye_quat[i][3] = frame_ctx.located_views[i].pose.orientation.w;
+        tr.eye_fov[i][0] = frame_ctx.located_views[i].fov.angleLeft;
+        tr.eye_fov[i][1] = frame_ctx.located_views[i].fov.angleRight;
+        tr.eye_fov[i][2] = frame_ctx.located_views[i].fov.angleDown;
+        tr.eye_fov[i][3] = frame_ctx.located_views[i].fov.angleUp;
+    }
+    return tr;
+}
 } // namespace
 #endif // LL_LINUX && LL_X11
 
+bool LLOpenXRManager::ensureInitializedForFrame()
+{
+    if (mDisabled)
+    {
+        return false;
+    }
+
+    if (!mInitializeAttempted)
+    {
+        mInitializeAttempted = true;
+        if (!initialize())
+        {
+#if LL_LINUX && LL_X11
+            if (isMonoRequested())
+            {
+                openxr_warn("OpenXR initialize() returned false; VR submit disabled.");
+            }
+            else
+            {
+                write_openxr_file_log("INFO", std::string(OPENXR_MONO_ENV) + " not enabled; OpenXR path skipped.");
+            }
+#endif
+            return false;
+        }
+    }
+
+#if LL_LINUX && LL_X11
+    return mImpl && mImpl->session != XR_NULL_HANDLE;
+#else
+    return false;
+#endif
+}
+
 void LLOpenXRManager::submitFrameMono(const LLRect& source_rect)
+{
+    submitFrameMonoImpl(source_rect, false);
+}
+
+void LLOpenXRManager::submitPacedFrameMono(const LLRect& source_rect)
+{
+#if LL_LINUX && LL_X11
+    if (!isPacedFrameLoopSelected() || !mImpl)
+    {
+        return;
+    }
+    const LLOpenXRManagerImpl::XRFrameContext& frame_ctx = mImpl->paced_frame;
+    if (!frame_ctx.active || !frame_ctx.wait_succeeded)
+    {
+        return;
+    }
+    if (!frame_ctx.begun || frame_ctx.ended)
+    {
+        // The frame must already be begun: beginPacedFrameAfterIdle()
+        // runs between idle() and display() (contract order). A frame
+        // reaching the submit unbegun -- or already ended by its
+        // pending zero-layer resolution -- is never submitted here;
+        // the main-loop fallback closes an unbegun one with zero
+        // layers after display().
+        return;
+    }
+    submitFrameMonoImpl(source_rect, true);
+    // The impl ends the frame on every exit path and marks the
+    // context ended; if anything ever leaves it open, close it here
+    // with zero layers rather than leaking an open frame into the
+    // next iteration's wait.
+    if (mImpl && mImpl->paced_frame.active)
+    {
+        if (mImpl->paced_frame.begun && !mImpl->paced_frame.ended)
+        {
+            closePacedFrameIfOpen("fallback_zero_layer");
+        }
+        if (mImpl && mImpl->paced_frame.active)
+        {
+            mImpl->paced_frame = LLOpenXRManagerImpl::XRFrameContext();
+        }
+    }
+#else
+    (void)source_rect;
+#endif
+}
+
+void LLOpenXRManager::submitFrameMonoImpl(const LLRect& source_rect, bool paced)
 {
 #if LL_LINUX && LL_X11
     LLOpenXRTrace::flushIfDue();
@@ -2061,26 +2410,18 @@ void LLOpenXRManager::submitFrameMono(const LLRect& source_rect)
     }
 #endif
 
-    if (mDisabled)
+    if (!paced)
     {
-        return;
-    }
-
-    if (!mInitializeAttempted)
-    {
-        mInitializeAttempted = true;
-        if (!initialize())
+        // Legacy loop: this call owns initialization and session
+        // events. The paced loop did both in beginPacedFrame()
+        // before idle(); its submit only consumes the frame context.
+        if (mDisabled)
         {
-#if LL_LINUX && LL_X11
-            if (isMonoRequested())
-            {
-                openxr_warn("OpenXR initialize() returned false; VR submit disabled.");
-            }
-            else
-            {
-                write_openxr_file_log("INFO", std::string(OPENXR_MONO_ENV) + " not enabled; OpenXR path skipped.");
-            }
-#endif
+            return;
+        }
+
+        if (!ensureInitializedForFrame())
+        {
             return;
         }
     }
@@ -2091,7 +2432,10 @@ void LLOpenXRManager::submitFrameMono(const LLRect& source_rect)
         return;
     }
 
-    processEvents();
+    if (!paced)
+    {
+        processEvents();
+    }
     // P2-01: iteration context for this call's record. The head
     // generation counts only when the head consumed the pose during
     // THIS main-loop iteration (token match); a stale stamp from an
@@ -2117,292 +2461,328 @@ void LLOpenXRManager::submitFrameMono(const LLRect& source_rect)
         mImpl->submit_ready_logged = true;
     }
 
-    XrFrameWaitInfo frame_wait_info{};
-    frame_wait_info.type = XR_TYPE_FRAME_WAIT_INFO;
-
+    // P2-02: frame state shared by the two loop modes. The legacy
+    // branch below runs wait/begin/locate itself (the Phase 0/1
+    // order: after the render); the paced branch transfers the
+    // XRFrameContext that beginPacedFrame() waited on and located
+    // before idle(). frame_views names the located views the
+    // submission is built from in either mode.
     XrFrameState frame_state{};
     frame_state.type = XR_TYPE_FRAME_STATE;
-
-    if (xr_trace.tracing)
-    {
-        xr_trace.t_wait_start = LLOpenXRTrace::nowUs();
-    }
-    XrResult result = xrWaitFrame(mImpl->session, &frame_wait_info, &frame_state);
-    xr_trace.wait_result = (int)result;
-    xr_trace.predicted_display_time = (long long)frame_state.predictedDisplayTime;
-    xr_trace.predicted_display_period = (long long)frame_state.predictedDisplayPeriod;
-    xr_trace.should_render = frame_state.shouldRender;
-    if (xr_trace.tracing)
-    {
-        xr_trace.t_wait_end = LLOpenXRTrace::nowUs();
-    }
-    if (XR_FAILED(result))
-    {
-        openxr_warn("xrWaitFrame failed: " + format_xr_result(mImpl->instance, result));
-        xr_trace.finish("wait_failed");
-        return;
-    }
-
-    XrFrameBeginInfo frame_begin_info{};
-    frame_begin_info.type = XR_TYPE_FRAME_BEGIN_INFO;
-    if (xr_trace.tracing)
-    {
-        xr_trace.t_begin_start = LLOpenXRTrace::nowUs();
-    }
-    result = xrBeginFrame(mImpl->session, &frame_begin_info);
-    xr_trace.begin_result = (int)result;
-    if (xr_trace.tracing)
-    {
-        xr_trace.t_begin_end = LLOpenXRTrace::nowUs();
-    }
-    if (XR_FAILED(result))
-    {
-        openxr_warn("xrBeginFrame failed: " + format_xr_result(mImpl->instance, result));
-        xr_trace.finish("begin_failed");
-        return;
-    }
-
-    if (!frame_state.shouldRender)
-    {
-        XrFrameEndInfo frame_end_info{};
-        frame_end_info.type = XR_TYPE_FRAME_END_INFO;
-        frame_end_info.displayTime = frame_state.predictedDisplayTime;
-        frame_end_info.environmentBlendMode = mImpl->blend_mode;
-        frame_end_info.layerCount = 0;
-        frame_end_info.layers = nullptr;
-        xr_trace.captureEndFrame(frame_end_info, nullptr, nullptr, 0);
-        xr_trace.end_result = (int)xrEndFrame(mImpl->session, &frame_end_info);
-        xr_trace.layer_count = 0;
-        if (xr_trace.tracing)
-        {
-            xr_trace.t_end_end = LLOpenXRTrace::nowUs();
-        }
-        xr_trace.finish("skipped_should_render");
-        return;
-    }
-
-    XrViewLocateInfo view_locate_info{};
-    view_locate_info.type = XR_TYPE_VIEW_LOCATE_INFO;
-    view_locate_info.viewConfigurationType = XR_VIEW_CONFIG;
-    view_locate_info.displayTime = frame_state.predictedDisplayTime;
-    view_locate_info.space = mImpl->app_space;
-
     XrViewState view_state{};
     view_state.type = XR_TYPE_VIEW_STATE;
-
-    if (xr_trace.tracing)
-    {
-        xr_trace.t_locate_start = LLOpenXRTrace::nowUs();
-    }
-    xr_trace.has_locate_display_time = true;
-    xr_trace.locate_display_time = (long long)view_locate_info.displayTime;
     uint32_t located_view_count = 0;
-    result = xrLocateViews(
-        mImpl->session,
-        &view_locate_info,
-        &view_state,
-        (uint32_t)mImpl->views.size(),
-        &located_view_count,
-        mImpl->views.data());
-    xr_trace.locate_result = (int)result;
-    xr_trace.located_view_count = located_view_count;
-    xr_trace.view_state_flags = (unsigned long long)view_state.viewStateFlags;
-    if (xr_trace.tracing)
+    unsigned long long this_locate_generation = 0;
+    XrResult result = XR_SUCCESS;
+    const std::vector<XrView>* frame_views = &mImpl->views;
+
+    if (!paced)
     {
-        xr_trace.t_locate_end = LLOpenXRTrace::nowUs();
-    }
-    if (XR_FAILED(result) || located_view_count < 2)
-    {
-        openxr_warn("xrLocateViews failed: " + format_xr_result(mImpl->instance, result));
-        mImpl->has_hmd_forward = false;
-        mImpl->has_hmd_up = false;
-        mImpl->has_left_eye_vertical_fov = false;
-        mImpl->has_left_eye_aspect = false;
-        mImpl->left_eye_fov_sample.valid = false;
-        xr_trace.pose_sample_valid = false;
-        XrFrameEndInfo frame_end_info{};
-        frame_end_info.type = XR_TYPE_FRAME_END_INFO;
-        frame_end_info.displayTime = frame_state.predictedDisplayTime;
-        frame_end_info.environmentBlendMode = mImpl->blend_mode;
-        frame_end_info.layerCount = 0;
-        frame_end_info.layers = nullptr;
-        // P2-01: finish() moves after this zero-layer end so the
-        // record carries the submitted state and the end timestamps
-        // (trace-only reorder; the end call itself is unchanged).
-        xr_trace.captureEndFrame(frame_end_info, nullptr, nullptr, 0);
-        xr_trace.end_result = (int)xrEndFrame(mImpl->session, &frame_end_info);
+        XrFrameWaitInfo frame_wait_info{};
+        frame_wait_info.type = XR_TYPE_FRAME_WAIT_INFO;
+
+        // frame_state is declared above the loop-mode branch.
+
         if (xr_trace.tracing)
         {
-            xr_trace.t_end_end = LLOpenXRTrace::nowUs();
+            xr_trace.t_wait_start = LLOpenXRTrace::nowUs();
         }
-        xr_trace.finish("locate_failed");
-        return;
-    }
-
-    // P0-06/V2: respect the located view state's validity flags. An
-    // invalid pose must drive neither the avatar head nor a submitted
-    // view; end the frame with no layers instead. Nothing here
-    // recalibrates or reuses a stale pose.
-    const bool orientation_valid =
-        (view_state.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) != 0;
-    const bool position_valid = (view_state.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) != 0;
-    if (!orientation_valid || !position_valid)
-    {
-        if (!orientation_valid)
+        result = xrWaitFrame(mImpl->session, &frame_wait_info, &frame_state);
+        xr_trace.wait_result = (int)result;
+        xr_trace.predicted_display_time = (long long)frame_state.predictedDisplayTime;
+        xr_trace.predicted_display_period = (long long)frame_state.predictedDisplayPeriod;
+        xr_trace.should_render = frame_state.shouldRender;
+        if (xr_trace.tracing)
         {
+            xr_trace.t_wait_end = LLOpenXRTrace::nowUs();
+        }
+        if (XR_FAILED(result))
+        {
+            openxr_warn("xrWaitFrame failed: " + format_xr_result(mImpl->instance, result));
+            xr_trace.finish("wait_failed");
+            return;
+        }
+
+        XrFrameBeginInfo frame_begin_info{};
+        frame_begin_info.type = XR_TYPE_FRAME_BEGIN_INFO;
+        if (xr_trace.tracing)
+        {
+            xr_trace.t_begin_start = LLOpenXRTrace::nowUs();
+        }
+        result = xrBeginFrame(mImpl->session, &frame_begin_info);
+        xr_trace.begin_result = (int)result;
+        if (xr_trace.tracing)
+        {
+            xr_trace.t_begin_end = LLOpenXRTrace::nowUs();
+        }
+        if (XR_FAILED(result))
+        {
+            openxr_warn("xrBeginFrame failed: " + format_xr_result(mImpl->instance, result));
+            xr_trace.finish("begin_failed");
+            return;
+        }
+
+        if (!frame_state.shouldRender)
+        {
+            XrFrameEndInfo frame_end_info{};
+            frame_end_info.type = XR_TYPE_FRAME_END_INFO;
+            frame_end_info.displayTime = frame_state.predictedDisplayTime;
+            frame_end_info.environmentBlendMode = mImpl->blend_mode;
+            frame_end_info.layerCount = 0;
+            frame_end_info.layers = nullptr;
+            xr_trace.captureEndFrame(frame_end_info, nullptr, nullptr, 0);
+            xr_trace.end_result = (int)xrEndFrame(mImpl->session, &frame_end_info);
+            xr_trace.layer_count = 0;
+            if (xr_trace.tracing)
+            {
+                xr_trace.t_end_end = LLOpenXRTrace::nowUs();
+            }
+            xr_trace.finish("skipped_should_render");
+            return;
+        }
+
+        XrViewLocateInfo view_locate_info{};
+        view_locate_info.type = XR_TYPE_VIEW_LOCATE_INFO;
+        view_locate_info.viewConfigurationType = XR_VIEW_CONFIG;
+        view_locate_info.displayTime = frame_state.predictedDisplayTime;
+        view_locate_info.space = mImpl->app_space;
+
+        // view_state is declared above the loop-mode branch.
+
+        if (xr_trace.tracing)
+        {
+            xr_trace.t_locate_start = LLOpenXRTrace::nowUs();
+        }
+        xr_trace.has_locate_display_time = true;
+        xr_trace.locate_display_time = (long long)view_locate_info.displayTime;
+        result = xrLocateViews(
+            mImpl->session,
+            &view_locate_info,
+            &view_state,
+            (uint32_t)mImpl->views.size(),
+            &located_view_count,
+            mImpl->views.data());
+        xr_trace.locate_result = (int)result;
+        xr_trace.located_view_count = located_view_count;
+        xr_trace.view_state_flags = (unsigned long long)view_state.viewStateFlags;
+        if (xr_trace.tracing)
+        {
+            xr_trace.t_locate_end = LLOpenXRTrace::nowUs();
+        }
+        if (XR_FAILED(result) || located_view_count < 2)
+        {
+            openxr_warn("xrLocateViews failed: " + format_xr_result(mImpl->instance, result));
             mImpl->has_hmd_forward = false;
             mImpl->has_hmd_up = false;
-        }
-        mImpl->has_left_eye_vertical_fov = false;
-        mImpl->has_left_eye_aspect = false;
-        XrFrameEndInfo frame_end_info{};
-        frame_end_info.type = XR_TYPE_FRAME_END_INFO;
-        frame_end_info.displayTime = frame_state.predictedDisplayTime;
-        frame_end_info.environmentBlendMode = mImpl->blend_mode;
-        frame_end_info.layerCount = 0;
-        frame_end_info.layers = nullptr;
-        xr_trace.captureEndFrame(frame_end_info, nullptr, nullptr, 0);
-        xr_trace.end_result = (int)xrEndFrame(mImpl->session, &frame_end_info);
-        if (xr_trace.tracing)
-        {
-            xr_trace.t_end_end = LLOpenXRTrace::nowUs();
-        }
-        mImpl->left_eye_fov_sample.valid = false;
-        xr_trace.pose_sample_valid = false;
-        xr_trace.finish("invalid_view_state");
-        return;
-    }
-
-    const uint32_t usable_view_count = std::min<uint32_t>(located_view_count, (uint32_t)mImpl->views.size());
-    // P2-01: the generation this call's locate mints once its views
-    // are adopted below (function scope: the submitted-layer
-    // generation fields at the final xrEndFrame derive from it).
-    unsigned long long this_locate_generation = 0;
-    if (usable_view_count > 0)
-    {
-        const XrFovf& left_eye_fov = mImpl->views[0].fov;
-
-        // P2-01: the locate passed the validity gates and its views
-        // are adopted as the manager's current pose/FOV sample --
-        // mint its generation on the one counter.
-        this_locate_generation = ++mImpl->locate_generation;
-        xr_trace.has_located_generation = true;
-        xr_trace.located_generation = this_locate_generation;
-        const F32 vertical_fov = left_eye_fov.angleUp - left_eye_fov.angleDown;
-        if (std::isfinite(vertical_fov) && vertical_fov > 0.f)
-        {
-            mImpl->latest_left_eye_vertical_fov = vertical_fov;
-            mImpl->has_left_eye_vertical_fov = true;
-        }
-        else
-        {
             mImpl->has_left_eye_vertical_fov = false;
-        }
-
-        const F32 horizontal_extent = tanf(left_eye_fov.angleRight) + tanf(-left_eye_fov.angleLeft);
-        const F32 vertical_extent = tanf(left_eye_fov.angleUp) + tanf(-left_eye_fov.angleDown);
-        const F32 aspect = horizontal_extent / llmax(vertical_extent, 0.00001f);
-        if (std::isfinite(aspect) && aspect > 0.f)
-        {
-            mImpl->latest_left_eye_aspect = aspect;
-            mImpl->has_left_eye_aspect = true;
-        }
-        else
-        {
             mImpl->has_left_eye_aspect = false;
-        }
-
-        // P1-01: cache the full located left-eye FOV as a provenance
-        // sample. Only a locate that passed the P0-06 validity gate
-        // and yields finite angles with positive extent counts as a
-        // valid replacement (locate_generation increments); anything
-        // else invalidates the sample. Never synthetic.
-        const bool fov_angles_finite =
-            std::isfinite(left_eye_fov.angleLeft) && std::isfinite(left_eye_fov.angleRight) &&
-            std::isfinite(left_eye_fov.angleDown) && std::isfinite(left_eye_fov.angleUp);
-        if (fov_angles_finite && std::isfinite(vertical_fov) && vertical_fov > 0.f &&
-            (left_eye_fov.angleRight - left_eye_fov.angleLeft) > 0.f)
-        {
-            LLXRLeftEyeFovSample sample;
-            sample.left = left_eye_fov.angleLeft;
-            sample.right = left_eye_fov.angleRight;
-            sample.down = left_eye_fov.angleDown;
-            sample.up = left_eye_fov.angleUp;
-            sample.locate_generation = this_locate_generation;
-            sample.located_monotonic_us = LLOpenXRTrace::nowUs();
-            sample.valid = true;
-            mImpl->left_eye_fov_sample = sample;
-        }
-        else
-        {
             mImpl->left_eye_fov_sample.valid = false;
+            xr_trace.pose_sample_valid = false;
+            XrFrameEndInfo frame_end_info{};
+            frame_end_info.type = XR_TYPE_FRAME_END_INFO;
+            frame_end_info.displayTime = frame_state.predictedDisplayTime;
+            frame_end_info.environmentBlendMode = mImpl->blend_mode;
+            frame_end_info.layerCount = 0;
+            frame_end_info.layers = nullptr;
+            // P2-01: finish() moves after this zero-layer end so the
+            // record carries the submitted state and the end timestamps
+            // (trace-only reorder; the end call itself is unchanged).
+            xr_trace.captureEndFrame(frame_end_info, nullptr, nullptr, 0);
+            xr_trace.end_result = (int)xrEndFrame(mImpl->session, &frame_end_info);
+            if (xr_trace.tracing)
+            {
+                xr_trace.t_end_end = LLOpenXRTrace::nowUs();
+            }
+            xr_trace.finish("locate_failed");
+            return;
+        }
+
+        // P0-06/V2: respect the located view state's validity flags. An
+        // invalid pose must drive neither the avatar head nor a submitted
+        // view; end the frame with no layers instead. Nothing here
+        // recalibrates or reuses a stale pose.
+        const bool orientation_valid =
+            (view_state.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) != 0;
+        const bool position_valid = (view_state.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) != 0;
+        if (!orientation_valid || !position_valid)
+        {
+            if (!orientation_valid)
+            {
+                mImpl->has_hmd_forward = false;
+                mImpl->has_hmd_up = false;
+            }
+            mImpl->has_left_eye_vertical_fov = false;
+            mImpl->has_left_eye_aspect = false;
+            XrFrameEndInfo frame_end_info{};
+            frame_end_info.type = XR_TYPE_FRAME_END_INFO;
+            frame_end_info.displayTime = frame_state.predictedDisplayTime;
+            frame_end_info.environmentBlendMode = mImpl->blend_mode;
+            frame_end_info.layerCount = 0;
+            frame_end_info.layers = nullptr;
+            xr_trace.captureEndFrame(frame_end_info, nullptr, nullptr, 0);
+            xr_trace.end_result = (int)xrEndFrame(mImpl->session, &frame_end_info);
+            if (xr_trace.tracing)
+            {
+                xr_trace.t_end_end = LLOpenXRTrace::nowUs();
+            }
+            mImpl->left_eye_fov_sample.valid = false;
+            xr_trace.pose_sample_valid = false;
+            xr_trace.finish("invalid_view_state");
+            return;
+        }
+
+        const uint32_t usable_view_count = std::min<uint32_t>(located_view_count, (uint32_t)mImpl->views.size());
+        // P2-01: the generation this call's locate mints once its views
+        // are adopted below (this_locate_generation is declared above
+        // the loop-mode branch at function scope: the submitted-layer
+        // generation fields at the final xrEndFrame derive from it).
+        // P2-02: adoption (generation mint, FOV caches + sample, head
+        // forward/up) lives in adopt_located_views() so the paced
+        // loop's pre-idle locate adopts identically to this one.
+        this_locate_generation = adopt_located_views(*mImpl, mImpl->views, usable_view_count);
+        if (this_locate_generation > 0)
+        {
+            xr_trace.has_located_generation = true;
+            xr_trace.located_generation = this_locate_generation;
+        }
+
+        // P2-01: mirror the sample's post-locate validity for the record.
+        xr_trace.pose_sample_valid = mImpl->left_eye_fov_sample.valid;
+        xr_trace.has_pose_sample_valid = true;
+
+        // P1-01: the manager's latest located left-eye sample, for the
+        // xr_submit record's render-vs-latest-located comparison.
+        if (mImpl->left_eye_fov_sample.valid)
+        {
+            xr_trace.has_latest_located = true;
+            xr_trace.latest_located_fov_rad[0] = mImpl->left_eye_fov_sample.left;
+            xr_trace.latest_located_fov_rad[1] = mImpl->left_eye_fov_sample.right;
+            xr_trace.latest_located_fov_rad[2] = mImpl->left_eye_fov_sample.down;
+            xr_trace.latest_located_fov_rad[3] = mImpl->left_eye_fov_sample.up;
+        }
+
+        for (uint32_t i = 0; i < usable_view_count && i < 2; ++i)
+        {
+            xr_trace.has_eye[i] = true;
+            xr_trace.eye_pos[i][0] = mImpl->views[i].pose.position.x;
+            xr_trace.eye_pos[i][1] = mImpl->views[i].pose.position.y;
+            xr_trace.eye_pos[i][2] = mImpl->views[i].pose.position.z;
+            xr_trace.eye_quat[i][0] = mImpl->views[i].pose.orientation.x;
+            xr_trace.eye_quat[i][1] = mImpl->views[i].pose.orientation.y;
+            xr_trace.eye_quat[i][2] = mImpl->views[i].pose.orientation.z;
+            xr_trace.eye_quat[i][3] = mImpl->views[i].pose.orientation.w;
+            xr_trace.eye_fov[i][0] = mImpl->views[i].fov.angleLeft;
+            xr_trace.eye_fov[i][1] = mImpl->views[i].fov.angleRight;
+            xr_trace.eye_fov[i][2] = mImpl->views[i].fov.angleDown;
+            xr_trace.eye_fov[i][3] = mImpl->views[i].fov.angleUp;
         }
     }
     else
     {
-        mImpl->has_left_eye_vertical_fov = false;
-        mImpl->has_left_eye_aspect = false;
-        mImpl->left_eye_fov_sample.valid = false;
-    }
-
-    // P2-01: mirror the sample's post-locate validity for the record.
-    xr_trace.pose_sample_valid = mImpl->left_eye_fov_sample.valid;
-    xr_trace.has_pose_sample_valid = true;
-
-    // P1-01: the manager's latest located left-eye sample, for the
-    // xr_submit record's render-vs-latest-located comparison.
-    if (mImpl->left_eye_fov_sample.valid)
-    {
-        xr_trace.has_latest_located = true;
-        xr_trace.latest_located_fov_rad[0] = mImpl->left_eye_fov_sample.left;
-        xr_trace.latest_located_fov_rad[1] = mImpl->left_eye_fov_sample.right;
-        xr_trace.latest_located_fov_rad[2] = mImpl->left_eye_fov_sample.down;
-        xr_trace.latest_located_fov_rad[3] = mImpl->left_eye_fov_sample.up;
-    }
-
-    for (uint32_t i = 0; i < usable_view_count && i < 2; ++i)
-    {
-        xr_trace.has_eye[i] = true;
-        xr_trace.eye_pos[i][0] = mImpl->views[i].pose.position.x;
-        xr_trace.eye_pos[i][1] = mImpl->views[i].pose.position.y;
-        xr_trace.eye_pos[i][2] = mImpl->views[i].pose.position.z;
-        xr_trace.eye_quat[i][0] = mImpl->views[i].pose.orientation.x;
-        xr_trace.eye_quat[i][1] = mImpl->views[i].pose.orientation.y;
-        xr_trace.eye_quat[i][2] = mImpl->views[i].pose.orientation.z;
-        xr_trace.eye_quat[i][3] = mImpl->views[i].pose.orientation.w;
-        xr_trace.eye_fov[i][0] = mImpl->views[i].fov.angleLeft;
-        xr_trace.eye_fov[i][1] = mImpl->views[i].fov.angleRight;
-        xr_trace.eye_fov[i][2] = mImpl->views[i].fov.angleDown;
-        xr_trace.eye_fov[i][3] = mImpl->views[i].fov.angleUp;
-    }
-
-    LLVector3 accumulated_forward;
-    LLVector3 accumulated_up;
-    for (uint32_t i = 0; i < usable_view_count; ++i)
-    {
-        accumulated_forward += xr_forward_from_orientation(mImpl->views[i].pose.orientation);
-        accumulated_up += xr_up_from_orientation(mImpl->views[i].pose.orientation);
-    }
-
-    if (usable_view_count > 0 && accumulated_forward.normalize() > 0.f)
-    {
-        mImpl->latest_hmd_forward = accumulated_forward;
-        mImpl->has_hmd_forward = true;
-        mImpl->latest_pose_generation = this_locate_generation;
-    }
-    else
-    {
-        mImpl->has_hmd_forward = false;
-    }
-
-    if (usable_view_count > 0 && accumulated_up.normalize() > 0.f)
-    {
-        mImpl->latest_hmd_up = accumulated_up;
-        mImpl->has_hmd_up = true;
-    }
-    else
-    {
-        mImpl->has_hmd_up = false;
+        // P2-02 paced loop: session events, xrWaitFrame and
+        // xrLocateViews for THIS frame already ran in
+        // beginPacedFrame() before idle(), and
+        // beginPacedFrameAfterIdle() (called by doFrame between
+        // idle() and display()) already began the frame. This
+        // branch only transfers the frame context's state into the
+        // submit path and enforces per-token source readiness.
+        const LLOpenXRManagerImpl::XRFrameContext& frame_ctx = mImpl->paced_frame;
+        frame_state = frame_ctx.frame_state;
+        view_state = frame_ctx.view_state;
+        located_view_count = frame_ctx.located_view_count;
+        this_locate_generation = frame_ctx.located_generation;
+        frame_views = &frame_ctx.located_views;
+        xr_trace.t_entry = frame_ctx.t_entry;
+        xr_trace.t_wait_start = frame_ctx.t_wait_start;
+        xr_trace.t_wait_end = frame_ctx.t_wait_end;
+        xr_trace.t_begin_start = frame_ctx.t_begin_start;
+        xr_trace.t_begin_end = frame_ctx.t_begin_end;
+        xr_trace.t_locate_start = frame_ctx.t_locate_start;
+        xr_trace.t_locate_end = frame_ctx.t_locate_end;
+        xr_trace.wait_result = frame_ctx.wait_result;
+        xr_trace.begin_result = frame_ctx.begin_result;
+        xr_trace.locate_result = frame_ctx.locate_result;
+        xr_trace.predicted_display_time = (long long)frame_ctx.frame_state.predictedDisplayTime;
+        xr_trace.predicted_display_period = (long long)frame_ctx.frame_state.predictedDisplayPeriod;
+        xr_trace.should_render = frame_ctx.frame_state.shouldRender;
+        xr_trace.has_locate_display_time = true;
+        xr_trace.locate_display_time = (long long)frame_ctx.frame_state.predictedDisplayTime;
+        xr_trace.located_view_count = frame_ctx.located_view_count;
+        xr_trace.view_state_flags = (unsigned long long)frame_ctx.view_state.viewStateFlags;
+        if (frame_ctx.located_generation > 0)
+        {
+            xr_trace.has_located_generation = true;
+            xr_trace.located_generation = frame_ctx.located_generation;
+        }
+        xr_trace.pose_sample_valid = mImpl->left_eye_fov_sample.valid;
+        xr_trace.has_pose_sample_valid = true;
+        if (mImpl->left_eye_fov_sample.valid)
+        {
+            xr_trace.has_latest_located = true;
+            xr_trace.latest_located_fov_rad[0] = mImpl->left_eye_fov_sample.left;
+            xr_trace.latest_located_fov_rad[1] = mImpl->left_eye_fov_sample.right;
+            xr_trace.latest_located_fov_rad[2] = mImpl->left_eye_fov_sample.down;
+            xr_trace.latest_located_fov_rad[3] = mImpl->left_eye_fov_sample.up;
+        }
+        {
+            const uint32_t usable_view_count = std::min<uint32_t>(located_view_count,
+                                                                  (uint32_t)frame_ctx.located_views.size());
+            for (uint32_t i = 0; i < usable_view_count && i < 2; ++i)
+            {
+                xr_trace.has_eye[i] = true;
+                xr_trace.eye_pos[i][0] = frame_ctx.located_views[i].pose.position.x;
+                xr_trace.eye_pos[i][1] = frame_ctx.located_views[i].pose.position.y;
+                xr_trace.eye_pos[i][2] = frame_ctx.located_views[i].pose.position.z;
+                xr_trace.eye_quat[i][0] = frame_ctx.located_views[i].pose.orientation.x;
+                xr_trace.eye_quat[i][1] = frame_ctx.located_views[i].pose.orientation.y;
+                xr_trace.eye_quat[i][2] = frame_ctx.located_views[i].pose.orientation.z;
+                xr_trace.eye_quat[i][3] = frame_ctx.located_views[i].pose.orientation.w;
+                xr_trace.eye_fov[i][0] = frame_ctx.located_views[i].fov.angleLeft;
+                xr_trace.eye_fov[i][1] = frame_ctx.located_views[i].fov.angleRight;
+                xr_trace.eye_fov[i][2] = frame_ctx.located_views[i].fov.angleDown;
+                xr_trace.eye_fov[i][3] = frame_ctx.located_views[i].fov.angleUp;
+            }
+        }
+        // Per-token source readiness: the only image this frame may
+        // submit is the render produced by THIS iteration. Token
+        // equality alone would not prove that -- the camera-step
+        // provenance stash is written BEFORE the render, already
+        // carrying this frame's token -- so the check also requires
+        // the world-render completion marker (set by display() on
+        // its main present path, after render_ui()/renderFinalize
+        // for this token) to match. Anything
+        // else -- no render this iteration, a stale stash, a camera
+        // snapshot without a completed render -- ends the frame
+        // with zero layers; a previous frame's image is never
+        // reused.
+        if (!has_render_provenance || render_provenance.app_frame_token != frame_ctx.token ||
+            LLOpenXRTrace::lastWorldRenderCompletedToken() != frame_ctx.token)
+        {
+            XrFrameEndInfo frame_end_info{};
+            frame_end_info.type = XR_TYPE_FRAME_END_INFO;
+            frame_end_info.displayTime = frame_state.predictedDisplayTime;
+            frame_end_info.environmentBlendMode = mImpl->blend_mode;
+            frame_end_info.layerCount = 0;
+            frame_end_info.layers = nullptr;
+            xr_trace.captureEndFrame(frame_end_info, nullptr, nullptr, 0);
+            xr_trace.end_result = (int)xrEndFrame(mImpl->session, &frame_end_info);
+            if (XR_FAILED((XrResult)xr_trace.end_result))
+            {
+                // End-failure policy: record (end_result), warn,
+                // retire -- never retry a failed end (see
+                // endPacedFrameZeroLayer).
+                openxr_warn("xrEndFrame failed (paced source-not-ready close): " +
+                            format_xr_result(mImpl->instance, (XrResult)xr_trace.end_result));
+            }
+            xr_trace.layer_count = 0;
+            if (xr_trace.tracing)
+            {
+                xr_trace.t_end_end = LLOpenXRTrace::nowUs();
+            }
+            mImpl->paced_frame.ended = true;
+            xr_trace.finish("paced_source_not_ready");
+            return;
+        }
     }
 
     GLint previous_read_fbo = 0;
@@ -2529,6 +2909,10 @@ void LLOpenXRManager::submitFrameMono(const LLRect& source_rect)
             frame_end_info.layers = nullptr;
             xr_trace.captureEndFrame(frame_end_info, nullptr, nullptr, 0);
             xr_trace.end_result = (int)xrEndFrame(mImpl->session, &frame_end_info);
+            if (paced)
+            {
+                mImpl->paced_frame.ended = true;
+            }
             if (xr_trace.tracing)
             {
                 xr_trace.t_end_end = LLOpenXRTrace::nowUs();
@@ -2576,6 +2960,10 @@ void LLOpenXRManager::submitFrameMono(const LLRect& source_rect)
             frame_end_info.layers = nullptr;
             xr_trace.captureEndFrame(frame_end_info, nullptr, nullptr, 0);
             xr_trace.end_result = (int)xrEndFrame(mImpl->session, &frame_end_info);
+            if (paced)
+            {
+                mImpl->paced_frame.ended = true;
+            }
             if (xr_trace.tracing)
             {
                 xr_trace.t_end_end = LLOpenXRTrace::nowUs();
@@ -2587,7 +2975,7 @@ void LLOpenXRManager::submitFrameMono(const LLRect& source_rect)
 
     // Mono submit uses one rendered viewpoint duplicated to both eyes
     // (the averaged centre pose is unchanged in both modes).
-    const XrPosef mono_pose = xr_center_pose_from_views(mImpl->views[0], mImpl->views[1]);
+    const XrPosef mono_pose = xr_center_pose_from_views((*frame_views)[0], (*frame_views)[1]);
     LLRect submit_source_rect;
     XrFovf mono_fov{};
     if (coherent_optics)
@@ -2611,7 +2999,7 @@ void LLOpenXRManager::submitFrameMono(const LLRect& source_rect)
         // by center-cropping the source image to runtime aspect when
         // needed, with a symmetric FOV fabricated for the cropped
         // region. Preserved verbatim for A/B comparison.
-        const XrFovf& left_eye_fov = mImpl->views[0].fov;
+        const XrFovf& left_eye_fov = (*frame_views)[0].fov;
         F32 runtime_aspect = 0.f;
         if (!xr_fov_aspect(left_eye_fov, runtime_aspect))
         {
@@ -2847,6 +3235,17 @@ void LLOpenXRManager::submitFrameMono(const LLRect& source_rect)
                              "LOCAL", (unsigned long long)(uintptr_t)mImpl->app_space);
     result = xrEndFrame(mImpl->session, &frame_end_info);
     xr_trace.end_result = (int)result;
+    if (paced)
+    {
+        mImpl->paced_frame.ended = true;
+        if (XR_FAILED(result))
+        {
+            // End-failure policy: recorded in end_result above,
+            // warned here, retired without retry (see
+            // endPacedFrameZeroLayer).
+            openxr_warn("xrEndFrame failed (paced submit): " + format_xr_result(mImpl->instance, result));
+        }
+    }
     if (xr_trace.tracing)
     {
         xr_trace.t_end_end = LLOpenXRTrace::nowUs();
@@ -2869,6 +3268,370 @@ void LLOpenXRManager::submitFrameMono(const LLRect& source_rect)
 
 #else
     (void)source_rect;
+#endif
+}
+
+bool LLOpenXRManager::isPacedFrameLoopSelected() const
+{
+    return pacedFrameLoopEnabled() && isMonoRequested();
+}
+
+bool LLOpenXRManager::hasOpenPacedFrame() const
+{
+#if LL_LINUX && LL_X11
+    return mImpl && mImpl->paced_frame.active && mImpl->paced_frame.begun &&
+           !mImpl->paced_frame.ended;
+#else
+    return false;
+#endif
+}
+
+// P2-02: the paced loop's pre-idle frame begin. Called by
+// LLAppViewer::doFrame() immediately before idle(). Session events
+// first, then the synchronous xrWaitFrame (the runtime paces the
+// loop here; contract section 4: no bound, no watchdog, no skip --
+// telemetry only), then xrLocateViews at the frame's predicted
+// display time, then adoption + publication of the pose/FOV
+// snapshot, so idle()'s updateLookAt and animation resolve ONCE
+// against this frame's locate. Outcomes that end the frame with
+// zero layers (shouldRender=false, locate failure, invalid view
+// state) are recorded on the context and resolved at
+// xrBeginFrame time, after idle.
+void LLOpenXRManager::beginPacedFrame()
+{
+#if LL_LINUX && LL_X11
+    if (!isPacedFrameLoopSelected())
+    {
+        return;
+    }
+    LLOpenXRTrace::setAppFrameLoopMode("paced_pre_idle");
+
+    if (mImpl && mImpl->paced_frame.active)
+    {
+        // A frame left open by a previous iteration (its fallback
+        // close should have handled it) is closed before a new one
+        // is waited on -- the runtime forbids a second wait while a
+        // frame is open.
+        closePacedFrameIfOpen("fallback_zero_layer");
+        if (mImpl && mImpl->paced_frame.active)
+        {
+            mImpl->paced_frame = LLOpenXRManagerImpl::XRFrameContext();
+        }
+    }
+
+    if (mDisabled)
+    {
+        return;
+    }
+
+    if (!mInitializeAttempted)
+    {
+        // initialize() binds the session to the current GLX context
+        // and disables the manager permanently when none is current.
+        // The legacy loop first initializes from swap(), where a
+        // context is guaranteed; at this pre-idle point a
+        // context-less iteration simply retries on the next one
+        // instead of disabling VR.
+        if (!glXGetCurrentContext() || !glXGetCurrentDrawable() ||
+            !LLWindowSDL::get_SDL_Display())
+        {
+            return;
+        }
+    }
+
+    if (!ensureInitializedForFrame())
+    {
+        return;
+    }
+
+    processEvents();
+    if (mDisabled || !mImpl->session_running)
+    {
+        return;
+    }
+
+    LLOpenXRManagerImpl::XRFrameContext& frame_ctx = mImpl->paced_frame;
+    frame_ctx = LLOpenXRManagerImpl::XRFrameContext();
+    frame_ctx.active = true;
+    frame_ctx.token = LLOpenXRTrace::currentAppFrameToken();
+    frame_ctx.tracing = LLOpenXRTrace::runActive();
+    frame_ctx.t_entry = LLOpenXRTrace::nowUs();
+    frame_ctx.session_state = (int)mImpl->session_state;
+
+    XrFrameWaitInfo frame_wait_info{};
+    frame_wait_info.type = XR_TYPE_FRAME_WAIT_INFO;
+    frame_ctx.frame_state.type = XR_TYPE_FRAME_STATE;
+    frame_ctx.t_wait_start = LLOpenXRTrace::nowUs();
+    const XrResult wait_result = xrWaitFrame(mImpl->session, &frame_wait_info, &frame_ctx.frame_state);
+    frame_ctx.wait_result = (int)wait_result;
+    frame_ctx.t_wait_end = LLOpenXRTrace::nowUs();
+    if (XR_FAILED(wait_result))
+    {
+        openxr_warn("xrWaitFrame failed (paced loop): " + format_xr_result(mImpl->instance, wait_result));
+        XrSubmitTrace xr_trace = make_paced_trace(*mImpl, frame_ctx);
+        xr_trace.finish("wait_failed");
+        frame_ctx = LLOpenXRManagerImpl::XRFrameContext();
+        return;
+    }
+    frame_ctx.wait_succeeded = true;
+
+    // Blocking telemetry (contract section 4): warn past two
+    // predicted periods, severe past 100 ms. A returned long wait
+    // is processed normally either way.
+    {
+        const long long wait_us = frame_ctx.t_wait_end - frame_ctx.t_wait_start;
+        const long long period_us = (long long)frame_ctx.frame_state.predictedDisplayPeriod / 1000;
+        if (wait_us > 100000 || (period_us > 0 && wait_us > 2 * period_us))
+        {
+            openxr_warn("xrWaitFrame blocked " + std::to_string(wait_us) + " us (paced loop" +
+                        (wait_us > 100000 ? ", severe" : "") + ").");
+        }
+    }
+
+    if (!frame_ctx.frame_state.shouldRender)
+    {
+        // No locate will happen for this frame: explicitly retire
+        // the published snapshot so idle() does not consume a
+        // previous frame's pose/FOV as if it were current. (In the
+        // legacy loop locate ran after the render, so this staleness
+        // was invisible; pre-idle it must be explicit.) Mirrors the
+        // locate-failure invalidation below.
+        mImpl->has_hmd_forward = false;
+        mImpl->has_hmd_up = false;
+        mImpl->has_left_eye_vertical_fov = false;
+        mImpl->has_left_eye_aspect = false;
+        mImpl->left_eye_fov_sample.valid = false;
+        frame_ctx.pending_end_status = "skipped_should_render";
+        return;
+    }
+
+    if (mImpl->views.empty())
+    {
+        frame_ctx.pending_end_status = "locate_failed";
+        return;
+    }
+
+    XrViewLocateInfo view_locate_info{};
+    view_locate_info.type = XR_TYPE_VIEW_LOCATE_INFO;
+    view_locate_info.viewConfigurationType = XR_VIEW_CONFIG;
+    view_locate_info.displayTime = frame_ctx.frame_state.predictedDisplayTime;
+    view_locate_info.space = mImpl->app_space;
+
+    frame_ctx.view_state.type = XR_TYPE_VIEW_STATE;
+    frame_ctx.located_views.assign(mImpl->views.size(), XrView{});
+    for (auto& view : frame_ctx.located_views)
+    {
+        view.type = XR_TYPE_VIEW;
+        view.next = nullptr;
+    }
+    frame_ctx.locate_attempted = true;
+    frame_ctx.t_locate_start = LLOpenXRTrace::nowUs();
+    uint32_t located_view_count = 0;
+    const XrResult locate_result = xrLocateViews(
+        mImpl->session,
+        &view_locate_info,
+        &frame_ctx.view_state,
+        (uint32_t)frame_ctx.located_views.size(),
+        &located_view_count,
+        frame_ctx.located_views.data());
+    frame_ctx.locate_result = (int)locate_result;
+    frame_ctx.located_view_count = located_view_count;
+    frame_ctx.t_locate_end = LLOpenXRTrace::nowUs();
+    if (XR_FAILED(locate_result) || located_view_count < 2)
+    {
+        openxr_warn("xrLocateViews failed (paced loop): " + format_xr_result(mImpl->instance, locate_result));
+        mImpl->has_hmd_forward = false;
+        mImpl->has_hmd_up = false;
+        mImpl->has_left_eye_vertical_fov = false;
+        mImpl->has_left_eye_aspect = false;
+        mImpl->left_eye_fov_sample.valid = false;
+        frame_ctx.pending_end_status = "locate_failed";
+        return;
+    }
+
+    // P0-06/V2 validity gates, identical to the legacy loop: an
+    // invalid pose drives neither the avatar head nor a submitted
+    // view. Nothing here recalibrates or reuses a stale pose.
+    const bool orientation_valid =
+        (frame_ctx.view_state.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) != 0;
+    const bool position_valid =
+        (frame_ctx.view_state.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) != 0;
+    if (!orientation_valid || !position_valid)
+    {
+        if (!orientation_valid)
+        {
+            mImpl->has_hmd_forward = false;
+            mImpl->has_hmd_up = false;
+        }
+        mImpl->has_left_eye_vertical_fov = false;
+        mImpl->has_left_eye_aspect = false;
+        mImpl->left_eye_fov_sample.valid = false;
+        frame_ctx.pending_end_status = "invalid_view_state";
+        return;
+    }
+
+    // Publish the snapshot: adopt this locate as the manager's
+    // current pose / FOV sample BEFORE idle() resolves look-at and
+    // animation against it. The context keeps its own copy of the
+    // located views for the submission.
+    const uint32_t usable_view_count = std::min<uint32_t>(located_view_count,
+                                                          (uint32_t)frame_ctx.located_views.size());
+    frame_ctx.located_generation = adopt_located_views(*mImpl, frame_ctx.located_views, usable_view_count);
+    frame_ctx.views_valid = frame_ctx.located_generation > 0;
+#endif
+}
+
+void LLOpenXRManager::beginPacedFrameAfterIdle()
+{
+#if LL_LINUX && LL_X11
+    if (!isPacedFrameLoopSelected())
+    {
+        return;
+    }
+    // Contract order (Phase 2 digest): the waited, pre-idle-located
+    // frame is begun HERE -- after idle() resolved look-at and
+    // animation against its snapshot, before display() renders --
+    // so the runtime knows the frame has begun while the render
+    // happens. Pending zero-layer outcomes (shouldRender=false,
+    // locate failure, invalid view state) are resolved at this
+    // point too, so such frames never reach the render path.
+    beginPacedFrameForRender();
+#endif
+}
+
+bool LLOpenXRManager::beginPacedFrameForRender()
+{
+#if LL_LINUX && LL_X11
+    if (!mImpl)
+    {
+        return false;
+    }
+    LLOpenXRManagerImpl::XRFrameContext& frame_ctx = mImpl->paced_frame;
+    if (!frame_ctx.active || frame_ctx.ended || !frame_ctx.wait_succeeded)
+    {
+        return false;
+    }
+    if (frame_ctx.begun)
+    {
+        return true;
+    }
+    if (frame_ctx.begin_attempted)
+    {
+        return false;
+    }
+    frame_ctx.begin_attempted = true;
+
+    XrFrameBeginInfo frame_begin_info{};
+    frame_begin_info.type = XR_TYPE_FRAME_BEGIN_INFO;
+    frame_ctx.t_begin_start = LLOpenXRTrace::nowUs();
+    const XrResult begin_result = xrBeginFrame(mImpl->session, &frame_begin_info);
+    frame_ctx.begin_result = (int)begin_result;
+    frame_ctx.t_begin_end = LLOpenXRTrace::nowUs();
+    if (XR_FAILED(begin_result))
+    {
+        openxr_warn("xrBeginFrame failed (paced loop): " + format_xr_result(mImpl->instance, begin_result));
+        XrSubmitTrace xr_trace = make_paced_trace(*mImpl, frame_ctx);
+        xr_trace.finish("begin_failed");
+        frame_ctx = LLOpenXRManagerImpl::XRFrameContext();
+        return false;
+    }
+    frame_ctx.begun = true;
+
+    if (!frame_ctx.pending_end_status.empty())
+    {
+        // shouldRender=false / locate failed / invalid view state:
+        // the waited frame still gets its orderly zero-layer end,
+        // before display() -- there is nothing to render for it.
+        const std::string status = frame_ctx.pending_end_status;
+        endPacedFrameZeroLayer(status);
+        return false;
+    }
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool LLOpenXRManager::endPacedFrameZeroLayer(const std::string& status)
+{
+#if LL_LINUX && LL_X11
+    if (!mImpl)
+    {
+        return false;
+    }
+    LLOpenXRManagerImpl::XRFrameContext& frame_ctx = mImpl->paced_frame;
+    if (!frame_ctx.active || !frame_ctx.begun || frame_ctx.ended)
+    {
+        return false;
+    }
+    XrSubmitTrace xr_trace = make_paced_trace(*mImpl, frame_ctx);
+    XrFrameEndInfo frame_end_info{};
+    frame_end_info.type = XR_TYPE_FRAME_END_INFO;
+    frame_end_info.displayTime = frame_ctx.frame_state.predictedDisplayTime;
+    frame_end_info.environmentBlendMode = mImpl->blend_mode;
+    frame_end_info.layerCount = 0;
+    frame_end_info.layers = nullptr;
+    xr_trace.captureEndFrame(frame_end_info, nullptr, nullptr, 0);
+    xr_trace.end_result = (int)xrEndFrame(mImpl->session, &frame_end_info);
+    xr_trace.layer_count = 0;
+    if (xr_trace.tracing)
+    {
+        xr_trace.t_end_end = LLOpenXRTrace::nowUs();
+    }
+    const bool ended_ok = XR_SUCCEEDED((XrResult)xr_trace.end_result);
+    if (!ended_ok)
+    {
+        openxr_warn("xrEndFrame failed (paced loop, zero-layer close): " +
+                    format_xr_result(mImpl->instance, (XrResult)xr_trace.end_result));
+    }
+    // End-failure policy: a failed xrEndFrame is recorded on the
+    // xr_submit record (end_result, "end_failed" status) and warned
+    // above; the context is then retired WITHOUT retrying the end --
+    // after a failed end the runtime owns the frame's state, and a
+    // blind second end risks compounding the error. Pacing resumes
+    // at the next iteration's xrWaitFrame, and the failure stays
+    // visible in the trace rather than being silently absorbed.
+    xr_trace.finish(ended_ok ? status : "end_failed");
+    frame_ctx = LLOpenXRManagerImpl::XRFrameContext();
+    return ended_ok;
+#else
+    (void)status;
+    return false;
+#endif
+}
+
+// P2-02: main-loop fallback close. Any waited frame that never
+// reached its submit (display() skipped, early return, snapshot or
+// cube path) is closed here with zero layers; a frame that was
+// never begun is begun only to be closed, so every successful
+// xrWaitFrame reaches an orderly xrEndFrame. No-op when no paced
+// frame is open.
+void LLOpenXRManager::closePacedFrameIfOpen(const char* status)
+{
+#if LL_LINUX && LL_X11
+    if (!mImpl || !mImpl->paced_frame.active)
+    {
+        return;
+    }
+    if (!mImpl->paced_frame.wait_succeeded)
+    {
+        mImpl->paced_frame = LLOpenXRManagerImpl::XRFrameContext();
+        return;
+    }
+    if (!mImpl->paced_frame.begun)
+    {
+        beginPacedFrameForRender();
+        if (!mImpl || !mImpl->paced_frame.active)
+        {
+            return;
+        }
+    }
+    if (mImpl->paced_frame.begun && !mImpl->paced_frame.ended)
+    {
+        endPacedFrameZeroLayer(status ? status : "fallback_zero_layer");
+    }
+#else
+    (void)status;
 #endif
 }
 
@@ -3043,6 +3806,9 @@ bool LLOpenXRManager::getLeftEyeRenderSize(S32& out_width, S32& out_height) cons
 void LLOpenXRManager::shutdown()
 {
 #if LL_LINUX && LL_X11
+    // P2-02: a paced frame still open at shutdown is closed with
+    // zero layers before the session is torn down.
+    closePacedFrameIfOpen("shutdown_close");
     LLOpenXRTrace::endRun("shutdown");
     if (!mImpl)
     {

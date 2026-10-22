@@ -705,7 +705,15 @@ void record_render_trace()
     // the frame-loop mode (P2-01 keeps the legacy render-then-submit
     // order; the label is what the P2-02 gate will later flip).
     fields << ",\"app_frame_token\":" << LLOpenXRTrace::currentAppFrameToken();
-    fields << ",\"frame_loop_mode\":\"legacy_after_render\"";
+    {
+        LLOpenXRTrace::AppFrameContext app_ctx;
+        std::string frame_loop_mode = "legacy_after_render";
+        if (LLOpenXRTrace::peekAppFrameContext(app_ctx) && !app_ctx.frame_loop_mode.empty())
+        {
+            frame_loop_mode = app_ctx.frame_loop_mode;
+        }
+        fields << ",\"frame_loop_mode\":\"" << frame_loop_mode << "\"";
+    }
     fields << ",\"camera_mode\":" << (S32)gAgentCamera.getCameraMode();
     fields << ",\"camera_mouselook\":" << (gAgentCamera.cameraMouselook() ? "true" : "false");
     fields << ",\"look_at_type\":" << (S32)gAgentCamera.getLookAtType();
@@ -1580,6 +1588,18 @@ void display(bool rebuild, F32 zoom_factor, int subfield, bool for_snapshot)
         if (!for_snapshot)
         {
             render_ui();
+
+            // P2-02: the world render and its post-processing
+            // (render_ui's renderFinalize, which produces the XR
+            // submit source) have completed for this iteration on
+            // the main present path -- record that functionally,
+            // trace run or not, so the paced loop's submit can
+            // prove image freshness. Deliberately placed HERE, not
+            // inside render_ui(): render_ui() also runs on the
+            // disconnected branch (before any world render) and
+            // from the snapshot path in llviewerwindow.cpp, and
+            // neither of those may claim a completed world render.
+            LLOpenXRTrace::markWorldRenderCompleted(LLOpenXRTrace::currentAppFrameToken());
             swap();
         }
 
@@ -2121,7 +2141,19 @@ void swap()
 
     if (!gSnapshot && !gCubeSnapshot && gViewerWindow)
     {
-        LLOpenXRManager::instance().submitFrameMono(gViewerWindow->getWorldRenderViewRectRaw());
+        // P2-02: on the runtime-paced loop the frame was waited on
+        // and located before idle(); swap() only hands its rendered
+        // image to the paced submit (blit + xrEndFrame) -- it owns
+        // no XR frame calls of its own. The legacy loop is unchanged.
+        LLOpenXRManager& xr_manager = LLOpenXRManager::instance();
+        if (xr_manager.isPacedFrameLoopSelected())
+        {
+            xr_manager.submitPacedFrameMono(gViewerWindow->getWorldRenderViewRectRaw());
+        }
+        else
+        {
+            xr_manager.submitFrameMono(gViewerWindow->getWorldRenderViewRectRaw());
+        }
     }
 
     if (gDisplaySwapBuffers)

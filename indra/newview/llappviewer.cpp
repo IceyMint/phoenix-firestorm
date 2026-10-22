@@ -1790,6 +1790,14 @@ bool LLAppViewer::doFrame()
                 {
                     LLPerfStats::RecordSceneTime T (LLPerfStats::StatType_t::RENDER_IDLE);
                     LL_PROFILE_ZONE_NAMED_CATEGORY_APP("df idle");
+                    // P2-02: the runtime-paced frame loop (gate
+                    // FS_OPENXR_P2_FRAME_LOOP=1) begins its frame
+                    // here -- session events, xrWaitFrame,
+                    // xrLocateViews, snapshot publish -- BEFORE
+                    // idle() resolves look-at and animation against
+                    // it. No-op when the gate is off or XR mono is
+                    // not requested.
+                    LLOpenXRManager::instance().beginPacedFrame();
                     LLOpenXRTrace::markAppFrameIdleStart();
                     idle();
                     LLOpenXRTrace::markAppFrameIdleEnd();
@@ -1824,6 +1832,17 @@ bool LLAppViewer::doFrame()
                 pingMainloopTimeout("Main:Display");
                 gGLActive = true;
 
+                // P2-02: contract order -- the paced frame that was
+                // waited on and located before idle() is begun HERE,
+                // after idle() resolved look-at/animation against its
+                // snapshot and before display() renders, so the
+                // runtime knows the frame has begun while the render
+                // happens. Pending zero-layer outcomes
+                // (shouldRender=false, locate failure, invalid view
+                // state) are resolved at this point too. No-op on the
+                // legacy loop.
+                LLOpenXRManager::instance().beginPacedFrameAfterIdle();
+
                 display();
                 LLOpenXRTrace::markAppFrameDisplayReturn();
 
@@ -1851,6 +1870,14 @@ bool LLAppViewer::doFrame()
                 }
             }
 
+            // P2-02: main-loop fallback for the paced loop -- a
+            // waited frame that never reached its submit (display()
+            // skipped, early return, snapshot/cube path) is closed
+            // here with zero layers, so every successful xrWaitFrame
+            // reaches an orderly xrEndFrame. No-op on the legacy
+            // loop and when the frame already submitted.
+            LLOpenXRManager::instance().closePacedFrameIfOpen("fallback_zero_layer");
+
             // P2-01: close out this iteration's trace context. The
             // per-iteration "app_frame" record carries the main-loop
             // stage timestamps -- including t_display_return_us,
@@ -1866,7 +1893,7 @@ bool LLAppViewer::doFrame()
                 {
                     std::ostringstream app_fields;
                     app_fields << "\"app_frame_token\":" << app_ctx.app_frame_token;
-                    app_fields << ",\"frame_loop_mode\":\"legacy_after_render\"";
+                    app_fields << ",\"frame_loop_mode\":\"" << app_ctx.frame_loop_mode << "\"";
                     app_fields << ",\"t_mainloop_frame_start_us\":" << app_ctx.t_mainloop_frame_start_us;
                     app_fields << ",\"t_idle_start_us\":" << app_ctx.t_idle_start_us;
                     app_fields << ",\"t_idle_end_us\":" << app_ctx.t_idle_end_us;
