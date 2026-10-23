@@ -124,17 +124,17 @@ bool diag_frame_marker_requested()
     return true;
 }
 
-// P2-02: FS_OPENXR_P2_FRAME_LOOP gate reader. The paced loop is
-// opt-in in this commit -- explicit true only; unset, empty, false
-// or unparseable all keep the legacy loop (P2-03 flips the
-// default). Launch-time configuration, read on each call like the
-// other FS_OPENXR_* readers.
+// P2-02: FS_OPENXR_P2_FRAME_LOOP gate reader. P2-03b: the paced
+// loop is the default -- unset, empty or unparseable select it;
+// an explicit parseable value wins, so FS_OPENXR_P2_FRAME_LOOP=0
+// remains the legacy escape hatch. Launch-time configuration,
+// read on each call like the other FS_OPENXR_* readers.
 bool xr_paced_frame_loop_requested()
 {
     std::string value = LLStringUtil::getenv(OPENXR_P2_FRAME_LOOP_ENV);
     if (value.empty())
     {
-        return false;
+        return true;
     }
 
     bool result = false;
@@ -143,7 +143,7 @@ bool xr_paced_frame_loop_requested()
         return result;
     }
 
-    return false;
+    return true;
 }
 
 // P2-01B: legacy-loop gate hook for the diagnostic cadence lock,
