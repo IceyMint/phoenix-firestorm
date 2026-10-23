@@ -264,6 +264,21 @@ std::string xr_session_state_name(XrSessionState state)
     }
 }
 
+std::string xr_reference_space_type_name(XrReferenceSpaceType space_type)
+{
+    switch (space_type)
+    {
+    case XR_REFERENCE_SPACE_TYPE_VIEW: return "VIEW";
+    case XR_REFERENCE_SPACE_TYPE_LOCAL: return "LOCAL";
+    case XR_REFERENCE_SPACE_TYPE_STAGE: return "STAGE";
+    case XR_REFERENCE_SPACE_TYPE_LOCAL_FLOOR: return "LOCAL_FLOOR";
+    case XR_REFERENCE_SPACE_TYPE_UNBOUNDED_MSFT: return "UNBOUNDED_MSFT";
+    case XR_REFERENCE_SPACE_TYPE_COMBINED_EYE_VARJO: return "COMBINED_EYE_VARJO";
+    case XR_REFERENCE_SPACE_TYPE_MAX_ENUM: return "MAX_ENUM";
+    default: return "UNRECOGNIZED";
+    }
+}
+
 std::string format_xr_result(XrInstance instance, XrResult result)
 {
     if (instance != XR_NULL_HANDLE)
@@ -1445,6 +1460,43 @@ void LLOpenXRManager::processEvents()
                 gResizeScreenTexture = true;
                 mDisabled = true;
                 return;
+            }
+            break;
+        }
+        case XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING:
+        {
+            // P2-04a: provenance probe only. Reference-space change
+            // events are recorded for the recenter provenance
+            // catalogue; nothing in the viewer reacts to them. The
+            // full field set also goes to the viewer log because
+            // trace records only exist inside an active run, while
+            // these events can arrive across session transitions.
+            const auto* space_event = reinterpret_cast<const XrEventDataReferenceSpaceChangePending*>(&event);
+            const XrPosef& prev_pose = space_event->poseInPreviousSpace;
+            std::ostringstream fields;
+            fields << "\"reference_space_type\":" << static_cast<int>(space_event->referenceSpaceType)
+                   << ",\"reference_space_type_name\":\"" << xr_reference_space_type_name(space_event->referenceSpaceType) << "\""
+                   << ",\"change_time_ns\":" << static_cast<long long>(space_event->changeTime)
+                   << ",\"pose_valid\":" << (space_event->poseValid ? "true" : "false");
+            if (space_event->poseValid)
+            {
+                // poseInPreviousSpace is undefined when poseValid
+                // is false (OpenXR spec); serialize null instead.
+                fields << ",\"prev_space_pos\":[" << prev_pose.position.x << "," << prev_pose.position.y << "," << prev_pose.position.z << "]"
+                       << ",\"prev_space_quat\":[" << prev_pose.orientation.x << "," << prev_pose.orientation.y << "," << prev_pose.orientation.z << "," << prev_pose.orientation.w << "]";
+            }
+            else
+            {
+                fields << ",\"prev_space_pos\":null,\"prev_space_quat\":null";
+            }
+            fields << ",\"event_session\":" << static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(space_event->session))
+                   << ",\"app_session\":" << static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(mImpl->session))
+                   << ",\"session_state\":\"" << xr_session_state_name(mImpl->session_state) << "\""
+                   << ",\"app_frame_token\":" << LLOpenXRTrace::currentAppFrameToken();
+            openxr_info("Reference space change pending: {" + fields.str() + "}");
+            if (LLOpenXRTrace::enabled())
+            {
+                LLOpenXRTrace::writeRecord("xr_recenter_probe", fields.str());
             }
             break;
         }
