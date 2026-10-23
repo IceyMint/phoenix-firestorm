@@ -117,6 +117,22 @@ struct LLXRWorldRenderReceipt
     std::string render_fingerprint;
 };
 
+// P2-04b: one pending LOCAL reference-space transition, queued by
+// the P2-04a probe case when the deployment identity gate passes
+// and the recenter consumption gate is enabled. The camera
+// consumes at most one per frame (the newest eligible; older
+// eligible ones are retired as superseded manager-side). The
+// (incarnation, generation, change_time_ns) key binds the
+// transition to one manager incarnation (process-static, never
+// reused), one session generation (READY re-begin after
+// STOPPING) and the runtime's own change time.
+struct LLLocalSpaceTransition
+{
+    unsigned long long incarnation = 0;
+    unsigned long long generation = 0;
+    long long change_time_ns = 0;
+};
+
 struct LLOpenXRManagerImpl;
 
 class LLOpenXRManager
@@ -139,6 +155,12 @@ public:
     // the 2x2 A/B matrix (loop x optics) is preserved: this gate is
     // independent of coherentOpticsEnabled().
     static bool pacedFrameLoopEnabled();
+    // P2-04b (D7'): FS_OPENXR_P2_RECENTER consumption gate --
+    // default OFF in P2-04b (an explicit parseable true enables;
+    // unset or anything else leaves consumption, and therefore
+    // enqueueing, off). P2-04c flips the default after the
+    // release gates pass.
+    static bool recenterConsumptionEnabled();
     bool isPacedFrameLoopSelected() const;
     void beginPacedFrame();
     // P2-02: contract-order begin point -- called by
@@ -205,6 +227,59 @@ public:
     void setMonoEnabled(bool enabled);
     bool isMonoEnabled() const;
     bool isSessionRunning() const;
+    // P2-04b (D6'): the camera's genuine-deactivation signal (b):
+    // the /xr mono-mode state (isMonoEnabled() is its source of
+    // truth: the /xr override when set, else FS_OPENXR_MONO).
+    bool isVRModeActive() const;
+    // P2-04b (round-9): VR-mode activation generation. Bumped
+    // inside setMonoEnabled() on every off->on edge, so an
+    // off/on cycle is a matter of record even if no camera
+    // frame observed the off state. The camera invalidates its
+    // whole calibration lifetime when the generation it owns
+    // no longer matches. (Env-only launches never call
+    // setMonoEnabled and stay at generation 0 consistently.)
+    unsigned long long getVRActivationGeneration() const { return mVRActivationGeneration; }
+    // P2-04b (D5'): LOCAL-space continuity certificate state:
+    // 0 = Unestablished, 1 = Established, 2 = Broken. The basis
+    // is "source_established" once established (never "measured"
+    // unless a measurement actually ran).
+    int getLocalContinuityState() const;
+    std::string getLocalContinuityBasis() const;
+    // P2-04b (D5'): the current manager incarnation (0 when no
+    // impl exists). The camera records the incarnation its
+    // calibration was captured under; a mismatch means the base
+    // outlived the manager/frame it belongs to.
+    unsigned long long getIncarnation() const;
+    // P2-04b (D2'/D3'): the sample the head path actually
+    // consumed (stamped by getHmdForward): its locate generation
+    // (== head_consumed_pose_generation), that locate's predicted
+    // display time (runtime clock, ns) and whether its
+    // orientation was actively tracked. Forward/up vectors,
+    // generation, time and tracked flag all bind to the SAME
+    // adopted locate (round-7 watch item). False when no valid
+    // consumed sample is recorded.
+    bool getHeadConsumedSampleInfo(unsigned long long& locate_generation,
+                                    long long& locate_time_ns,
+                                    bool& orientation_tracked) const;
+    // P2-04b (D2'): release the newest pending LOCAL transition
+    // eligible at sample_time_ns (change_time_ns <= sample time,
+    // current epoch). Older eligible transitions are retired
+    // manager-side as recenter_superseded (traced) and counted
+    // in superseded_count; stale-epoch entries encountered are
+    // dropped (traced dropped_stale_generation). False when no
+    // eligible transition exists. A returned transition is
+    // popped exactly once: the camera's decision (apply or
+    // interlock-reject) is final.
+    bool takeNewestEligibleLocalTransition(long long sample_time_ns,
+                                            LLLocalSpaceTransition& out_transition,
+                                            int& superseded_count);
+    // P2-04b (D3'): retire every currently-eligible transition
+    // of the current epoch, tracing each with the given reason
+    // (e.g. "absorbed_by_initial_capture"); they can never apply
+    // later. Not-yet-eligible transitions are kept.
+    void retireEligibleLocalTransitions(long long sample_time_ns, const char* reason);
+    // P2-04b: queued-transition diagnostics.
+    unsigned long long pendingLocalTransitionCount() const;
     void shutdown();
 
 private:
@@ -233,6 +308,7 @@ private:
     bool mInitializeAttempted;
     bool mDisabled;
     bool mMonoEnabledOverrideActive;
+    unsigned long long mVRActivationGeneration = 0;
     bool mMonoEnabledOverrideValue;
 };
 

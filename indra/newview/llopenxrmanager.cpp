@@ -29,11 +29,15 @@
 #include <GL/glx.h>
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <ctime>
+#include <deque>
 #include <fstream>
+#include <limits.h>
 #include <mutex>
+#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -47,6 +51,7 @@ constexpr const char* OPENXR_P1_OPTICS_ENV = "FS_OPENXR_P1_OPTICS_EXPERIMENTAL";
 constexpr const char* OPENXR_DIAG_CADENCE_ENV = "FS_OPENXR_DIAG_FIXED_CADENCE_HZ";
 constexpr const char* OPENXR_DIAG_MARKER_ENV = "FS_OPENXR_DIAG_FRAME_MARKER";
 constexpr const char* OPENXR_P2_FRAME_LOOP_ENV = "FS_OPENXR_P2_FRAME_LOOP";
+constexpr const char* OPENXR_P2_RECENTER_ENV = "FS_OPENXR_P2_RECENTER";
 
 bool is_openxr_mono_requested()
 {
@@ -146,6 +151,29 @@ bool xr_paced_frame_loop_requested()
     return true;
 }
 
+// P2-04b (D7'): FS_OPENXR_P2_RECENTER consumption gate reader --
+// read on each call like the other FS_OPENXR_* readers. Default
+// OFF in P2-04b: only an explicit parseable true ("1"/"true")
+// enables consumption; unset, empty, explicit false and
+// unparseable values all leave it off. P2-04c flips the default
+// once the release gates pass.
+bool xr_recenter_consumption_requested()
+{
+    std::string value = LLStringUtil::getenv(OPENXR_P2_RECENTER_ENV);
+    if (value.empty())
+    {
+        return false;
+    }
+
+    bool result = false;
+    if (LLStringUtil::convertToBOOL(value, result))
+    {
+        return result;
+    }
+
+    return false;
+}
+
 // P2-01B: legacy-loop gate hook for the diagnostic cadence lock,
 // updated for P2-02: the lock engages only when the paced loop is
 // NOT selected -- the paced loop is paced by its own xrWaitFrame,
@@ -168,6 +196,11 @@ bool xr_diag_frame_loop_is_legacy()
 /*static*/ bool LLOpenXRManager::pacedFrameLoopEnabled()
 {
     return xr_paced_frame_loop_requested();
+}
+
+/*static*/ bool LLOpenXRManager::recenterConsumptionEnabled()
+{
+    return xr_recenter_consumption_requested();
 }
 
 /*static*/ F32 LLOpenXRManager::diagFixedCadenceHz()
@@ -204,6 +237,12 @@ struct DiagCadenceGrid
     bool has_last_wake = false;
 };
 DiagCadenceGrid g_diag_cadence_grid;
+
+// P2-04b (D1'): manager incarnation counter. Process-static and
+// monotonic: every LLOpenXRManagerImpl creation takes the next
+// value, so an (incarnation, generation, changeTime) transition
+// key can never collide with a key from a destroyed impl.
+std::atomic<unsigned long long> g_openxr_impl_incarnation_counter{0};
 
 std::string openxr_log_file_path()
 {
@@ -244,6 +283,207 @@ void openxr_warn(const std::string& message)
 {
     LL_WARNS("OpenXR") << message << LL_ENDL;
     write_openxr_file_log("WARN", message);
+}
+
+// P2-04b: dual-emit one LOCAL transition lifecycle record in
+// the P2-04a probe idiom: the full field set goes to the viewer
+// log unconditionally (via openxr_info) AND to the trace when a
+// run is active, because these events can arrive across session
+// transitions where no run exists.
+void emit_local_transition_record(const char* event_name,
+                                  const LLLocalSpaceTransition& transition,
+                                  const std::string& extra_fields)
+{
+    std::ostringstream fields;
+    fields << "\"incarnation\":" << transition.incarnation
+           << ",\"generation\":" << transition.generation
+           << ",\"change_time_ns\":" << transition.change_time_ns;
+    if (!extra_fields.empty())
+    {
+        fields << "," << extra_fields;
+    }
+    fields << ",\"app_frame_token\":" << LLOpenXRTrace::currentAppFrameToken();
+    openxr_info(std::string(event_name) + ": {" + fields.str() + "}");
+    if (LLOpenXRTrace::enabled())
+    {
+        LLOpenXRTrace::writeRecord(event_name, fields.str());
+    }
+}
+
+std::string local_continuity_state_name(int state)
+{
+    switch (state)
+    {
+    case 1: return "established";
+    case 2: return "broken";
+    default: return "unestablished";
+    }
+}
+
+// P2-04b (D5'): dual-emit the continuity certificate record.
+// basis states HOW continuity is known ("source_established":
+// the audited runtime's overseer persistence over surviving
+// handles) -- it is never reported as "measured" unless a
+// geometric measurement actually ran.
+void emit_local_continuity_record(unsigned long long incarnation,
+                                  unsigned long long generation,
+                                  int continuity_state,
+                                  const std::string& basis,
+                                  const std::string& broken_reason,
+                                  const char* event_detail,
+                                  unsigned long long session_handle,
+                                  unsigned long long space_handle)
+{
+    std::ostringstream fields;
+    fields << "\"incarnation\":" << incarnation
+           << ",\"generation\":" << generation
+           << ",\"continuity_state\":" << continuity_state
+           << ",\"continuity_state_name\":\"" << local_continuity_state_name(continuity_state) << "\""
+           << ",\"basis\":\"" << basis << "\""
+           << ",\"broken_reason\":\"" << broken_reason << "\""
+           << ",\"event\":\"" << event_detail << "\""
+           << ",\"session\":" << session_handle
+           << ",\"app_space\":" << space_handle
+           << ",\"app_frame_token\":" << LLOpenXRTrace::currentAppFrameToken();
+    openxr_info("xr_local_continuity: {" + fields.str() + "}");
+    if (LLOpenXRTrace::enabled())
+    {
+        LLOpenXRTrace::writeRecord("xr_local_continuity", fields.str());
+    }
+}
+
+// Extract the string value of a "key" : "value" pair from the
+// pinned runtime manifest. The manifest is a small, controlled
+// deployment file (D4''), so a quoted-string scan is
+// sufficient; anything unexpected fails closed.
+bool extract_manifest_string(const std::string& json, const std::string& key, std::string& out_value)
+{
+    const std::string quoted_key = "\"" + key + "\"";
+    std::string::size_type pos = json.find(quoted_key);
+    if (pos == std::string::npos)
+    {
+        return false;
+    }
+    pos = json.find(':', pos + quoted_key.size());
+    if (pos == std::string::npos)
+    {
+        return false;
+    }
+    const std::string::size_type open = json.find('"', pos);
+    if (open == std::string::npos)
+    {
+        return false;
+    }
+    const std::string::size_type close = json.find('"', open + 1);
+    if (close == std::string::npos)
+    {
+        return false;
+    }
+    out_value = json.substr(open + 1, close - open - 1);
+    return true;
+}
+
+// P2-04b (D4''): pinned-runtime verification. Authentication
+// requires XR_RUNTIME_JSON to be SET and to canonicalize to the
+// approved manifest of Leah's audited WiVRn install
+// ($HOME/.local/share/openxr/1/openxr_wivrn.json) -- we verify
+// the manifest the loader was TOLD to use, which is the
+// controlled deployment's contract. The manifest itself must
+// name WiVRn, and its library_path (resolved relative to the
+// manifest directory) must exist inside the same install tree.
+// Absent or mismatched pin => NOT authenticated.
+bool verify_pinned_wivrn_manifest(std::string& out_detail)
+{
+    const char* pin_env = std::getenv("XR_RUNTIME_JSON");
+    if (!pin_env || pin_env[0] == '\0')
+    {
+        out_detail = "XR_RUNTIME_JSON is not set";
+        return false;
+    }
+    const char* home_env = std::getenv("HOME");
+    if (!home_env || home_env[0] == '\0')
+    {
+        out_detail = "HOME is not set";
+        return false;
+    }
+    const std::string expected_path =
+        std::string(home_env) + "/.local/share/openxr/1/openxr_wivrn.json";
+
+    char pin_resolved[PATH_MAX] = {};
+    char expected_resolved[PATH_MAX] = {};
+    if (!realpath(pin_env, pin_resolved) || !realpath(expected_path.c_str(), expected_resolved))
+    {
+        out_detail = "manifest path does not resolve";
+        return false;
+    }
+    if (std::strcmp(pin_resolved, expected_resolved) != 0)
+    {
+        out_detail = std::string("XR_RUNTIME_JSON resolves to ") + pin_resolved +
+                     ", not the pinned " + expected_resolved;
+        return false;
+    }
+
+    std::ifstream manifest_file(expected_resolved);
+    if (!manifest_file.is_open())
+    {
+        out_detail = "pinned manifest is unreadable";
+        return false;
+    }
+    std::ostringstream manifest_text;
+    manifest_text << manifest_file.rdbuf();
+    const std::string json = manifest_text.str();
+
+    std::string runtime_name;
+    std::string library_path;
+    if (!extract_manifest_string(json, "name", runtime_name) ||
+        !extract_manifest_string(json, "library_path", library_path))
+    {
+        out_detail = "pinned manifest lacks name/library_path";
+        return false;
+    }
+    if (runtime_name != "WiVRn")
+    {
+        out_detail = "pinned manifest names runtime \"" + runtime_name + "\", not WiVRn";
+        return false;
+    }
+
+    const std::string expected_str(expected_resolved);
+    const std::string::size_type slash = expected_str.find_last_of('/');
+    if (slash == std::string::npos)
+    {
+        out_detail = "pinned manifest path has no directory";
+        return false;
+    }
+    const std::string manifest_dir = expected_str.substr(0, slash);
+    const std::string library_candidate =
+        (!library_path.empty() && library_path[0] == '/')
+            ? library_path
+            : manifest_dir + "/" + library_path;
+    char library_resolved[PATH_MAX] = {};
+    if (!realpath(library_candidate.c_str(), library_resolved))
+    {
+        out_detail = "manifest library_path does not resolve: " + library_candidate;
+        return false;
+    }
+    const std::string library_str(library_resolved);
+    // The install tree is the pinned WiVRn prefix ($HOME/.local):
+    // the manifest lives at share/openxr/1/ under it while the
+    // libraries live at lib64/wivrn/ under it, so containment is
+    // checked against the prefix, not the manifest directory.
+    char install_root_resolved[PATH_MAX] = {};
+    const std::string install_root_candidate = std::string(home_env) + "/.local";
+    const std::string install_root = realpath(install_root_candidate.c_str(), install_root_resolved)
+                                         ? std::string(install_root_resolved)
+                                         : install_root_candidate;
+    if (library_str.compare(0, install_root.size() + 1, install_root + "/") != 0)
+    {
+        out_detail = "manifest library escapes the pinned install: " + library_str;
+        return false;
+    }
+
+    out_detail = std::string("pinned manifest ") + expected_resolved +
+                 ", library " + library_str;
+    return true;
 }
 
 std::string xr_session_state_name(XrSessionState state)
@@ -800,6 +1040,51 @@ struct LLOpenXRManagerImpl
     // app_frame_token of the iteration that used it.
     unsigned long long head_consumed_pose_generation = 0;
     unsigned long long head_consumed_app_frame_token = 0;
+    // P2-04b: the adopted-locate stamp (written by
+    // adopt_located_views() together with latest_pose_generation,
+    // so generation, time and the orientation-tracked flag name
+    // ONE locate) and the head-consumption copy getHmdForward()
+    // makes from it when it stamps the consumed generation
+    // (round-7 watch item: one adoption binds forward/up,
+    // generation, time, token and tracked state).
+    unsigned long long adopted_sample_locate_generation = 0;
+    long long adopted_sample_time_ns = 0;
+    bool adopted_sample_orientation_tracked = false;
+    bool adopted_sample_valid = false;
+    unsigned long long head_consumed_sample_time_ns = 0;
+    bool head_consumed_sample_orientation_tracked = false;
+    bool head_consumed_sample_valid = false;
+    // P2-04b (D1'/D4''/D5'): recenter transition queue, epoch
+    // and identity/continuity state. incarnation is assigned at
+    // impl creation in initialize() from the process-static
+    // counter; session_generation increments at the READY
+    // re-begin after STOPPING. Continuity is Established at
+    // initialize() for the (incarnation, session, app_space,
+    // authenticated identity) tuple only; a fresh impl starts
+    // Unestablished.
+    enum class LocalContinuity : int
+    {
+        Unestablished = 0,
+        Established = 1,
+        Broken = 2
+    };
+    unsigned long long incarnation = 0;
+    unsigned long long session_generation = 0;
+    bool session_was_stopped = false;
+    std::deque<LLLocalSpaceTransition> pending_local_transitions;
+    // P2-04b (round-8 B3): keys of transitions already finalized
+    // in this incarnation (consumed, superseded, or retired).
+    // Dedupe is judged on (incarnation, change_time_ns): a
+    // runtime redelivery of the same change can never re-enter
+    // the queue under any generation. Bounded by the event
+    // count of one manager lifetime.
+    std::set<std::pair<unsigned long long, long long>> finalized_local_transitions;
+    bool runtime_authenticated = false;
+    std::string runtime_name;
+    std::string runtime_version;
+    LocalContinuity local_continuity = LocalContinuity::Unestablished;
+    std::string local_continuity_basis;
+    std::string local_continuity_broken_reason;
 };
 #endif
 
@@ -852,6 +1137,14 @@ void LLOpenXRManager::setMonoEnabled(bool enabled)
     const bool previous_requested = isMonoRequested();
     mMonoEnabledOverrideActive = true;
     mMonoEnabledOverrideValue = enabled;
+    // P2-04b (round-9): record the activation edge HERE, where
+    // the transition happens -- an off/on cycle is then visible
+    // to the camera's lifetime check even when no updateLookAt
+    // frame ran while the mode was off.
+    if (enabled && !previous_requested)
+    {
+        ++mVRActivationGeneration;
+    }
 
     if (enabled)
     {
@@ -992,6 +1285,9 @@ bool LLOpenXRManager::initialize()
     }
 
     mImpl = std::make_unique<LLOpenXRManagerImpl>();
+    // P2-04b (D1'): this impl's incarnation (never reused in
+    // this process; keys every transition it queues).
+    mImpl->incarnation = ++g_openxr_impl_incarnation_counter;
 
     uint32_t extension_count = 0;
     XrResult result = xrEnumerateInstanceExtensionProperties(nullptr, 0, &extension_count, nullptr);
@@ -1054,6 +1350,50 @@ bool LLOpenXRManager::initialize()
     }
 
     openxr_info("xrCreateInstance succeeded.");
+
+    // P2-04b (D4''): deployment identity gate. Authentication
+    // requires the pinned WiVRn manifest (verify_pinned_wivrn_
+    // manifest) AND a non-foreign instance identity: the
+    // runtime's reported name is recorded, and a non-empty name
+    // outside {"WiVRn", "Monado"} fails authentication.
+    // Unauthenticated does NOT fail initialization -- VR keeps
+    // working; the probe stays diagnostic-only (P2-04a
+    // behavior), no transitions are queued and continuity
+    // cannot be Established.
+    {
+        std::string identity_detail;
+        const bool manifest_ok = verify_pinned_wivrn_manifest(identity_detail);
+        XrInstanceProperties instance_properties{};
+        instance_properties.type = XR_TYPE_INSTANCE_PROPERTIES;
+        bool name_ok = true;
+        const XrResult props_result = xrGetInstanceProperties(mImpl->instance, &instance_properties);
+        if (XR_SUCCEEDED(props_result))
+        {
+            mImpl->runtime_name = instance_properties.runtimeName;
+            std::ostringstream version_stream;
+            version_stream << XR_VERSION_MAJOR(instance_properties.runtimeVersion) << "."
+                           << XR_VERSION_MINOR(instance_properties.runtimeVersion) << "."
+                           << XR_VERSION_PATCH(instance_properties.runtimeVersion);
+            mImpl->runtime_version = version_stream.str();
+            if (!mImpl->runtime_name.empty() &&
+                mImpl->runtime_name != "WiVRn" && mImpl->runtime_name != "Monado")
+            {
+                name_ok = false;
+            }
+        }
+        else
+        {
+            openxr_warn("xrGetInstanceProperties failed: " +
+                        format_xr_result(mImpl->instance, props_result) +
+                        "; identity rests on the manifest pin alone.");
+        }
+        mImpl->runtime_authenticated = manifest_ok && name_ok;
+        openxr_info("P2-04b runtime identity: manifest_pin=" +
+                    std::string(manifest_ok ? "ok" : "FAILED") + " (" + identity_detail + ")" +
+                    ", runtime_name=\"" + mImpl->runtime_name + "\"" +
+                    ", runtime_version=" + mImpl->runtime_version +
+                    ", authenticated=" + (mImpl->runtime_authenticated ? "true" : "false"));
+    }
 
     XrSystemGetInfo system_info{};
     system_info.type = XR_TYPE_SYSTEM_GET_INFO;
@@ -1217,6 +1557,30 @@ bool LLOpenXRManager::initialize()
         mDisabled = true;
         shutdown();
         return false;
+    }
+
+    // P2-04b (D5'): with the session and its LOCAL space created
+    // under the authenticated pinned runtime, continuity is
+    // Established for this (incarnation, session, app_space)
+    // tuple on the source-established basis: the audited Monado
+    // overseer holds the LOCAL offsets server-side across these
+    // handles' begin/end cycles. Without authentication the
+    // certificate stays Unestablished; a base captured in that
+    // same incarnation remains self-consistent and keeps
+    // driving (no transitions can be queued there), while a
+    // Broken certificate or a destroyed-incarnation base
+    // suspends head-driving camera-side (D5').
+    if (mImpl->runtime_authenticated)
+    {
+        mImpl->local_continuity = LLOpenXRManagerImpl::LocalContinuity::Established;
+        mImpl->local_continuity_basis = "source_established";
+        emit_local_continuity_record(
+            mImpl->incarnation, mImpl->session_generation,
+            static_cast<int>(mImpl->local_continuity),
+            mImpl->local_continuity_basis, mImpl->local_continuity_broken_reason,
+            "established_at_initialize",
+            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(mImpl->session)),
+            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(mImpl->app_space)));
     }
 
     uint32_t view_count = 0;
@@ -1388,9 +1752,40 @@ void LLOpenXRManager::processEvents()
         switch (event.type)
         {
         case XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING:
+        {
+            // P2-04b (round-8 B1): instance loss must fail closed
+            // on its own -- the session-state EXITING/LOSS_PENDING
+            // branch is not guaranteed to run. Break the
+            // continuity certificate, drop pending transitions
+            // with reasons, and invalidate the published pose and
+            // the consumed-sample stamp so nothing downstream can
+            // act on them.
             openxr_warn("OpenXR runtime instance loss pending; disabling VR submit.");
+            for (const auto& pending : mImpl->pending_local_transitions)
+            {
+                emit_local_transition_record("dropped_stale_generation", pending,
+                                             "\"reason\":\"instance_loss\"");
+            }
+            mImpl->pending_local_transitions.clear();
+            if (mImpl->local_continuity == LLOpenXRManagerImpl::LocalContinuity::Established)
+            {
+                mImpl->local_continuity = LLOpenXRManagerImpl::LocalContinuity::Broken;
+                mImpl->local_continuity_broken_reason = "instance_loss_event";
+                emit_local_continuity_record(
+                    mImpl->incarnation, mImpl->session_generation,
+                    static_cast<int>(mImpl->local_continuity),
+                    mImpl->local_continuity_basis, mImpl->local_continuity_broken_reason,
+                    "broken_instance_loss_event",
+                    static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(mImpl->session)),
+                    static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(mImpl->app_space)));
+            }
+            mImpl->has_hmd_forward = false;
+            mImpl->has_hmd_up = false;
+            mImpl->adopted_sample_valid = false;
+            mImpl->head_consumed_sample_valid = false;
             mDisabled = true;
             return;
+        }
 
         case XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED:
         {
@@ -1411,6 +1806,24 @@ void LLOpenXRManager::processEvents()
                 {
                     mImpl->session_running = true;
                     openxr_info("OpenXR session started.");
+                    if (mImpl->session_was_stopped)
+                    {
+                        // P2-04b (D1'/D5'): re-begin on the SAME
+                        // session/space handles. The epoch's
+                        // generation advances (transitions minted
+                        // under it were dropped at STOPPING); the
+                        // continuity certificate is preserved --
+                        // same surviving objects, audited runtime.
+                        mImpl->session_was_stopped = false;
+                        ++mImpl->session_generation;
+                        emit_local_continuity_record(
+                            mImpl->incarnation, mImpl->session_generation,
+                            static_cast<int>(mImpl->local_continuity),
+                            mImpl->local_continuity_basis, mImpl->local_continuity_broken_reason,
+                            "session_rebegin_generation_advanced",
+                            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(mImpl->session)),
+                            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(mImpl->app_space)));
+                    }
                     if (LLOpenXRTrace::enabled())
                     {
                         // P2-01B: the session record states the
@@ -1438,6 +1851,18 @@ void LLOpenXRManager::processEvents()
             }
             else if (mImpl->session_state == XR_SESSION_STATE_STOPPING && mImpl->session_running)
             {
+                // P2-04b (D1'): pending transitions die with the
+                // stopping generation -- traced, never carried
+                // across the stop.
+                for (const auto& pending : mImpl->pending_local_transitions)
+                {
+                    emit_local_transition_record("dropped_stale_generation", pending,
+                                                 "\"reason\":\"session_stopping\"");
+                    mImpl->finalized_local_transitions.insert(
+                        std::make_pair(pending.incarnation, pending.change_time_ns));
+                }
+                mImpl->pending_local_transitions.clear();
+                mImpl->session_was_stopped = true;
                 xrEndSession(mImpl->session);
                 mImpl->session_running = false;
                 mImpl->has_hmd_forward = false;
@@ -1452,6 +1877,20 @@ void LLOpenXRManager::processEvents()
                      mImpl->session_state == XR_SESSION_STATE_LOSS_PENDING)
             {
                 openxr_warn("OpenXR runtime requested exit; disabling VR submit.");
+                // P2-04b (D5'): instance/session loss breaks the
+                // continuity certificate for this incarnation.
+                if (mImpl->local_continuity == LLOpenXRManagerImpl::LocalContinuity::Established)
+                {
+                    mImpl->local_continuity = LLOpenXRManagerImpl::LocalContinuity::Broken;
+                    mImpl->local_continuity_broken_reason = "instance_loss";
+                    emit_local_continuity_record(
+                        mImpl->incarnation, mImpl->session_generation,
+                        static_cast<int>(mImpl->local_continuity),
+                        mImpl->local_continuity_basis, mImpl->local_continuity_broken_reason,
+                        "broken_instance_loss",
+                        static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(mImpl->session)),
+                        static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(mImpl->app_space)));
+                }
                 LLOpenXRTrace::endRun("exiting");
                 mImpl->has_hmd_forward = false;
                 mImpl->has_left_eye_vertical_fov = false;
@@ -1498,6 +1937,50 @@ void LLOpenXRManager::processEvents()
             {
                 LLOpenXRTrace::writeRecord("xr_recenter_probe", fields.str());
             }
+            // P2-04b (D2'/D7'): queue the transition for the
+            // camera's interlock-gated consumption -- only for the
+            // audited deployment (LOCAL space, this session,
+            // authenticated pinned runtime) and only while the
+            // consumption gate is enabled; otherwise the probe
+            // above remains the only record (P2-04a behavior) and
+            // nothing accumulates.
+            if (space_event->referenceSpaceType == XR_REFERENCE_SPACE_TYPE_LOCAL &&
+                space_event->session == mImpl->session &&
+                mImpl->runtime_authenticated &&
+                LLOpenXRManager::recenterConsumptionEnabled())
+            {
+                LLLocalSpaceTransition transition;
+                transition.incarnation = mImpl->incarnation;
+                transition.generation = mImpl->session_generation;
+                transition.change_time_ns = static_cast<long long>(space_event->changeTime);
+                // P2-04b (round-8 B3): duplicate deliveries of
+                // one change collapse -- a key already pending
+                // or already finalized is traced and never
+                // re-queued.
+                const auto key = std::make_pair(transition.incarnation, transition.change_time_ns);
+                bool duplicate = mImpl->finalized_local_transitions.count(key) > 0;
+                if (!duplicate)
+                {
+                    for (const auto& queued : mImpl->pending_local_transitions)
+                    {
+                        if (queued.incarnation == transition.incarnation &&
+                            queued.change_time_ns == transition.change_time_ns)
+                        {
+                            duplicate = true;
+                            break;
+                        }
+                    }
+                }
+                if (duplicate)
+                {
+                    emit_local_transition_record("dropped_duplicate", transition,
+                                                 "\"reason\":\"duplicate_delivery\"");
+                }
+                else
+                {
+                    mImpl->pending_local_transitions.push_back(transition);
+                }
+            }
             break;
         }
         default:
@@ -1507,6 +1990,199 @@ void LLOpenXRManager::processEvents()
         event = {};
         event.type = XR_TYPE_EVENT_DATA_BUFFER;
     }
+#endif
+}
+
+// P2-04b (D6'): the camera's genuine-deactivation signal (b).
+// isMonoEnabled() is the source of truth for the /xr mono-mode
+// state (the /xr override when set, else FS_OPENXR_MONO).
+bool LLOpenXRManager::isVRModeActive() const
+{
+    return isMonoEnabled();
+}
+
+int LLOpenXRManager::getLocalContinuityState() const
+{
+#if LL_LINUX && LL_X11
+    if (!mImpl)
+    {
+        return 0;
+    }
+    return static_cast<int>(mImpl->local_continuity);
+#else
+    return 0;
+#endif
+}
+
+std::string LLOpenXRManager::getLocalContinuityBasis() const
+{
+#if LL_LINUX && LL_X11
+    if (!mImpl)
+    {
+        return std::string();
+    }
+    return mImpl->local_continuity_basis;
+#else
+    return std::string();
+#endif
+}
+
+unsigned long long LLOpenXRManager::getIncarnation() const
+{
+#if LL_LINUX && LL_X11
+    return mImpl ? mImpl->incarnation : 0;
+#else
+    return 0;
+#endif
+}
+
+bool LLOpenXRManager::getHeadConsumedSampleInfo(unsigned long long& locate_generation,
+                                                long long& locate_time_ns,
+                                                bool& orientation_tracked) const
+{
+    locate_generation = 0;
+    locate_time_ns = 0;
+    orientation_tracked = false;
+#if LL_LINUX && LL_X11
+    if (!mImpl)
+    {
+        return false;
+    }
+    locate_generation = mImpl->head_consumed_pose_generation;
+    if (!mImpl->head_consumed_sample_valid)
+    {
+        return false;
+    }
+    locate_time_ns = mImpl->head_consumed_sample_time_ns;
+    orientation_tracked = mImpl->head_consumed_sample_orientation_tracked;
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool LLOpenXRManager::takeNewestEligibleLocalTransition(long long sample_time_ns,
+                                                        LLLocalSpaceTransition& out_transition,
+                                                        int& superseded_count)
+{
+    superseded_count = 0;
+    out_transition = LLLocalSpaceTransition();
+#if LL_LINUX && LL_X11
+    if (!mImpl)
+    {
+        return false;
+    }
+    // One pass over the queue: stale-epoch entries are dropped
+    // (traced; defensive -- STOPPING already clears the queue),
+    // eligible current-epoch entries collapse to the newest
+    // (older ones are retired as superseded: the consumed sample
+    // reflects only the newest LOCAL definition, so applying an
+    // older one would misattribute the pose), and
+    // not-yet-eligible entries keep their order.
+    std::deque<LLLocalSpaceTransition> keep;
+    LLLocalSpaceTransition newest;
+    bool found = false;
+    for (const auto& transition : mImpl->pending_local_transitions)
+    {
+        if (transition.incarnation != mImpl->incarnation ||
+            transition.generation != mImpl->session_generation)
+        {
+            emit_local_transition_record("dropped_stale_generation", transition,
+                                         "\"reason\":\"epoch_mismatch_at_drain\"");
+            mImpl->finalized_local_transitions.insert(
+                std::make_pair(transition.incarnation, transition.change_time_ns));
+        }
+        else if (transition.change_time_ns <= sample_time_ns)
+        {
+            // P2-04b (round-8 B3): "newest" is the GREATEST
+            // change_time_ns, not the last arrival -- queue order
+            // is delivery order, which the contract does not
+            // guarantee is chronological.
+            if (found && transition.change_time_ns > newest.change_time_ns)
+            {
+                emit_local_transition_record("recenter_superseded", newest,
+                                             "\"reason\":\"superseded_by_newer_eligible\"");
+                mImpl->finalized_local_transitions.insert(
+                    std::make_pair(newest.incarnation, newest.change_time_ns));
+                ++superseded_count;
+                newest = transition;
+            }
+            else if (found)
+            {
+                emit_local_transition_record("recenter_superseded", transition,
+                                             "\"reason\":\"superseded_by_newer_eligible\"");
+                mImpl->finalized_local_transitions.insert(
+                    std::make_pair(transition.incarnation, transition.change_time_ns));
+                ++superseded_count;
+            }
+            else
+            {
+                newest = transition;
+                found = true;
+            }
+        }
+        else
+        {
+            keep.push_back(transition);
+        }
+    }
+    mImpl->pending_local_transitions.swap(keep);
+    if (found)
+    {
+        mImpl->finalized_local_transitions.insert(
+            std::make_pair(newest.incarnation, newest.change_time_ns));
+        out_transition = newest;
+    }
+    return found;
+#else
+    (void)sample_time_ns;
+    return false;
+#endif
+}
+
+void LLOpenXRManager::retireEligibleLocalTransitions(long long sample_time_ns, const char* reason)
+{
+#if LL_LINUX && LL_X11
+    if (!mImpl)
+    {
+        return;
+    }
+    const std::string reason_str = reason ? reason : "retired";
+    std::deque<LLLocalSpaceTransition> keep;
+    for (const auto& transition : mImpl->pending_local_transitions)
+    {
+        if (transition.incarnation != mImpl->incarnation ||
+            transition.generation != mImpl->session_generation)
+        {
+            emit_local_transition_record("dropped_stale_generation", transition,
+                                         "\"reason\":\"epoch_mismatch_at_retire\"");
+            mImpl->finalized_local_transitions.insert(
+                std::make_pair(transition.incarnation, transition.change_time_ns));
+        }
+        else if (transition.change_time_ns <= sample_time_ns)
+        {
+            emit_local_transition_record(reason_str.c_str(), transition, "");
+            mImpl->finalized_local_transitions.insert(
+                std::make_pair(transition.incarnation, transition.change_time_ns));
+        }
+        else
+        {
+            keep.push_back(transition);
+        }
+    }
+    mImpl->pending_local_transitions.swap(keep);
+#else
+    (void)sample_time_ns;
+    (void)reason;
+#endif
+}
+
+unsigned long long LLOpenXRManager::pendingLocalTransitionCount() const
+{
+#if LL_LINUX && LL_X11
+    return mImpl ? static_cast<unsigned long long>(mImpl->pending_local_transitions.size()) : 0;
+#else
+    return 0;
 #endif
 }
 
@@ -2214,7 +2890,9 @@ struct XrSubmitTrace
 // usable).
 unsigned long long adopt_located_views(LLOpenXRManagerImpl& impl,
                                        const std::vector<XrView>& views,
-                                       uint32_t usable_view_count)
+                                       uint32_t usable_view_count,
+                                       long long predicted_display_time_ns,
+                                       unsigned int view_state_flags)
 {
     unsigned long long this_locate_generation = 0;
     if (usable_view_count > 0)
@@ -2295,10 +2973,20 @@ unsigned long long adopt_located_views(LLOpenXRManagerImpl& impl,
         impl.latest_hmd_forward = accumulated_forward;
         impl.has_hmd_forward = true;
         impl.latest_pose_generation = this_locate_generation;
+        // P2-04b (D2'): stamp THIS adoption's locate time and
+        // orientation-tracked flag with its generation, so the
+        // head path's consumption record binds time/generation/
+        // tracked to the same locate as the forward/up vectors.
+        impl.adopted_sample_locate_generation = this_locate_generation;
+        impl.adopted_sample_time_ns = predicted_display_time_ns;
+        impl.adopted_sample_orientation_tracked =
+            (view_state_flags & XR_VIEW_STATE_ORIENTATION_TRACKED_BIT) != 0;
+        impl.adopted_sample_valid = true;
     }
     else
     {
         impl.has_hmd_forward = false;
+        impl.adopted_sample_valid = false;
     }
 
     if (usable_view_count > 0 && accumulated_up.normalize() > 0.f)
@@ -2885,7 +3573,16 @@ void LLOpenXRManager::submitFrameMonoImpl(const LLRect& source_rect, bool paced)
         // P2-02: adoption (generation mint, FOV caches + sample, head
         // forward/up) lives in adopt_located_views() so the paced
         // loop's pre-idle locate adopts identically to this one.
-        this_locate_generation = adopt_located_views(*mImpl, mImpl->views, usable_view_count);
+        // P2-04b (round-8 B4): LEGACY timing relationship -- this
+        // adoption happens after idle(), so updateLookAt consumed
+        // the PREVIOUS iteration's adoption during this frame.
+        // The stamp getHmdForward() copies names the pose it
+        // actually returned (that previous adoption), which is
+        // the binding the interlock relies on; the paced path's
+        // same-frame freshness rule does not apply here.
+        this_locate_generation = adopt_located_views(*mImpl, mImpl->views, usable_view_count,
+                                                     static_cast<long long>(frame_state.predictedDisplayTime),
+                                                     static_cast<unsigned int>(view_state.viewStateFlags));
         if (this_locate_generation > 0)
         {
             xr_trace.has_located_generation = true;
@@ -3691,6 +4388,15 @@ void LLOpenXRManager::beginPacedFrame()
     frame_ctx.t_wait_end = LLOpenXRTrace::nowUs();
     if (XR_FAILED(wait_result))
     {
+        // P2-04b (round-9 B4 / round-10): a pre-adoption
+        // failure path -- this paced frame adopted nothing, so
+        // neither the sample stamps nor the published pose may
+        // be consumed against it (getHmdForward needs only
+        // session_running && has_hmd_forward).
+        mImpl->adopted_sample_valid = false;
+        mImpl->head_consumed_sample_valid = false;
+        mImpl->has_hmd_forward = false;
+        mImpl->has_hmd_up = false;
         openxr_warn("xrWaitFrame failed (paced loop): " + format_xr_result(mImpl->instance, wait_result));
         XrSubmitTrace xr_trace = make_paced_trace(*mImpl, frame_ctx);
         xr_trace.finish("wait_failed");
@@ -3725,12 +4431,23 @@ void LLOpenXRManager::beginPacedFrame()
         mImpl->has_left_eye_vertical_fov = false;
         mImpl->has_left_eye_aspect = false;
         mImpl->left_eye_fov_sample.valid = false;
+        // P2-04b (round-10 B4): the published sample stamps are
+        // part of the snapshot this exit retires.
+        mImpl->adopted_sample_valid = false;
+        mImpl->head_consumed_sample_valid = false;
         frame_ctx.pending_end_status = "skipped_should_render";
         return;
     }
 
     if (mImpl->views.empty())
     {
+        // P2-04b (round-10 B4): a pre-adoption exit like the
+        // others -- retire the published pose and the sample
+        // stamps so nothing stale is consumed this frame.
+        mImpl->has_hmd_forward = false;
+        mImpl->has_hmd_up = false;
+        mImpl->adopted_sample_valid = false;
+        mImpl->head_consumed_sample_valid = false;
         frame_ctx.pending_end_status = "locate_failed";
         return;
     }
@@ -3769,6 +4486,11 @@ void LLOpenXRManager::beginPacedFrame()
         mImpl->has_left_eye_vertical_fov = false;
         mImpl->has_left_eye_aspect = false;
         mImpl->left_eye_fov_sample.valid = false;
+        // P2-04b (round-8 B4): this paced frame adopted nothing;
+        // no sample metadata from an earlier adoption may be
+        // consumed against it.
+        mImpl->adopted_sample_valid = false;
+        mImpl->head_consumed_sample_valid = false;
         frame_ctx.pending_end_status = "locate_failed";
         return;
     }
@@ -3782,11 +4504,18 @@ void LLOpenXRManager::beginPacedFrame()
         (frame_ctx.view_state.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) != 0;
     if (!orientation_valid || !position_valid)
     {
-        if (!orientation_valid)
-        {
-            mImpl->has_hmd_forward = false;
-            mImpl->has_hmd_up = false;
-        }
+        // An invalid pose drives neither the avatar head nor a
+        // submitted view (the gate comment above): BOTH invalid
+        // sub-cases clear the published head pose -- previously a
+        // position-invalid frame kept serving the last adoption
+        // to the head path. P2-04b (round-8 B4): the adoption and
+        // consumed-sample stamps are invalidated too, so no
+        // recenter decision can bind to an earlier locate on a
+        // frame that adopted nothing.
+        mImpl->has_hmd_forward = false;
+        mImpl->has_hmd_up = false;
+        mImpl->adopted_sample_valid = false;
+        mImpl->head_consumed_sample_valid = false;
         mImpl->has_left_eye_vertical_fov = false;
         mImpl->has_left_eye_aspect = false;
         mImpl->left_eye_fov_sample.valid = false;
@@ -3800,7 +4529,9 @@ void LLOpenXRManager::beginPacedFrame()
     // located views for the submission.
     const uint32_t usable_view_count = std::min<uint32_t>(located_view_count,
                                                           (uint32_t)frame_ctx.located_views.size());
-    frame_ctx.located_generation = adopt_located_views(*mImpl, frame_ctx.located_views, usable_view_count);
+    frame_ctx.located_generation = adopt_located_views(*mImpl, frame_ctx.located_views, usable_view_count,
+                                                       static_cast<long long>(frame_ctx.frame_state.predictedDisplayTime),
+                                                       static_cast<unsigned int>(frame_ctx.view_state.viewStateFlags));
     frame_ctx.views_valid = frame_ctx.located_generation > 0;
 #endif
 }
@@ -4290,6 +5021,23 @@ bool LLOpenXRManager::getHmdForward(LLVector3& out_forward) const
         // value and its normalization are unchanged.
         mImpl->head_consumed_pose_generation = mImpl->latest_pose_generation;
         mImpl->head_consumed_app_frame_token = LLOpenXRTrace::currentAppFrameToken();
+        // P2-04b (D2', round-7 watch item): copy the adopted
+        // sample's time/tracked stamp for the generation just
+        // consumed, so the camera's interlock binds to the SAME
+        // locate as the forward/up vectors it consumed. The
+        // generation guard keeps the copy honest if the stamp
+        // ever belongs to a different adoption.
+        if (mImpl->adopted_sample_valid &&
+            mImpl->adopted_sample_locate_generation == mImpl->latest_pose_generation)
+        {
+            mImpl->head_consumed_sample_time_ns = mImpl->adopted_sample_time_ns;
+            mImpl->head_consumed_sample_orientation_tracked = mImpl->adopted_sample_orientation_tracked;
+            mImpl->head_consumed_sample_valid = true;
+        }
+        else
+        {
+            mImpl->head_consumed_sample_valid = false;
+        }
         return true;
     }
     return false;

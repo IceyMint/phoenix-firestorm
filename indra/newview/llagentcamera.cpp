@@ -50,6 +50,7 @@
 #include "llviewerwindow.h"
 #include "llkeyboard.h"
 #include "llopenxrmanager.h"
+#include "llopenxrtrace.h"
 #include "llvoavatarself.h"
 #include "llwindow.h"
 #include "llworld.h"
@@ -146,6 +147,51 @@ F32 sViewpointOverrideHmdBaseRoll = 0.f;
 bool sViewpointOverrideDisableHeadAnims = true;
 bool sViewpointOverrideInstantHeadRot = true;
 constexpr F32 VIEWPOINT_OVERRIDE_HEAD_ROTATION_CONSTRAINT = F_PI_BY_TWO * 0.8f; // match LLHeadRotMotion
+// P2-04b: recenter interlock landing tolerance -- the first
+// eligible post-change sample updateLookAt consumes must land
+// within 8 degrees of yaw zero (round 5: accepted provisionally
+// against a measured worst case of 3.84 degrees).
+constexpr F32 VIEWPOINT_OVERRIDE_RECENTER_LANDING_TOLERANCE = 0.1396263f; // 8 degrees in radians
+// P2-04b (D6''): VR-activation ownership state. Ownership is
+// latched the first frame the override prim is present AND VR
+// is in play (HMD look available, or an OpenXR session
+// running); prim presence alone on the desktop does NOT own
+// the activation, so the Rule #9 desktop mouse fallback stays
+// legal there. While owned, the activation (and its
+// calibration) is released only by a genuine deactivation --
+// affirmative prim detach, or the manager's VR mode turning
+// off. An avatar-pointer change is an interruption
+// (rebinding), never a deactivation.
+bool sViewpointOverrideActivationOwned = false;
+LLVOAvatar* sViewpointOverrideActivationAvatar = nullptr;
+bool sViewpointOverrideRebinding = false;
+// P2-04b (D5'): the manager incarnation the current calibration
+// base was captured under. If the manager is destroyed and
+// recreated under a preserved activation, the base's frame is
+// unverified and HMD head-driving suspends (see updateLookAt).
+unsigned long long sViewpointOverrideCaptureIncarnation = 0;
+// P2-04b (round-9): the VR-mode activation generation the
+// camera last reconciled against (manager-side record, bumped
+// in setMonoEnabled on every off->on edge).
+unsigned long long sViewpointOverrideSeenActivationGeneration = 0;
+
+// P2-04b (round-9): end the ENTIRE calibration lifetime --
+// ownership and the captured base together. Used when the
+// activation that created the calibration is over (VR mode
+// off, or the activation generation moved on): the next
+// activation must ENTER and capture fresh, never resurrect.
+void clearViewpointOverrideActivationLifetime()
+{
+    sViewpointOverrideActivationOwned = false;
+    sViewpointOverrideActivationAvatar = nullptr;
+    sViewpointOverrideRebinding = false;
+    sViewpointOverrideCaptureIncarnation = 0;
+    sViewpointOverrideWasActive = false;
+    sViewpointOverrideHmdCalibrated = false;
+    sViewpointOverrideHmdBaseYaw = 0.f;
+    sViewpointOverrideHmdBasePitch = 0.f;
+    sViewpointOverrideHmdBaseRoll = 0.f;
+}
 
 LLViewerObject* findViewpointOverrideMesh()
 {
@@ -172,6 +218,86 @@ LLViewerObject* findViewpointOverrideMesh()
     }
 
     return nullptr;
+}
+
+// P2-04b (D6''): tri-state override-prim lookup. Present: the
+// mesh was found. Detached: the avatar is valid and its
+// attachment set was affirmatively walked without finding the
+// prim -- a genuine detach. Unavailable: the avatar or its
+// attachment data cannot be read right now -- NOT a detach;
+// ownership and calibration must be preserved unchanged.
+enum class ViewpointOverridePrimState
+{
+    Present,
+    Detached,
+    Unavailable
+};
+
+ViewpointOverridePrimState getViewpointOverridePrimState(LLViewerObject*& out_mesh)
+{
+    out_mesh = nullptr;
+    if (gAgentAvatarp.isNull() || !gAgentAvatarp->isValid())
+    {
+        return ViewpointOverridePrimState::Unavailable;
+    }
+
+    out_mesh = findViewpointOverrideMesh();
+    if (out_mesh)
+    {
+        return ViewpointOverridePrimState::Present;
+    }
+
+    // P2-04b (round-8 B2b / round-9): "not found" is positive
+    // evidence of detach only on a COMPLETE attachment set.
+    // Completeness is the viewer avatar system's own
+    // accounting: isFullyLoaded() (mFullyLoaded -- set when the
+    // avatar's appearance and attachments finish loading, the
+    // decloud point). Before it, absence is Unavailable BY
+    // CONSTRUCTION, not by any duration heuristic. The set
+    // must also be non-empty (a fully loaded avatar wearing
+    // literally nothing cannot prove a detach either). The
+    // 45-frame window in updateLookAt's bookkeeping is only an
+    // edit-churn guard for in-flight wear/unwear operations;
+    // it is not the completeness evidence.
+    if (!gAgentAvatarp->isFullyLoaded())
+    {
+        return ViewpointOverridePrimState::Unavailable;
+    }
+    bool any_attached = false;
+    for (const auto& attachment : gAgentAvatarp->mAttachmentPoints)
+    {
+        if (attachment.second && !attachment.second->mAttachedObjects.empty())
+        {
+            any_attached = true;
+            break;
+        }
+    }
+    return any_attached ? ViewpointOverridePrimState::Detached
+                        : ViewpointOverridePrimState::Unavailable;
+}
+
+// P2-04b: wrap an angle to [-pi, pi] for the interlock's
+// landing measurement.
+F32 wrapAnglePi(F32 angle)
+{
+    F32 wrapped = fmodf(angle + F_PI, F_TWO_PI);
+    if (wrapped < 0.f)
+    {
+        wrapped += F_TWO_PI;
+    }
+    return wrapped - F_PI;
+}
+
+// P2-04b: dual-emit a camera-side recenter record in the
+// manager's idiom: the full field set to the viewer log
+// unconditionally, plus the trace record when a run is active.
+void emitViewpointOverrideRecenterRecord(const char* event_name, const std::string& fields)
+{
+    LL_INFOS("OpenXR") << event_name << ": {" << fields << "}" << LL_ENDL;
+    if (LLOpenXRTrace::enabled())
+    {
+        LLOpenXRTrace::writeRecord(event_name, fields);
+    }
 }
 
 LLQuaternion getViewpointOverrideLookBasisRotation()
@@ -1477,15 +1603,94 @@ void LLAgentCamera::updateLookAt(const S32 mouse_x, const S32 mouse_y)
 {
     static LLVector3 last_at_axis;
 
+    // P2-04b (round-8 B2 / round-9): the calibration lifetime
+    // belongs to ONE VR-mode activation. This check runs before
+    // the avatar-valid early return, so it observes mode
+    // changes even on invalid-avatar frames; and because the
+    // manager records off->on edges inside setMonoEnabled
+    // itself, a cycle no frame observed still invalidates via
+    // the generation mismatch. Either signal ends the WHOLE
+    // lifetime (ownership + base): the next activation ENTERs
+    // and captures fresh.
+    {
+        LLOpenXRManager& openxr_inst = LLOpenXRManager::instance();
+        const unsigned long long activation_generation = openxr_inst.getVRActivationGeneration();
+        if ((sViewpointOverrideActivationOwned || sViewpointOverrideHmdCalibrated) &&
+            activation_generation != sViewpointOverrideSeenActivationGeneration)
+        {
+            clearViewpointOverrideActivationLifetime();
+        }
+        sViewpointOverrideSeenActivationGeneration = activation_generation;
+        if (sViewpointOverrideActivationOwned && !openxr_inst.isVRModeActive())
+        {
+            clearViewpointOverrideActivationLifetime();
+        }
+    }
+
     if (!isAgentAvatarValid()) return;
 
-    const bool viewpoint_override_active = (findViewpointOverrideMesh() != nullptr);
+    // P2-04b (D6'' / round-10 B2b fallback): tri-state prim
+    // lookup + activation bookkeeping. Genuine deactivation is
+    // ONLY the end of the VR-mode activation lifetime (mode
+    // off, or the activation generation moving on -- the
+    // hoisted check above). Prim-absent while owned is an
+    // INTERRUPTION, never a deactivation: no attachment-set
+    // reading can prove a detach (load state and in-flight
+    // edits make absence ambiguous), so ownership and the
+    // calibration are preserved and driving simply holds
+    // until the prim is affirmatively present again. An
+    // avatar-pointer
+    // change is an interruption (rebinding): ownership and
+    // calibration are preserved, and HMD head-driving stays
+    // suspended until the prim is affirmatively found on the
+    // new avatar. A lookup that cannot read the avatar
+    // (Unavailable) -- like the avatar-invalid early return
+    // above -- changes nothing.
+    LLOpenXRManager& openxr = LLOpenXRManager::instance();
+    LLViewerObject* viewpoint_override_mesh = nullptr;
+    const ViewpointOverridePrimState prim_state = getViewpointOverridePrimState(viewpoint_override_mesh);
+    const bool viewpoint_override_active = (prim_state == ViewpointOverridePrimState::Present);
+
+    if (sViewpointOverrideActivationOwned && !sViewpointOverrideRebinding &&
+        gAgentAvatarp.notNull() && sViewpointOverrideActivationAvatar &&
+        gAgentAvatarp.get() != sViewpointOverrideActivationAvatar)
+    {
+        // Avatar replacement is detected FIRST: on the swap
+        // frame the new avatar's attachments may not be readable
+        // yet, which the tri-state lookup reports as Detached --
+        // that must never release ownership before rebinding is
+        // marked (D6'').
+        sViewpointOverrideRebinding = true;
+    }
+    if (sViewpointOverrideActivationOwned &&
+        prim_state != ViewpointOverridePrimState::Present)
+    {
+        // P2-04b (round-10 B2b fallback): owned + prim not
+        // affirmatively present = interruption. The rebinding
+        // hold expresses it exactly (driving suspended,
+        // calibration and ownership preserved); it clears when
+        // the prim is found again, on this avatar or a
+        // replacement.
+        sViewpointOverrideRebinding = true;
+    }
+    if (sViewpointOverrideRebinding && prim_state == ViewpointOverridePrimState::Present)
+    {
+        // Prim affirmatively found on the current avatar:
+        // rebind. Calibration and ownership are PRESERVED -- no
+        // enter writes, no recapture.
+        sViewpointOverrideActivationAvatar = gAgentAvatarp.get();
+        sViewpointOverrideRebinding = false;
+    }
+
     LLQuaternion av_inv_rot = ~gAgentAvatarp->mRoot->getWorldRotation();
     LLVector3 root_at = LLVector3::x_axis * gAgentAvatarp->mRoot->getWorldRotation();
 
     if (gAgentAvatarp.notNull() && gAgentAvatarp->isValid())
     {
-        if (viewpoint_override_active)
+        // P2-04b (D6''): while a VR activation is owned, head
+        // animation stays disabled even on frames where the prim
+        // lookup is unavailable -- the HMD owns the head.
+        if (viewpoint_override_active || sViewpointOverrideActivationOwned)
         {
             gAgentAvatarp->setAnimationData(VIEWPOINT_OVERRIDE_DISABLE_HEAD_ANIMS_KEY,
                                             &sViewpointOverrideDisableHeadAnims);
@@ -1498,7 +1703,12 @@ void LLAgentCamera::updateLookAt(const S32 mouse_x, const S32 mouse_y)
         }
     }
 
-    if (viewpoint_override_active)
+    // P2-04b (D6''): the override block also runs while an
+    // activation is owned but the prim is temporarily
+    // unavailable / rebinding -- in that state it holds the head
+    // (no HMD consumption, no mouse branch, no calibration
+    // writes) instead of falling through to desktop control.
+    if (viewpoint_override_active || sViewpointOverrideActivationOwned)
     {
         if (!sViewpointOverrideWasActive)
         {
@@ -1526,7 +1736,31 @@ void LLAgentCamera::updateLookAt(const S32 mouse_x, const S32 mouse_y)
         F32 hmd_yaw = 0.f;
         F32 hmd_pitch = 0.f;
         F32 hmd_roll = 0.f;
-        const bool use_hmd_look = getViewpointOverrideHmdYawPitchRoll(hmd_yaw, hmd_pitch, hmd_roll);
+        // P2-04b (D6''): the HMD path is live only with the prim
+        // affirmatively present and no rebinding in progress;
+        // otherwise this frame is a hold (head target unchanged,
+        // mouse branch unreachable while owned).
+        const bool hmd_path_live = viewpoint_override_active && !sViewpointOverrideRebinding;
+        const bool use_hmd_look = hmd_path_live &&
+            getViewpointOverrideHmdYawPitchRoll(hmd_yaw, hmd_pitch, hmd_roll);
+
+        // P2-04b (D6''/round-8 B2a): latch VR ownership the
+        // first frame the prim is present and VR mode is on.
+        // (Prim presence alone on the desktop must not own: the
+        // Rule #9 mouse fallback stays legal there, and the
+        // caution-2 desktop scenario depends on it.) Ownership follows the explicit
+        // VR-mode state, not session/sample readiness -- /xr on
+        // owns the activation from the first frame, so the mouse
+        // branch is blocked throughout VR initialization too.
+        // Desktop (VR mode off) never latches.
+        if (!sViewpointOverrideActivationOwned &&
+            prim_state == ViewpointOverridePrimState::Present &&
+            openxr.isVRModeActive())
+        {
+            sViewpointOverrideActivationOwned = true;
+            sViewpointOverrideActivationAvatar = gAgentAvatarp.get();
+            sViewpointOverrideRebinding = false;
+        }
         if (gAgentAvatarp.notNull() && gAgentAvatarp->isValid())
         {
             if (use_hmd_look)
@@ -1547,29 +1781,144 @@ void LLAgentCamera::updateLookAt(const S32 mouse_x, const S32 mouse_y)
 
         if (use_hmd_look)
         {
+            // P2-04b (D2'/D3'): the sample THIS call consumed --
+            // getViewpointOverrideHmdYawPitchRoll() just stamped
+            // it via getHmdForward, binding generation, locate
+            // time and the tracked flag to the same adoption as
+            // the forward/up vectors behind hmd_yaw/pitch/roll.
+            unsigned long long sample_generation = 0;
+            long long sample_time_ns = 0;
+            bool sample_tracked = false;
+            const bool have_sample_info =
+                openxr.getHeadConsumedSampleInfo(sample_generation, sample_time_ns, sample_tracked);
+
+            bool feed_head = true;
             if (!sViewpointOverrideHmdCalibrated)
             {
                 sViewpointOverrideHmdBaseYaw = hmd_yaw;
                 sViewpointOverrideHmdBasePitch = hmd_pitch;
                 sViewpointOverrideHmdBaseRoll = hmd_roll;
                 sViewpointOverrideHmdCalibrated = true;
+                sViewpointOverrideCaptureIncarnation = openxr.getIncarnation();
+
+                // P2-04b (D3'): a transition already eligible at
+                // first capture is absorbed BY this capture (the
+                // base IS the post-change sample) -- retired,
+                // never counted as an applied recenter.
+                if (LLOpenXRManager::recenterConsumptionEnabled() && have_sample_info)
+                {
+                    openxr.retireEligibleLocalTransitions(sample_time_ns,
+                                                          "absorbed_by_initial_capture");
+                }
+            }
+            else if (openxr.getLocalContinuityState() == 2 ||
+                     (sViewpointOverrideCaptureIncarnation != 0 &&
+                      sViewpointOverrideCaptureIncarnation != openxr.getIncarnation()))
+            {
+                // P2-04b (D5'): this base's frame is UNVERIFIED --
+                // either the continuity certificate broke under
+                // it, or it was captured under a manager
+                // incarnation that has since been destroyed.
+                // Suspend HMD head-driving (the head holds its
+                // last target), consume nothing, touch no
+                // calibration. An Unestablished certificate in
+                // the SAME incarnation (unauthenticated runtime)
+                // does NOT suspend: the base was captured and is
+                // used inside one self-consistent LOCAL lifetime
+                // -- exactly the pre-P2-04b situation -- and no
+                // transitions can be queued there anyway.
+                feed_head = false;
+            }
+            else if (LLOpenXRManager::recenterConsumptionEnabled() &&
+                     have_sample_info && sample_tracked && std::isfinite(hmd_yaw) &&
+                     std::isfinite(hmd_pitch) && std::isfinite(hmd_roll))
+            {
+                // P2-04b (D2'/D3'): consume at most one transition
+                // per frame -- the newest eligible at this
+                // sample's locate time (older eligible ones were
+                // retired as superseded inside the manager) --
+                // and apply it only if this consumed sample LANDS
+                // the facing at the new forward: |wrapped yaw|
+                // within tolerance. On acceptance the base is
+                // recaptured from THIS sample, so the head
+                // residual (sample - base) is zero from this
+                // frame on: the view faces the avatar's forward
+                // until the head moves (spec addendum). Rejection
+                // drops the transition forever; the runtime has
+                // already moved LOCAL, so the preserved base may
+                // leave a visible offset -- fail-closed by
+                // design (round 5).
+                LLLocalSpaceTransition transition;
+                int superseded_count = 0;
+                if (openxr.takeNewestEligibleLocalTransition(sample_time_ns, transition, superseded_count))
+                {
+                    const F32 landing_rad = fabsf(wrapAnglePi(hmd_yaw));
+                    const F32 landing_deg = landing_rad * (180.f / F_PI);
+                    if (landing_rad <= VIEWPOINT_OVERRIDE_RECENTER_LANDING_TOLERANCE)
+                    {
+                        const F32 old_base_yaw = sViewpointOverrideHmdBaseYaw;
+                        const F32 old_base_pitch = sViewpointOverrideHmdBasePitch;
+                        const F32 old_base_roll = sViewpointOverrideHmdBaseRoll;
+                        sViewpointOverrideHmdBaseYaw = hmd_yaw;
+                        sViewpointOverrideHmdBasePitch = hmd_pitch;
+                        sViewpointOverrideHmdBaseRoll = hmd_roll;
+
+                        std::ostringstream fields;
+                        fields << "\"incarnation\":" << transition.incarnation
+                               << ",\"generation\":" << transition.generation
+                               << ",\"change_time_ns\":" << transition.change_time_ns
+                               << ",\"app_frame_token\":" << LLOpenXRTrace::currentAppFrameToken()
+                               << ",\"sample_generation\":" << sample_generation
+                               << ",\"sample_time_ns\":" << sample_time_ns
+                               << ",\"landing_deg\":" << landing_deg
+                               << ",\"superseded_count\":" << superseded_count
+                               << ",\"old_base\":[" << old_base_yaw << "," << old_base_pitch << "," << old_base_roll << "]"
+                               << ",\"new_base\":[" << hmd_yaw << "," << hmd_pitch << "," << hmd_roll << "]"
+                               << ",\"continuity_state\":" << openxr.getLocalContinuityState()
+                               << ",\"continuity_basis\":\"" << openxr.getLocalContinuityBasis() << "\"";
+                        emitViewpointOverrideRecenterRecord("xr_recenter_applied", fields.str());
+                    }
+                    else
+                    {
+                        std::ostringstream fields;
+                        fields << "\"incarnation\":" << transition.incarnation
+                               << ",\"generation\":" << transition.generation
+                               << ",\"change_time_ns\":" << transition.change_time_ns
+                               << ",\"app_frame_token\":" << LLOpenXRTrace::currentAppFrameToken()
+                               << ",\"sample_generation\":" << sample_generation
+                               << ",\"sample_time_ns\":" << sample_time_ns
+                               << ",\"landing_deg\":" << landing_deg
+                               << ",\"tolerance_deg\":8.0"
+                               << ",\"superseded_count\":" << superseded_count;
+                        emitViewpointOverrideRecenterRecord("recenter_interlock_rejected", fields.str());
+                    }
+                }
             }
 
-            sViewpointOverrideHeadYaw = llclamp(
-                -(hmd_yaw - sViewpointOverrideHmdBaseYaw),
-                -VIEWPOINT_OVERRIDE_HEAD_ROTATION_CONSTRAINT,
-                 VIEWPOINT_OVERRIDE_HEAD_ROTATION_CONSTRAINT);
-            sViewpointOverrideHeadPitch = llclamp(
-                -(hmd_pitch - sViewpointOverrideHmdBasePitch),
-                -VIEWPOINT_OVERRIDE_HEAD_ROTATION_CONSTRAINT,
-                 VIEWPOINT_OVERRIDE_HEAD_ROTATION_CONSTRAINT);
-            sViewpointOverrideHeadRoll = llclamp(
-                (hmd_roll - sViewpointOverrideHmdBaseRoll),
-                -VIEWPOINT_OVERRIDE_HEAD_ROTATION_CONSTRAINT,
-                 VIEWPOINT_OVERRIDE_HEAD_ROTATION_CONSTRAINT);
+            if (feed_head)
+            {
+                sViewpointOverrideHeadYaw = llclamp(
+                    -(hmd_yaw - sViewpointOverrideHmdBaseYaw),
+                    -VIEWPOINT_OVERRIDE_HEAD_ROTATION_CONSTRAINT,
+                    VIEWPOINT_OVERRIDE_HEAD_ROTATION_CONSTRAINT);
+                sViewpointOverrideHeadPitch = llclamp(
+                    -(hmd_pitch - sViewpointOverrideHmdBasePitch),
+                    -VIEWPOINT_OVERRIDE_HEAD_ROTATION_CONSTRAINT,
+                    VIEWPOINT_OVERRIDE_HEAD_ROTATION_CONSTRAINT);
+                sViewpointOverrideHeadRoll = llclamp(
+                    (hmd_roll - sViewpointOverrideHmdBaseRoll),
+                    -VIEWPOINT_OVERRIDE_HEAD_ROTATION_CONSTRAINT,
+                    VIEWPOINT_OVERRIDE_HEAD_ROTATION_CONSTRAINT);
+            }
         }
-        else if (sViewpointOverrideMouseCaptured)
+
+        else if (sViewpointOverrideMouseCaptured && !sViewpointOverrideActivationOwned)
         {
+            // P2-04b (D6''): while a VR activation is owned the
+            // mouse branch is unreachable -- it must never clear
+            // the calibration or steer the head during tracking
+            // loss (the caution-2 hole). On the desktop (no
+            // ownership) this remains the Rule #9 fallback.
             sViewpointOverrideHmdCalibrated = false;
             sViewpointOverrideHeadRoll = 0.f;
             const F32 NOMINAL_MOUSE_SENSITIVITY = 0.0025f;
@@ -1618,8 +1967,13 @@ void LLAgentCamera::updateLookAt(const S32 mouse_x, const S32 mouse_y)
         return;
     }
 
-    if (sViewpointOverrideWasActive)
+    if (sViewpointOverrideWasActive && !sViewpointOverrideActivationOwned)
     {
+        // P2-04b (round-10 B2b fallback): while VR-owned, a
+        // falling override edge is an interruption, not an
+        // exit -- the calibration survives prim loss and the
+        // lifetime ends only via the mode/generation path.
+        // (Desktop, never owned, keeps the classic EXIT.)
         // Only force cursor visibility on exit when not in viewer mouselook.
         if (!cameraMouselook())
         {
@@ -1635,6 +1989,14 @@ void LLAgentCamera::updateLookAt(const S32 mouse_x, const S32 mouse_y)
         sViewpointOverrideHmdBaseYaw = 0.f;
         sViewpointOverrideHmdBasePitch = 0.f;
         sViewpointOverrideHmdBaseRoll = 0.f;
+        // P2-04b (D6''): the EXIT path runs only on genuine
+        // deactivation (the prim is gone without ownership, or
+        // ownership was already released by the bookkeeping
+        // above) -- clear the ownership state with the rest.
+        sViewpointOverrideActivationOwned = false;
+        sViewpointOverrideActivationAvatar = nullptr;
+        sViewpointOverrideRebinding = false;
+        sViewpointOverrideCaptureIncarnation = 0;
     }
 
     if  (LLTrace::get_frame_recording().getLastRecording().getLastValue(*gViewerWindow->getMouseVelocityStat()) < 0.01f
