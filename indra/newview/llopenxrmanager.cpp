@@ -2522,7 +2522,7 @@ struct XrSubmitTrace
     bool has_view_diag = false;
     std::string view_locate_status;
     int view_locate_result = 0;
-    unsigned long long view_state_flags = 0;
+    unsigned long long view_diag_state_flags = 0;
     uint32_t view_located_count = 0;
     float view_eye_pos[2][3] = {};
     float view_eye_quat[2][4] = {};
@@ -2961,8 +2961,8 @@ struct XrSubmitTrace
         {
             f << ",\"view_locate_status\":\"" << view_locate_status << "\"";
             f << ",\"view_locate_result\":" << view_locate_result;
-            f << ",\"view_state_flags\":" << view_state_flags;
             f << ",\"view_located_count\":" << view_located_count;
+            f << ",\"view_diag_state_flags\":" << view_diag_state_flags;
             for (uint32_t i = 0; i < 2 && i < view_located_count; i++)
             {
                 f << ",\"view_eye" << i << "_pos\":[" << f32(view_eye_pos[i][0]) << "," << f32(view_eye_pos[i][1]) << "," << f32(view_eye_pos[i][2]) << "]";
@@ -4414,7 +4414,7 @@ void LLOpenXRManager::submitFrameMonoImpl(const LLRect& source_rect, bool paced)
             xr_trace.t_view_locate_end = LLOpenXRTrace::nowUs();
         }
         xr_trace.view_locate_result = (int)diag_result;
-        xr_trace.view_state_flags = (unsigned long long)diag_view_state.viewStateFlags;
+        xr_trace.view_diag_state_flags = (unsigned long long)diag_view_state.viewStateFlags;
         xr_trace.view_located_count = diag_count;
         const bool diag_ok = XR_SUCCEEDED(diag_result) && diag_count >= 2 &&
             (diag_view_state.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) != 0 &&
