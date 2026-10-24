@@ -1795,9 +1795,18 @@ void LLAgentCamera::updateLookAt(const S32 mouse_x, const S32 mouse_y)
             bool feed_head = true;
             if (!sViewpointOverrideHmdCalibrated)
             {
+                // YAW-ONLY CALIBRATION (Leah, 2026-10-23,
+                // DESIGN-RULES rule #11): yaw is the only axis
+                // ever calibrated. Pitch and roll are
+                // gravity-referenced absolutes -- their bases
+                // are pinned to 0, never captured from the
+                // headset (a capture while looking down or
+                // tilted would bake that pose in as "level";
+                // she almost never holds her head perfectly
+                // straight at activation).
                 sViewpointOverrideHmdBaseYaw = hmd_yaw;
-                sViewpointOverrideHmdBasePitch = hmd_pitch;
-                sViewpointOverrideHmdBaseRoll = hmd_roll;
+                sViewpointOverrideHmdBasePitch = 0.f;
+                sViewpointOverrideHmdBaseRoll = 0.f;
                 sViewpointOverrideHmdCalibrated = true;
                 sViewpointOverrideCaptureIncarnation = openxr.getIncarnation();
 
@@ -1859,9 +1868,12 @@ void LLAgentCamera::updateLookAt(const S32 mouse_x, const S32 mouse_y)
                         const F32 old_base_yaw = sViewpointOverrideHmdBaseYaw;
                         const F32 old_base_pitch = sViewpointOverrideHmdBasePitch;
                         const F32 old_base_roll = sViewpointOverrideHmdBaseRoll;
+                        // Yaw-only (rule #11): a recenter
+                        // redefines forward, never level --
+                        // pitch/roll bases stay pinned at 0.
                         sViewpointOverrideHmdBaseYaw = hmd_yaw;
-                        sViewpointOverrideHmdBasePitch = hmd_pitch;
-                        sViewpointOverrideHmdBaseRoll = hmd_roll;
+                        sViewpointOverrideHmdBasePitch = 0.f;
+                        sViewpointOverrideHmdBaseRoll = 0.f;
 
                         std::ostringstream fields;
                         fields << "\"incarnation\":" << transition.incarnation
