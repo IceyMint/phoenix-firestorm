@@ -152,17 +152,17 @@ bool xr_paced_frame_loop_requested()
 }
 
 // P2-04b (D7'): FS_OPENXR_P2_RECENTER consumption gate reader --
-// read on each call like the other FS_OPENXR_* readers. Default
-// OFF in P2-04b: only an explicit parseable true ("1"/"true")
-// enables consumption; unset, empty, explicit false and
-// unparseable values all leave it off. P2-04c flips the default
-// once the release gates pass.
+// read on each call like the other FS_OPENXR_* readers. P2-04c:
+// consumption is the default after the P2-04b release gates passed
+// (headset acceptance 2026-10-23 + the yaw-only retest) -- unset,
+// empty or unparseable values enable it; an explicit parseable
+// value wins, so FS_OPENXR_P2_RECENTER=0 remains the escape hatch.
 bool xr_recenter_consumption_requested()
 {
     std::string value = LLStringUtil::getenv(OPENXR_P2_RECENTER_ENV);
     if (value.empty())
     {
-        return false;
+        return true;
     }
 
     bool result = false;
@@ -171,7 +171,7 @@ bool xr_recenter_consumption_requested()
         return result;
     }
 
-    return false;
+    return true;
 }
 
 // P2-01B: legacy-loop gate hook for the diagnostic cadence lock,
