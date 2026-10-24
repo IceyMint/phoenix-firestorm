@@ -52,6 +52,7 @@ constexpr const char* OPENXR_DIAG_CADENCE_ENV = "FS_OPENXR_DIAG_FIXED_CADENCE_HZ
 constexpr const char* OPENXR_DIAG_MARKER_ENV = "FS_OPENXR_DIAG_FRAME_MARKER";
 constexpr const char* OPENXR_P2_FRAME_LOOP_ENV = "FS_OPENXR_P2_FRAME_LOOP";
 constexpr const char* OPENXR_P2_RECENTER_ENV = "FS_OPENXR_P2_RECENTER";
+constexpr const char* OPENXR_P2_VIEW_DIAGNOSTIC_ENV = "FS_OPENXR_P2_VIEW_DIAGNOSTIC";
 
 bool is_openxr_mono_requested()
 {
@@ -172,6 +173,29 @@ bool xr_recenter_consumption_requested()
     }
 
     return true;
+}
+
+// P2-05a: FS_OPENXR_P2_VIEW_DIAGNOSTIC request reader. Sampled
+// EXACTLY ONCE per incarnation, at initialize() (spec P5-03
+// latch); this reader itself is never called per frame. Default
+// OFF in the strict sense: only an explicit parseable true
+// requests the diagnostic -- it is an experiment arm, not a
+// feature, so the P2-04c default-on pattern does not apply.
+bool xr_view_diagnostic_requested()
+{
+    std::string value = LLStringUtil::getenv(OPENXR_P2_VIEW_DIAGNOSTIC_ENV);
+    if (value.empty())
+    {
+        return false;
+    }
+
+    bool result = false;
+    if (LLStringUtil::convertToBOOL(value, result))
+    {
+        return result;
+    }
+
+    return false;
 }
 
 // P2-01B: legacy-loop gate hook for the diagnostic cadence lock,
@@ -643,6 +667,63 @@ XrPosef xr_center_pose_from_views(const XrView& left_view, const XrView& right_v
     return pose;
 }
 
+// P2-05a (P5-01): rigid-pose helpers for the VIEW diagnostic
+// conversion. xr_center_pose_from_views above AVERAGES two eye
+// poses; it is not a composition operator and is never used as
+// one. These helpers implement exact rigid inverse/composition
+// with explicit quaternion normalization at each step.
+XrQuaternionf xr_quat_normalized(const XrQuaternionf& q)
+{
+    const F32 len_sq = q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w;
+    if (len_sq > 0.f && std::isfinite(len_sq))
+    {
+        const F32 inv_len = 1.f / sqrtf(len_sq);
+        return XrQuaternionf{q.x * inv_len, q.y * inv_len, q.z * inv_len, q.w * inv_len};
+    }
+    return XrQuaternionf{0.f, 0.f, 0.f, 1.f};
+}
+
+XrQuaternionf xr_quat_multiply(const XrQuaternionf& a, const XrQuaternionf& b)
+{
+    // Hamilton product a * b (the rotation that applies b first,
+    // then a), normalized.
+    XrQuaternionf r;
+    r.w = a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z;
+    r.x = a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y;
+    r.y = a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x;
+    r.z = a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w;
+    return xr_quat_normalized(r);
+}
+
+XrVector3f xr_vec_rotated(const XrQuaternionf& q, const XrVector3f& v)
+{
+    const LLQuaternion rotation(q.x, q.y, q.z, q.w);
+    const LLVector3 rotated = LLVector3(v.x, v.y, v.z) * rotation;
+    return XrVector3f{rotated.mV[0], rotated.mV[1], rotated.mV[2]};
+}
+
+XrPosef xr_pose_invert(const XrPosef& pose)
+{
+    XrPosef inv{};
+    const XrQuaternionf q = xr_quat_normalized(pose.orientation);
+    inv.orientation = XrQuaternionf{-q.x, -q.y, -q.z, q.w};
+    const XrVector3f neg{-pose.position.x, -pose.position.y, -pose.position.z};
+    inv.position = xr_vec_rotated(inv.orientation, neg);
+    return inv;
+}
+
+XrPosef xr_pose_compose(const XrPosef& a, const XrPosef& b)
+{
+    // a ∘ b: b expressed through a (result = a * b as transforms).
+    XrPosef r{};
+    r.orientation = xr_quat_multiply(a.orientation, b.orientation);
+    const XrVector3f rotated = xr_vec_rotated(xr_quat_normalized(a.orientation), b.position);
+    r.position = XrVector3f{a.position.x + rotated.x,
+                            a.position.y + rotated.y,
+                            a.position.z + rotated.z};
+    return r;
+}
+
 bool xr_fov_aspect(const XrFovf& fov, F32& out_aspect)
 {
     const F32 horizontal_extent = tanf(fov.angleRight) + tanf(-fov.angleLeft);
@@ -950,6 +1031,14 @@ struct LLOpenXRManagerImpl
     XrSystemId system_id = XR_NULL_SYSTEM_ID;
     XrSession session = XR_NULL_HANDLE;
     XrSpace app_space = XR_NULL_HANDLE;
+    // P2-05a: VIEW diagnostic state, latched once at initialize()
+    // (P5-03). view_space is submission-only; app_space above
+    // remains the locate/camera/continuity space in both arms.
+    XrSpace view_space = XR_NULL_HANDLE;
+    bool view_diagnostic_requested = false;
+    bool view_diagnostic_create_failed = false;
+    bool diagnostic_arm_view = false;
+    bool view_interval_disturbed = false;
     XrSessionState session_state = XR_SESSION_STATE_UNKNOWN;
     XrEnvironmentBlendMode blend_mode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
     PFN_xrGetOpenGLGraphicsRequirementsKHR get_gl_requirements = nullptr;
@@ -1577,6 +1666,34 @@ bool LLOpenXRManager::initialize()
         return false;
     }
 
+    // P2-05a (P5-03): sample the VIEW diagnostic request ONCE,
+    // here at initialize(). The arm becomes VIEW only if the VIEW
+    // space is actually created; a creation failure leaves a real
+    // LOCAL arm (create_failed recorded for the session record),
+    // never a partially enabled diagnostic. app_space is never
+    // replaced or re-typed.
+    mImpl->view_diagnostic_requested = xr_view_diagnostic_requested();
+    if (mImpl->view_diagnostic_requested)
+    {
+        XrReferenceSpaceCreateInfo view_space_info{};
+        view_space_info.type = XR_TYPE_REFERENCE_SPACE_CREATE_INFO;
+        view_space_info.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
+        view_space_info.poseInReferenceSpace.orientation.w = 1.f;
+
+        const XrResult view_result = xrCreateReferenceSpace(mImpl->session, &view_space_info, &mImpl->view_space);
+        if (XR_SUCCEEDED(view_result) && mImpl->view_space != XR_NULL_HANDLE)
+        {
+            mImpl->diagnostic_arm_view = true;
+            openxr_info("P2-05a: VIEW diagnostic arm latched for this incarnation.");
+        }
+        else
+        {
+            mImpl->view_space = XR_NULL_HANDLE;
+            mImpl->view_diagnostic_create_failed = true;
+            openxr_warn("P2-05a: VIEW space creation failed; diagnostic unavailable, LOCAL arm retained.");
+        }
+    }
+
     // P2-04b (D5'): with the session and its LOCAL space created
     // under the authenticated pinned runtime, continuity is
     // Established for this (incarnation, session, app_space)
@@ -1855,6 +1972,18 @@ void LLOpenXRManager::processEvents()
                             hz_stream << diag_cadence_hz;
                             trace_extra_fields = "\"diag_cadence_target_hz\":" + hz_stream.str();
                         }
+                        {
+                            // P2-05a: the session record states the
+                            // latched diagnostic arm so an A/B trace
+                            // is self-describing.
+                            std::ostringstream diag_stream;
+                            diag_stream << "\"view_diagnostic\":\"" << (mImpl->diagnostic_arm_view ? "on" : (mImpl->view_diagnostic_create_failed ? "create_failed" : "off"))
+                                        << "\",\"diagnostic_arm\":\"" << (mImpl->diagnostic_arm_view ? "VIEW" : "LOCAL")
+                                        << "\",\"view_space\":" << static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(mImpl->view_space));
+                            trace_extra_fields = trace_extra_fields.empty()
+                                ? diag_stream.str()
+                                : trace_extra_fields + "," + diag_stream.str();
+                        }
                         const unsigned int trace_run = LLOpenXRTrace::beginRun(
                             LLOpenXRManager::pacedFrameLoopEnabled() ? "paced_pre_idle_mono" : "legacy_mono",
                             trace_extra_fields);
@@ -1965,6 +2094,7 @@ void LLOpenXRManager::processEvents()
             if (space_event->referenceSpaceType == XR_REFERENCE_SPACE_TYPE_LOCAL &&
                 space_event->session == mImpl->session &&
                 mImpl->runtime_authenticated &&
+                !mImpl->diagnostic_arm_view &&
                 LLOpenXRManager::recenterConsumptionEnabled())
             {
                 LLLocalSpaceTransition transition;
@@ -1998,6 +2128,24 @@ void LLOpenXRManager::processEvents()
                 {
                     mImpl->pending_local_transitions.push_back(transition);
                 }
+            }
+            else if (mImpl->diagnostic_arm_view &&
+                     space_event->referenceSpaceType == XR_REFERENCE_SPACE_TYPE_LOCAL &&
+                     space_event->session == mImpl->session)
+            {
+                // P2-05a (amendment 3 + P5-03): in a VIEW-arm
+                // incarnation the transition is logged but never
+                // enqueued -- consumption is suppressed for the
+                // whole arm, and the interval is marked disturbed
+                // for the analyzer's scoring exclusion. The
+                // P2-04a probe record above stays unconditional.
+                LLLocalSpaceTransition transition;
+                transition.incarnation = mImpl->incarnation;
+                transition.generation = mImpl->session_generation;
+                transition.change_time_ns = static_cast<long long>(space_event->changeTime);
+                emit_local_transition_record("suppressed_view_diagnostic", transition,
+                                             "\"reason\":\"view_diagnostic_arm\"");
+                mImpl->view_interval_disturbed = true;
             }
             break;
         }
@@ -2090,6 +2238,14 @@ bool LLOpenXRManager::takeNewestEligibleLocalTransition(long long sample_time_ns
     {
         return false;
     }
+    // P2-05a (P5-03): consumption protection -- a VIEW-arm
+    // incarnation never hands a transition to the camera. (Its
+    // queue is empty by construction; this is the explicit guard
+    // at the hand-off point.)
+    if (mImpl->diagnostic_arm_view)
+    {
+        return false;
+    }
     // One pass over the queue: stale-epoch entries are dropped
     // (traced; defensive -- STOPPING already clears the queue),
     // eligible current-epoch entries collapse to the newest
@@ -2162,6 +2318,12 @@ void LLOpenXRManager::retireEligibleLocalTransitions(long long sample_time_ns, c
 {
 #if LL_LINUX && LL_X11
     if (!mImpl)
+    {
+        return;
+    }
+    // P2-05a (P5-03): same consumption protection as the take
+    // path -- nothing is retired (finalized) in a VIEW arm either.
+    if (mImpl->diagnostic_arm_view)
     {
         return;
     }
@@ -2348,6 +2510,42 @@ struct XrSubmitTrace
     bool has_submitted_fov_generation = false;
     unsigned long long submitted_fov_generation = 0;
     std::string fp_layer;
+
+    // P2-05a (P5-04): diagnostic arm + VIEW provenance. diagnostic_arm
+    // is the LATCHED selection (always emitted); layer_space_type
+    // above remains the space of the layer actually submitted and
+    // stays absent on zero-layer frames (reads as null).
+    std::string diagnostic_arm = "LOCAL";
+    bool view_interval_disturbed = false;
+    bool has_runtime_eye_separation = false;
+    float runtime_eye_separation_m = 0.f;
+    bool has_view_diag = false;
+    std::string view_locate_status;
+    int view_locate_result = 0;
+    unsigned long long view_state_flags = 0;
+    uint32_t view_located_count = 0;
+    float view_eye_pos[2][3] = {};
+    float view_eye_quat[2][4] = {};
+    float view_eye_fov[2][4] = {};
+    long long t_view_locate_start = 0;
+    long long t_view_locate_end = 0;
+    long long t_view_rel_start = 0;
+    long long t_view_rel_end = 0;
+    std::string view_conversion_status;
+    std::string view_conversion_reason;
+    std::string view_conversion_confidence;
+    int view_rel_result = 0;
+    bool view_rel_attempted = false;
+    bool has_rel_flags = false;
+    bool has_rel_pos = false;
+    bool has_rel_quat = false;
+    float rel_pos[3] = {0.f, 0.f, 0.f};
+    float rel_quat[4] = {0.f, 0.f, 0.f, 1.f};
+    unsigned long long rel_flags = 0;
+    bool has_residual = false;
+    float residual_pos_m = 0.f;
+    float residual_angle_deg = 0.f;
+    std::string view_consistency = "unavailable";
 
     // P2-03a: frozen AvatarEyeFrame + render-receipt state
     // (paced records only; has_ stays false on legacy records and
@@ -2747,6 +2945,74 @@ struct XrSubmitTrace
                       << (has_submitted_image_index[i] ? std::to_string(submitted_view_image_index[i]) : std::string("null"));
                 }
             }
+        }
+        // P2-05a (P5-04): latched arm is always emitted; the VIEW
+        // provenance below rides only when the diagnostic block ran
+        // this frame. Zero-layer frames have no layer_space_type by
+        // construction -- an attempted VIEW submission is never
+        // readable as a success.
+        f << ",\"diagnostic_arm\":\"" << diagnostic_arm << "\"";
+        f << ",\"view_interval_disturbed\":" << (view_interval_disturbed ? "true" : "false");
+        if (has_runtime_eye_separation)
+        {
+            f << ",\"runtime_eye_separation_m\":" << f32(runtime_eye_separation_m);
+        }
+        if (has_view_diag)
+        {
+            f << ",\"view_locate_status\":\"" << view_locate_status << "\"";
+            f << ",\"view_locate_result\":" << view_locate_result;
+            f << ",\"view_state_flags\":" << view_state_flags;
+            f << ",\"view_located_count\":" << view_located_count;
+            for (uint32_t i = 0; i < 2 && i < view_located_count; i++)
+            {
+                f << ",\"view_eye" << i << "_pos\":[" << f32(view_eye_pos[i][0]) << "," << f32(view_eye_pos[i][1]) << "," << f32(view_eye_pos[i][2]) << "]";
+                f << ",\"view_eye" << i << "_quat\":[" << f32(view_eye_quat[i][0]) << "," << f32(view_eye_quat[i][1]) << "," << f32(view_eye_quat[i][2]) << "," << f32(view_eye_quat[i][3]) << "]";
+                f << ",\"view_eye" << i << "_fov\":[" << f32(view_eye_fov[i][0]) << "," << f32(view_eye_fov[i][1]) << "," << f32(view_eye_fov[i][2]) << "," << f32(view_eye_fov[i][3]) << "]";
+            }
+            f << ",\"t_view_locate_start_us\":" << t_view_locate_start;
+            f << ",\"t_view_locate_end_us\":" << t_view_locate_end;
+            f << ",\"t_view_rel_start_us\":" << t_view_rel_start;
+            f << ",\"t_view_rel_end_us\":" << t_view_rel_end;
+            f << ",\"view_conversion_status\":\"" << view_conversion_status << "\"";
+            f << ",\"view_conversion_reason\":\"" << view_conversion_reason << "\"";
+            f << ",\"view_conversion_confidence\":\"" << view_conversion_confidence << "\"";
+            if (view_rel_attempted)
+            {
+                f << ",\"view_rel_result\":" << view_rel_result;
+            }
+            else
+            {
+                f << ",\"view_rel_result\":null";
+            }
+            if (has_rel_flags)
+            {
+                // P5-I01: a pose component is serialized only when
+                // its VALID bit was set; otherwise it is null --
+                // never an undefined value dressed as data.
+                f << ",\"rel_flags\":" << rel_flags;
+                if (has_rel_pos)
+                {
+                    f << ",\"rel_pos\":[" << f32(rel_pos[0]) << "," << f32(rel_pos[1]) << "," << f32(rel_pos[2]) << "]";
+                }
+                else
+                {
+                    f << ",\"rel_pos\":null";
+                }
+                if (has_rel_quat)
+                {
+                    f << ",\"rel_quat\":[" << f32(rel_quat[0]) << "," << f32(rel_quat[1]) << "," << f32(rel_quat[2]) << "," << f32(rel_quat[3]) << "]";
+                }
+                else
+                {
+                    f << ",\"rel_quat\":null";
+                }
+            }
+            if (has_residual)
+            {
+                f << ",\"residual_pos_m\":" << f32(residual_pos_m);
+                f << ",\"residual_angle_deg\":" << f32(residual_angle_deg);
+            }
+            f << ",\"view_consistency\":\"" << view_consistency << "\"";
         }
         f << ",\"source_app_frame_token\":" << source_app_frame_token;
         if (has_source_gl)
@@ -3243,6 +3509,13 @@ void LLOpenXRManager::submitFrameMonoImpl(const LLRect& source_rect, bool paced)
     LLOpenXRTrace::flushIfDue();
     XrSubmitTrace xr_trace;
     xr_trace.tracing = LLOpenXRTrace::runActive();
+    // P2-05a (P5-04): the latched arm is stamped at entry so every
+    // record this call emits -- including early exits that never
+    // reach the submit construction -- names the SELECTED arm;
+    // layer_space_type separately names what was actually
+    // submitted (absent on zero-layer records).
+    xr_trace.diagnostic_arm = (mImpl && mImpl->diagnostic_arm_view) ? "VIEW" : "LOCAL";
+    xr_trace.view_interval_disturbed = mImpl && mImpl->view_interval_disturbed;
     if (xr_trace.tracing)
     {
         xr_trace.t_entry = LLOpenXRTrace::nowUs();
@@ -4071,6 +4344,209 @@ void LLOpenXRManager::submitFrameMonoImpl(const LLRect& source_rect, bool paced)
     xr_trace.mono_quat[2] = mono_pose.orientation.z;
     xr_trace.mono_quat[3] = mono_pose.orientation.w;
 
+    // P2-05a: diagnostic arm + conversion. The latch is read from
+    // the impl (set once at initialize; never re-decided here).
+    // The LOCAL arm keeps today's behavior exactly: submit_pose is
+    // mono_pose and the layer space stays app_space below.
+    const bool view_arm = mImpl && mImpl->diagnostic_arm_view;
+    xr_trace.diagnostic_arm = view_arm ? "VIEW" : "LOCAL";
+    xr_trace.view_interval_disturbed = mImpl && mImpl->view_interval_disturbed;
+    {
+        const XrVector3f& e0 = (*frame_views)[0].pose.position;
+        const XrVector3f& e1 = (*frame_views)[1].pose.position;
+        const F32 dx = e1.x - e0.x;
+        const F32 dy = e1.y - e0.y;
+        const F32 dz = e1.z - e0.z;
+        xr_trace.runtime_eye_separation_m = sqrtf(dx * dx + dy * dy + dz * dz);
+        xr_trace.has_runtime_eye_separation = std::isfinite(xr_trace.runtime_eye_separation_m);
+    }
+    XrPosef submit_pose = mono_pose;
+    if (view_arm)
+    {
+        xr_trace.has_view_diag = true;
+        auto end_zero_layer_view = [&](const char* finish_reason) {
+            XrFrameEndInfo frame_end_info{};
+            frame_end_info.type = XR_TYPE_FRAME_END_INFO;
+            frame_end_info.displayTime = frame_state.predictedDisplayTime;
+            frame_end_info.environmentBlendMode = mImpl->blend_mode;
+            frame_end_info.layerCount = 0;
+            frame_end_info.layers = nullptr;
+            xr_trace.captureEndFrame(frame_end_info, nullptr, nullptr, 0);
+            xr_trace.end_result = (int)xrEndFrame(mImpl->session, &frame_end_info);
+            if (paced)
+            {
+                mImpl->paced_frame.ended = true;
+            }
+            if (xr_trace.tracing)
+            {
+                xr_trace.t_end_end = LLOpenXRTrace::nowUs();
+            }
+            xr_trace.finish(finish_reason);
+        };
+
+        // Diagnostic locate: function-local storage ONLY (P5-02).
+        // It never touches mImpl->views, the frame context's
+        // located views, the locate generation, the published HMD
+        // pose, or the frozen AvatarEyeFrame.
+        XrViewState diag_view_state{};
+        diag_view_state.type = XR_TYPE_VIEW_STATE;
+        XrViewLocateInfo diag_locate_info{};
+        diag_locate_info.type = XR_TYPE_VIEW_LOCATE_INFO;
+        diag_locate_info.viewConfigurationType = XR_VIEW_CONFIG;
+        diag_locate_info.displayTime = frame_state.predictedDisplayTime;
+        diag_locate_info.space = mImpl->view_space;
+        XrView diag_views[2];
+        for (int i = 0; i < 2; i++)
+        {
+            diag_views[i] = XrView{};
+            diag_views[i].type = XR_TYPE_VIEW;
+        }
+        uint32_t diag_count = 0;
+        if (xr_trace.tracing)
+        {
+            xr_trace.t_view_locate_start = LLOpenXRTrace::nowUs();
+        }
+        const XrResult diag_result = xrLocateViews(
+            mImpl->session, &diag_locate_info, &diag_view_state,
+            2, &diag_count, diag_views);
+        if (xr_trace.tracing)
+        {
+            xr_trace.t_view_locate_end = LLOpenXRTrace::nowUs();
+        }
+        xr_trace.view_locate_result = (int)diag_result;
+        xr_trace.view_state_flags = (unsigned long long)diag_view_state.viewStateFlags;
+        xr_trace.view_located_count = diag_count;
+        const bool diag_ok = XR_SUCCEEDED(diag_result) && diag_count >= 2 &&
+            (diag_view_state.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT) != 0 &&
+            (diag_view_state.viewStateFlags & XR_VIEW_STATE_POSITION_VALID_BIT) != 0;
+        if (!diag_ok)
+        {
+            xr_trace.view_locate_status = XR_FAILED(diag_result) ? "locate_failed" : "incomplete";
+            xr_trace.view_conversion_status = "failed";
+            xr_trace.view_conversion_reason = "view_locate_failed";
+            end_zero_layer_view("view_locate_failed");
+            return;
+        }
+        xr_trace.view_locate_status = "ok";
+        for (uint32_t i = 0; i < 2; i++)
+        {
+            xr_trace.view_eye_pos[i][0] = diag_views[i].pose.position.x;
+            xr_trace.view_eye_pos[i][1] = diag_views[i].pose.position.y;
+            xr_trace.view_eye_pos[i][2] = diag_views[i].pose.position.z;
+            xr_trace.view_eye_quat[i][0] = diag_views[i].pose.orientation.x;
+            xr_trace.view_eye_quat[i][1] = diag_views[i].pose.orientation.y;
+            xr_trace.view_eye_quat[i][2] = diag_views[i].pose.orientation.z;
+            xr_trace.view_eye_quat[i][3] = diag_views[i].pose.orientation.w;
+            xr_trace.view_eye_fov[i][0] = diag_views[i].fov.angleLeft;
+            xr_trace.view_eye_fov[i][1] = diag_views[i].fov.angleRight;
+            xr_trace.view_eye_fov[i][2] = diag_views[i].fov.angleDown;
+            xr_trace.view_eye_fov[i][3] = diag_views[i].fov.angleUp;
+        }
+
+        // Conversion (P5-01): rel is the pose of the VIEW origin
+        // expressed in LOCAL (the tracked HMD position, lean
+        // included). Submitted pose = inverse(rel) o mono_pose.
+        XrSpaceLocation rel_loc{};
+        rel_loc.type = XR_TYPE_SPACE_LOCATION;
+        if (xr_trace.tracing)
+        {
+            xr_trace.t_view_rel_start = LLOpenXRTrace::nowUs();
+        }
+        xr_trace.view_rel_attempted = true;
+        const XrResult rel_result = xrLocateSpace(
+            mImpl->view_space, mImpl->app_space,
+            frame_state.predictedDisplayTime, &rel_loc);
+        if (xr_trace.tracing)
+        {
+            xr_trace.t_view_rel_end = LLOpenXRTrace::nowUs();
+        }
+        xr_trace.view_rel_result = (int)rel_result;
+        if (XR_SUCCEEDED(rel_result))
+        {
+            // P5-I01: flags are recorded whenever the locate
+            // succeeded, but a pose component is read only when
+            // its VALID bit is set -- without the bit the
+            // component is undefined, not data.
+            xr_trace.has_rel_flags = true;
+            xr_trace.rel_flags = (unsigned long long)rel_loc.locationFlags;
+            if ((rel_loc.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) != 0)
+            {
+                xr_trace.has_rel_pos = true;
+                xr_trace.rel_pos[0] = rel_loc.pose.position.x;
+                xr_trace.rel_pos[1] = rel_loc.pose.position.y;
+                xr_trace.rel_pos[2] = rel_loc.pose.position.z;
+            }
+            if ((rel_loc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) != 0)
+            {
+                xr_trace.has_rel_quat = true;
+                xr_trace.rel_quat[0] = rel_loc.pose.orientation.x;
+                xr_trace.rel_quat[1] = rel_loc.pose.orientation.y;
+                xr_trace.rel_quat[2] = rel_loc.pose.orientation.z;
+                xr_trace.rel_quat[3] = rel_loc.pose.orientation.w;
+            }
+        }
+        const bool rel_valid = XR_SUCCEEDED(rel_result) &&
+            (rel_loc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) != 0 &&
+            (rel_loc.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) != 0;
+        if (!rel_valid)
+        {
+            xr_trace.view_conversion_status = XR_FAILED(rel_result) ? "failed" : "invalid";
+            xr_trace.view_conversion_reason = XR_FAILED(rel_result) ? "locate_space_failed" : "rel_validity_bits_missing";
+            end_zero_layer_view("view_conversion_invalid");
+            return;
+        }
+        const bool rel_tracked =
+            (rel_loc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT) != 0 &&
+            (rel_loc.locationFlags & XR_SPACE_LOCATION_POSITION_TRACKED_BIT) != 0;
+        xr_trace.view_conversion_status = "valid";
+        xr_trace.view_conversion_confidence = rel_tracked ? "tracked" : "untracked";
+        submit_pose = xr_pose_compose(xr_pose_invert(rel_loc.pose), mono_pose);
+        // P5-I02: never hand the compositor a nonfinite pose. The
+        // helpers normalize (identity fallback for a degenerate
+        // quaternion), so this gate catches nonfinite positions
+        // propagated from the inputs.
+        if (!std::isfinite(submit_pose.position.x) || !std::isfinite(submit_pose.position.y) ||
+            !std::isfinite(submit_pose.position.z) || !std::isfinite(submit_pose.orientation.x) ||
+            !std::isfinite(submit_pose.orientation.y) || !std::isfinite(submit_pose.orientation.z) ||
+            !std::isfinite(submit_pose.orientation.w))
+        {
+            xr_trace.view_conversion_status = "invalid";
+            xr_trace.view_conversion_reason = "submit_pose_nonfinite";
+            end_zero_layer_view("view_conversion_invalid");
+            return;
+        }
+
+        // Prediction-consistency residual (P5-02): the VIEW
+        // center mapped back into LOCAL vs the LOCAL center.
+        const XrPosef view_center = xr_center_pose_from_views(diag_views[0], diag_views[1]);
+        const XrPosef mapped_center = xr_pose_compose(rel_loc.pose, view_center);
+        const F32 rdx = mapped_center.position.x - mono_pose.position.x;
+        const F32 rdy = mapped_center.position.y - mono_pose.position.y;
+        const F32 rdz = mapped_center.position.z - mono_pose.position.z;
+        xr_trace.residual_pos_m = sqrtf(rdx * rdx + rdy * rdy + rdz * rdz);
+        const XrQuaternionf qa = xr_quat_normalized(mapped_center.orientation);
+        const XrQuaternionf qb = xr_quat_normalized(mono_pose.orientation);
+        F32 qdot = qa.x * qb.x + qa.y * qb.y + qa.z * qb.z + qa.w * qb.w;
+        if (qdot < 0.f)
+        {
+            qdot = -qdot;
+        }
+        if (qdot > 1.f)
+        {
+            qdot = 1.f;
+        }
+        xr_trace.residual_angle_deg = 2.f * acosf(qdot) * (180.f / 3.14159265358979f);
+        xr_trace.has_residual = std::isfinite(xr_trace.residual_pos_m) && std::isfinite(xr_trace.residual_angle_deg);
+        // P5-I02: three states -- an unavailable residual is not
+        // a measured disagreement.
+        xr_trace.view_consistency = !xr_trace.has_residual
+                                        ? "unavailable"
+                                        : ((xr_trace.residual_pos_m <= 0.002f &&
+                                            xr_trace.residual_angle_deg <= 0.25f)
+                                               ? "consistent"
+                                               : "disagreeing");
+    }
+
     // P2-01B: diagnostic source-image marker state for this
     // submission. The encoded value is the low 10 bits of the
     // producing iteration's app_frame_token (maintained whether or
@@ -4208,7 +4684,7 @@ void LLOpenXRManager::submitFrameMonoImpl(const LLRect& source_rect, bool paced)
         }
 
         XrCompositionLayerProjectionView& projection_view = layer_views[submitted_view_count];
-        projection_view.pose = mono_pose;
+        projection_view.pose = submit_pose;
         projection_view.fov = mono_fov;
         projection_view.subImage.swapchain = swapchain.handle;
         projection_view.subImage.imageRect.offset = {0, 0};
@@ -4222,7 +4698,7 @@ void LLOpenXRManager::submitFrameMonoImpl(const LLRect& source_rect, bool paced)
 
     XrCompositionLayerProjection projection_layer{};
     projection_layer.type = XR_TYPE_COMPOSITION_LAYER_PROJECTION;
-    projection_layer.space = mImpl->app_space;
+    projection_layer.space = view_arm ? mImpl->view_space : mImpl->app_space;
     projection_layer.viewCount = submitted_view_count;
     projection_layer.views = layer_views.data();
 
@@ -4269,9 +4745,12 @@ void LLOpenXRManager::submitFrameMonoImpl(const LLRect& source_rect, bool paced)
     }
     // app_space is the session's XR_REFERENCE_SPACE_TYPE_LOCAL
     // reference space (created in initialize()); its handle value is
-    // the space identity within the run.
+    // the space identity within the run. P2-05a: in the VIEW arm the
+    // submitted layer's space is the diagnostic view_space instead;
+    // the label and handle recorded are the ones actually submitted.
     xr_trace.captureEndFrame(frame_end_info, submit_layer ? &projection_layer : nullptr,
-                             "LOCAL", (unsigned long long)(uintptr_t)mImpl->app_space);
+                             view_arm ? "VIEW" : "LOCAL",
+                             (unsigned long long)(uintptr_t)(view_arm ? mImpl->view_space : mImpl->app_space));
     result = xrEndFrame(mImpl->session, &frame_end_info);
     xr_trace.end_result = (int)result;
     if (paced)
@@ -5254,6 +5733,12 @@ void LLOpenXRManager::shutdown()
         swapchain.images.clear();
     }
     mImpl->swapchains.clear();
+
+    if (mImpl->view_space != XR_NULL_HANDLE)
+    {
+        xrDestroySpace(mImpl->view_space);
+        mImpl->view_space = XR_NULL_HANDLE;
+    }
 
     if (mImpl->app_space != XR_NULL_HANDLE)
     {
