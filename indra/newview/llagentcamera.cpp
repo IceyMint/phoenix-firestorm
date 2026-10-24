@@ -1885,7 +1885,7 @@ void LLAgentCamera::updateLookAt(const S32 mouse_x, const S32 mouse_y)
                                << ",\"landing_deg\":" << landing_deg
                                << ",\"superseded_count\":" << superseded_count
                                << ",\"old_base\":[" << old_base_yaw << "," << old_base_pitch << "," << old_base_roll << "]"
-                               << ",\"new_base\":[" << hmd_yaw << "," << hmd_pitch << "," << hmd_roll << "]"
+                               << ",\"new_base\":[" << sViewpointOverrideHmdBaseYaw << "," << sViewpointOverrideHmdBasePitch << "," << sViewpointOverrideHmdBaseRoll << "]"
                                << ",\"continuity_state\":" << openxr.getLocalContinuityState()
                                << ",\"continuity_basis\":\"" << openxr.getLocalContinuityBasis() << "\"";
                         emitViewpointOverrideRecenterRecord("xr_recenter_applied", fields.str());
