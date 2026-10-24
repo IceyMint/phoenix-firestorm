@@ -1375,8 +1375,26 @@ bool LLOpenXRManager::initialize()
                            << XR_VERSION_MINOR(instance_properties.runtimeVersion) << "."
                            << XR_VERSION_PATCH(instance_properties.runtimeVersion);
             mImpl->runtime_version = version_stream.str();
-            if (!mImpl->runtime_name.empty() &&
-                mImpl->runtime_name != "WiVRn" && mImpl->runtime_name != "Monado")
+            // The reported name is accepted when it IS one of
+            // the audited runtimes or carries that runtime's
+            // name as a leading token: Leah's WiVRn reports
+            // itself as "WiVRn 'v26.6-205-gbef986d6-dirty'"
+            // (name + version decoration, measured live
+            // 2026-10-23), so an exact-string test would reject
+            // the audited deployment itself. A foreign runtime
+            // (SteamVR, Oculus, ...) still fails: its name
+            // neither equals nor leads with WiVRn/Monado.
+            const std::string& reported_name = mImpl->runtime_name;
+            auto is_audited_runtime_name = [](const std::string& name, const char* base) {
+                const std::string base_str(base);
+                return name == base_str ||
+                       (name.size() > base_str.size() &&
+                        name.compare(0, base_str.size(), base_str) == 0 &&
+                        name[base_str.size()] == ' ');
+            };
+            if (!reported_name.empty() &&
+                !is_audited_runtime_name(reported_name, "WiVRn") &&
+                !is_audited_runtime_name(reported_name, "Monado"))
             {
                 name_ok = false;
             }
