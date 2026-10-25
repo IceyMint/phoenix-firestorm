@@ -13,6 +13,55 @@
     <key>Value</key>
     <integer>0</integer>
   </map>
+  <key>FSVRTrackingDisabledBones</key>
+    <map>
+      <key>Comment</key>
+      <string>P2-07a: versioned set of bones excluded from VR tracking (LLSD map: version + disabled array). Empty set means all bones enabled by preference. Unknown identifiers are preserved and ignored.</string>
+      <key>Persist</key>
+      <integer>1</integer>
+      <key>Type</key>
+      <string>LLSD</string>
+      <key>Value</key>
+      <map>
+        <key>version</key>
+        <integer>1</integer>
+        <key>disabled</key>
+        <array />
+      </map>
+    </map>
+  <key>FSVRTrackHeadPitch</key>
+    <map>
+      <key>Comment</key>
+      <string>P2-07a: the HMD may contribute pitch to the head/neck path. When off, pitch comes from the avatar's animation instead. Stage 1: evaluated in shadow mode only.</string>
+      <key>Persist</key>
+      <integer>1</integer>
+      <key>Type</key>
+      <string>Boolean</string>
+      <key>Value</key>
+      <integer>1</integer>
+    </map>
+  <key>FSVRTrackHeadRoll</key>
+    <map>
+      <key>Comment</key>
+      <string>P2-07a: the HMD may contribute roll to the head/neck path. When off, roll comes from the avatar's animation instead. Stage 1: evaluated in shadow mode only.</string>
+      <key>Persist</key>
+      <integer>1</integer>
+      <key>Type</key>
+      <string>Boolean</string>
+      <key>Value</key>
+      <integer>1</integer>
+    </map>
+  <key>FVRBodyFollowsHeadset</key>
+    <map>
+      <key>Comment</key>
+      <string>P2-07b (reserved): the avatar body follows excess headset yaw beyond the head clamp. Read in P2-07a for validation/trace only; it does not rotate the body yet.</string>
+      <key>Persist</key>
+      <integer>1</integer>
+      <key>Type</key>
+      <string>Boolean</string>
+      <key>Value</key>
+      <integer>1</integer>
+    </map>
   <key>FSEnforceStrictObjectCheck</key>
   <map>
     <key>Comment</key>

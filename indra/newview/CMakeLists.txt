@@ -216,6 +216,10 @@ set(viewer_SOURCE_FILES
     llagentaccess.cpp
     llagentbenefits.cpp
     llagentcamera.cpp
+    llvrboneregistry.cpp
+    llvrtrackingarbitrator.cpp
+    llvrtrackingframe.cpp
+    llvrtrackingsettings.cpp
     llagentdata.cpp
     llagentlanguage.cpp
     llagentlistener.cpp
@@ -1066,6 +1070,10 @@ set(viewer_HEADER_FILES
     llagentaccess.h
     llagentbenefits.h
     llagentcamera.h
+    llvrboneregistry.h
+    llvrtrackingarbitrator.h
+    llvrtrackingframe.h
+    llvrtrackingsettings.h
     llagentdata.h
     llagentlanguage.h
     llagentlistener.h

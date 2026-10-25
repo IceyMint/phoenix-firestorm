@@ -34,6 +34,7 @@
 #include "llagentaccess.h"
 #include "llagentbenefits.h"
 #include "llagentcamera.h"
+#include "llvrtrackingframe.h" // P2-07a Stage 1
 #include "llagentlistener.h"
 #include "llagentwearables.h"
 #include "llagentui.h"
@@ -2515,7 +2516,23 @@ void LLAgent::updateAgentPosition(const F32 dt, const F32 yaw_radians, const S32
     // Check for water and land collision, set underwater flag
     //
 
+    // P2-07a Stage 1: capture the tracking settings snapshot and
+    // frame identity, run the unchanged look-at path, then publish
+    // shadow arbitration decisions from its observation. The legacy
+    // head path is not modified by either call.
+    FSVRTrackingCoordinator::beginFrame();
     gAgentCamera.updateLookAt(mouse_x, mouse_y);
+    {
+        LLAgentCamera::ViewpointOverrideHeadObservation fs_head_observation;
+        if (gAgentCamera.getViewpointOverrideHeadObservation(fs_head_observation))
+        {
+            FSVRTrackingCoordinator::finalizeAfterLookAt(fs_head_observation);
+        }
+        else
+        {
+            FSVRTrackingCoordinator::finalizeWithoutObservation();
+        }
+    }
 
     // When agent has no parents, position updates come from setPositionAgent()
     // But when agent has a parent (ex: is seated), position remains unchanged

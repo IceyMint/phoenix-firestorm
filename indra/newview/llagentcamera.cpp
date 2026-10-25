@@ -170,6 +170,15 @@ bool sViewpointOverrideRebinding = false;
 // recreated under a preserved activation, the base's frame is
 // unverified and HMD head-driving suspends (see updateLookAt).
 unsigned long long sViewpointOverrideCaptureIncarnation = 0;
+// P2-07a Stage 1: observation stamp, written only at the point in
+// updateLookAt() where the override head target is actually applied
+// (see getViewpointOverrideHeadObservation). Diagnostic only.
+bool sFSHeadObsPrimPresent = false;
+F32 sFSHeadObsYaw = 0.f;
+F32 sFSHeadObsPitch = 0.f;
+F32 sFSHeadObsRoll = 0.f;
+LLVector3 sFSHeadObsLookDirection = LLVector3::zero;
+unsigned long long sFSHeadObsFrameToken = 0;
 // P2-04b (round-9): the VR-mode activation generation the
 // camera last reconciled against (manager-side record, bumped
 // in setMonoEnabled on every off->on edge).
@@ -397,6 +406,42 @@ bool getViewpointOverrideHmdYawPitchRoll(F32& out_yaw, F32& out_pitch, F32& out_
 // encloses the class (review round 1, B1). The internal-
 // linkage finder and constants above remain visible in this
 // translation unit.
+bool LLAgentCamera::getViewpointOverrideHeadObservation(ViewpointOverrideHeadObservation& out) const
+{
+    out = ViewpointOverrideHeadObservation();
+    out.override_owned = sViewpointOverrideActivationOwned;
+    out.hmd_calibrated = sViewpointOverrideHmdCalibrated;
+
+    const unsigned long long token = LLOpenXRTrace::currentAppFrameToken();
+    const bool fresh = (token != 0) && (sFSHeadObsFrameToken == token);
+    out.valid = fresh;
+    out.override_present = fresh && sFSHeadObsPrimPresent;
+    // Owned + calibrated but not freshly driven this frame means the
+    // frozen target is being retained: a P2-04 interruption hold.
+    out.interruption_hold =
+        out.override_owned && out.hmd_calibrated && !fresh;
+
+    unsigned long long sample_generation = 0;
+    long long sample_time_ns = 0;
+    bool sample_tracked = false;
+    const bool have_sample_info =
+        LLOpenXRManager::instance().getHeadConsumedSampleInfo(
+            sample_generation, sample_time_ns, sample_tracked);
+    out.sample_consumed = fresh && have_sample_info;
+    if (have_sample_info)
+    {
+        out.sample_generation = sample_generation;
+        out.sample_time_ns = sample_time_ns;
+        out.sample_tracked = sample_tracked;
+    }
+
+    out.target_yaw_rad = sFSHeadObsYaw;
+    out.target_pitch_rad = sFSHeadObsPitch;
+    out.target_roll_rad = sFSHeadObsRoll;
+    out.look_direction = sFSHeadObsLookDirection;
+    return true;
+}
+
 bool LLAgentCamera::getViewpointOverrideEyeState(ViewpointOverrideEyeState& out) const
 {
     out = ViewpointOverrideEyeState();
@@ -1973,6 +2018,15 @@ void LLAgentCamera::updateLookAt(const S32 mouse_x, const S32 mouse_y)
         const LLQuaternion pitch_rot(sViewpointOverrideHeadPitch, left_axis);
         headLookAxis = headLookAxis * pitch_rot;
         headLookAxis.normalize();
+
+        // P2-07a Stage 1: stamp the head observation for this
+        // frame (diagnostic only; the applied target is unchanged).
+        sFSHeadObsPrimPresent = true;
+        sFSHeadObsYaw = sViewpointOverrideHeadYaw;
+        sFSHeadObsPitch = sViewpointOverrideHeadPitch;
+        sFSHeadObsRoll = sViewpointOverrideHeadRoll;
+        sFSHeadObsLookDirection = headLookAxis;
+        sFSHeadObsFrameToken = LLOpenXRTrace::currentAppFrameToken();
 
         setLookAt(LOOKAT_TARGET_MOUSELOOK, gAgentAvatarp, headLookAxis);
         last_at_axis = LLVector3::x_axis * look_basis_rot;

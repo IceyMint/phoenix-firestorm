@@ -163,6 +163,29 @@ public:
         LLQuaternion head_world;
     };
     bool getViewpointOverrideEyeState(ViewpointOverrideEyeState& out) const;
+    // P2-07a Stage 1: read-only observation of the HMD head target
+    // as computed by the most recent updateLookAt(). Diagnostic
+    // only; nothing here feeds back into the legacy head path.
+    struct ViewpointOverrideHeadObservation
+    {
+        bool override_owned = false;
+        bool override_present = false;
+        bool hmd_calibrated = false;
+        // Owned + calibrated but not freshly driven this frame:
+        // the frozen P2-04 target is being retained (a hold).
+        bool interruption_hold = false;
+        bool sample_consumed = false;
+        unsigned long long sample_generation = 0;
+        long long sample_time_ns = 0;
+        bool sample_tracked = false;
+        float target_yaw_rad = 0.f;
+        float target_pitch_rad = 0.f;
+        float target_roll_rad = 0.f;
+        LLVector3 look_direction = LLVector3::zero;
+        // The stamped fields describe the current app frame.
+        bool valid = false;
+    };
+    bool getViewpointOverrideHeadObservation(ViewpointOverrideHeadObservation& out) const;
     bool isJoystickCameraUsed();
     void setInitSitRot(LLQuaternion sit_rot) { mInitSitRot = sit_rot; };
     void rotateToInitSitRot();
