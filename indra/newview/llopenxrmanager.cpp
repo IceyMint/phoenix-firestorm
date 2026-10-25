@@ -2227,6 +2227,24 @@ bool LLOpenXRManager::getHeadConsumedSampleInfo(unsigned long long& locate_gener
 #endif
 }
 
+bool LLOpenXRManager::getPublishedLocateGeneration(unsigned long long app_frame_token,
+                                                   unsigned long long& out_locate_generation) const
+{
+    out_locate_generation = 0;
+#if LL_LINUX && LL_X11
+    if (!mImpl || !mImpl->paced_frame.active ||
+        mImpl->paced_frame.token != app_frame_token ||
+        !mImpl->paced_frame.locate_attempted)
+    {
+        return false;
+    }
+    out_locate_generation = mImpl->paced_frame.located_generation;
+    return true;
+#else
+    return false;
+#endif
+}
+
 bool LLOpenXRManager::takeNewestEligibleLocalTransition(long long sample_time_ns,
                                                         LLLocalSpaceTransition& out_transition,
                                                         int& superseded_count)

@@ -261,6 +261,13 @@ public:
     bool getHeadConsumedSampleInfo(unsigned long long& locate_generation,
                                     long long& locate_time_ns,
                                     bool& orientation_tracked) const;
+    // P2-07a Stage 1: the locate generation of the frame context
+    // published by beginPacedFrame() for the given app frame token
+    // (the pre-idle published source; the avatar eye frame is only
+    // frozen after idle). Read-only observation; returns false when
+    // no context is active for that token.
+    bool getPublishedLocateGeneration(unsigned long long app_frame_token,
+                                      unsigned long long& out_locate_generation) const;
     // P2-04b (D2'): release the newest pending LOCAL transition
     // eligible at sample_time_ns (change_time_ns <= sample time,
     // current epoch). Older eligible transitions are retired

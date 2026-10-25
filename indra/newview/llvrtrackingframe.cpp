@@ -160,14 +160,16 @@ void emitTrace(const FSVRTrackingFrameDecisions& decisions,
 
 void fillPublishedGeneration(FSVRTrackingFrameInput& input)
 {
-    // The published generation comes from the frame context's frozen
-    // snapshot, independently of the head-consumption record
-    // (review finding P207A-S1-04).
-    LLXRAvatarEyeFrame eye_frame;
-    if (LLOpenXRManager::instance().getAvatarEyeFrame(eye_frame) &&
-        eye_frame.valid)
+    // The published generation comes from the frame context frozen
+    // by beginPacedFrame() BEFORE idle, read through the manager's
+    // token-validated accessor (review finding P207A-S1-04, second
+    // round: the avatar eye frame is only frozen after idle, so it
+    // cannot serve as the pre-idle published source).
+    unsigned long long published = 0;
+    if (LLOpenXRManager::instance().getPublishedLocateGeneration(
+            input.app_frame_token, published))
     {
-        input.published_locate_generation = eye_frame.locate_generation;
+        input.published_locate_generation = published;
         input.has_published_generation = true;
     }
 }

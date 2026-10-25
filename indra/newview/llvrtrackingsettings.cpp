@@ -198,6 +198,16 @@ void appendCanonicalLLSD(const LLSD& value, std::string& out)
         out += value.asString();
         out += ";";
         break;
+    case LLSD::TypeURI:
+    {
+        const std::string text = value.asString();
+        out += "uri:";
+        out += std::to_string(text.size());
+        out += ":";
+        out += text;
+        out += ";";
+        break;
+    }
     case LLSD::TypeDate:
         out += "date:";
         out += value.asString();
@@ -232,6 +242,13 @@ void appendCanonicalLLSD(const LLSD& value, std::string& out)
         for (LLSD::map_const_iterator it = value.beginMap();
              it != value.endMap(); ++it)
         {
+            // Keys are length-prefixed: without the length, two
+            // different maps can render identically ({"a"=1,"b"=2}
+            // vs {"a=i:1;b"=2}) and a real change would be missed
+            // (review finding P207A-S1-03, second round).
+            out += "k:";
+            out += std::to_string(it->first.size());
+            out += ":";
             out += it->first;
             out += "=";
             appendCanonicalLLSD(it->second, out);
