@@ -33,15 +33,23 @@ FSVRTrackingDisabledBoneSet FSVRTrackingSettings::parseDisabledBones(
         return result;
     }
 
-    if (!document.isMap() || !document.has("version") ||
-        !document["version"].isInteger() || !document.has("disabled") ||
-        !document["disabled"].isArray())
+    if (!document.isMap())
     {
         result.parse_status = FSVRTrackingDisabledBoneSet::ParseStatus::MALFORMED;
         result.writable = false;
         return result;
     }
 
+    // Classify the schema version BEFORE enforcing version-1 shape:
+    // a future version may lay its fields out differently and must
+    // still be recognized as an unsupported future version (never
+    // silently treated as malformed version 1).
+    if (!document.has("version") || !document["version"].isInteger())
+    {
+        result.parse_status = FSVRTrackingDisabledBoneSet::ParseStatus::MALFORMED;
+        result.writable = false;
+        return result;
+    }
     const S32 version = document["version"].asInteger();
     if (version < 1)
     {
@@ -61,6 +69,13 @@ FSVRTrackingDisabledBoneSet FSVRTrackingSettings::parseDisabledBones(
         return result;
     }
 
+    if (!document.has("disabled") || !document["disabled"].isArray())
+    {
+        result.parse_status = FSVRTrackingDisabledBoneSet::ParseStatus::MALFORMED;
+        result.writable = false;
+        return result;
+    }
+
     // Version 1: collect membership. Duplicates collapse in the set;
     // non-string entries make the document malformed rather than
     // being silently dropped.
@@ -74,11 +89,10 @@ FSVRTrackingDisabledBoneSet FSVRTrackingSettings::parseDisabledBones(
             result.disabled_ids.clear();
             return result;
         }
-        const std::string id = it->asString();
-        if (!id.empty())
-        {
-            result.disabled_ids.insert(id);
-        }
+        // Every string entry is membership, including an empty
+        // string: it is an unknown identifier, preserved exactly
+        // like any other, never silently dropped.
+        result.disabled_ids.insert(it->asString());
     }
 
     // Preserve unknown top-level fields for compatible round trips.
@@ -136,79 +150,109 @@ LLSD FSVRTrackingSettings::serializeDisabledBones(
 
 namespace
 {
-// Effective-settings fingerprint of the raw saved value, for change
-// detection (LLSD has no operator==). Only the parts that can affect
-// the effective snapshot are fingerprinted: schema version, disabled
-// membership and the presence of unknown top-level fields. A change
-// confined to an unknown field's value cannot change any effective
-// setting, so it correctly does not advance the generation.
-struct RawFingerprint
+// Deterministic canonical rendering of a complete LLSD document,
+// used for change detection (LLSD has no operator==). The canonical
+// form covers the WHOLE document -- unknown-field values included --
+// so a change anywhere in the raw setting is observed and the
+// snapshot's preserved document can never go stale relative to the
+// saved one (review finding P207A-S1-03). LLSD maps iterate in key
+// order, so the rendering is deterministic.
+void appendCanonicalLLSD(const LLSD& value, std::string& out)
 {
-    bool is_map = false;
-    bool has_version = false;
-    S32 version = 0;
-    bool disabled_is_array = false;
-    bool disabled_has_nonstring = false;
-    std::set<std::string> disabled_ids;
-    std::set<std::string> extra_keys;
-
-    bool operator==(const RawFingerprint& other) const
+    switch (value.type())
     {
-        return is_map == other.is_map && has_version == other.has_version &&
-               version == other.version &&
-               disabled_is_array == other.disabled_is_array &&
-               disabled_has_nonstring == other.disabled_has_nonstring &&
-               disabled_ids == other.disabled_ids &&
-               extra_keys == other.extra_keys;
+    case LLSD::TypeUndefined:
+        out += "u;";
+        break;
+    case LLSD::TypeBoolean:
+        out += value.asBoolean() ? "b:1;" : "b:0;";
+        break;
+    case LLSD::TypeInteger:
+    {
+        out += "i:";
+        out += std::to_string(value.asInteger());
+        out += ";";
+        break;
     }
-    bool operator!=(const RawFingerprint& other) const
+    case LLSD::TypeReal:
     {
-        return !(*this == other);
+        char buffer[32];
+        snprintf(buffer, sizeof(buffer), "%.17g", value.asReal());
+        out += "r:";
+        out += buffer;
+        out += ";";
+        break;
     }
-};
-
-RawFingerprint fingerprintRaw(const LLSD& document)
-{
-    RawFingerprint fp;
-    if (document.isUndefined() || !document.isMap())
+    case LLSD::TypeString:
     {
-        return fp;
+        const std::string text = value.asString();
+        out += "s:";
+        out += std::to_string(text.size());
+        out += ":";
+        out += text;
+        out += ";";
+        break;
     }
-    fp.is_map = true;
-    if (document.has("version") && document["version"].isInteger())
+    case LLSD::TypeUUID:
+        out += "uuid:";
+        out += value.asString();
+        out += ";";
+        break;
+    case LLSD::TypeDate:
+        out += "date:";
+        out += value.asString();
+        out += ";";
+        break;
+    case LLSD::TypeBinary:
     {
-        fp.has_version = true;
-        fp.version = document["version"].asInteger();
-    }
-    if (document.has("disabled") && document["disabled"].isArray())
-    {
-        fp.disabled_is_array = true;
-        for (LLSD::array_const_iterator it = document["disabled"].beginArray();
-             it != document["disabled"].endArray(); ++it)
+        const std::vector<U8> data = value.asBinary();
+        out += "bin:";
+        out += std::to_string(data.size());
+        out += ":";
+        static const char* const hex = "0123456789abcdef";
+        for (const U8 byte : data)
         {
-            if (it->isString())
-            {
-                fp.disabled_ids.insert(it->asString());
-            }
-            else
-            {
-                fp.disabled_has_nonstring = true;
-            }
+            out += hex[byte >> 4];
+            out += hex[byte & 0x0f];
         }
+        out += ";";
+        break;
     }
-    for (LLSD::map_const_iterator it = document.beginMap();
-         it != document.endMap(); ++it)
-    {
-        if (it->first != "version" && it->first != "disabled")
+    case LLSD::TypeArray:
+        out += "a[";
+        for (LLSD::array_const_iterator it = value.beginArray();
+             it != value.endArray(); ++it)
         {
-            fp.extra_keys.insert(it->first);
+            appendCanonicalLLSD(*it, out);
         }
+        out += "]";
+        break;
+    case LLSD::TypeMap:
+        out += "m{";
+        for (LLSD::map_const_iterator it = value.beginMap();
+             it != value.endMap(); ++it)
+        {
+            out += it->first;
+            out += "=";
+            appendCanonicalLLSD(it->second, out);
+        }
+        out += "}";
+        break;
+    default:
+        out += "?;";
+        break;
     }
-    return fp;
 }
 
-RawFingerprint s_last_fingerprint;
-bool s_last_fingerprint_valid = false;
+std::string canonicalLLSD(const LLSD& value)
+{
+    std::string out;
+    appendCanonicalLLSD(value, out);
+    return out;
+}
+
+std::string s_last_canonical;
+bool s_last_canonical_valid = false;
 bool s_last_pitch = true;
 bool s_last_roll = true;
 bool s_last_body_follow = true;
@@ -223,10 +267,10 @@ const FSVRTrackingSettingsSnapshot& FSVRTrackingSettings::captureForFrame()
     const bool pitch = gSavedSettings.getBOOL(SETTING_TRACK_HEAD_PITCH);
     const bool roll = gSavedSettings.getBOOL(SETTING_TRACK_HEAD_ROLL);
     const bool body_follow = gSavedSettings.getBOOL(SETTING_BODY_FOLLOWS_HEADSET);
-    const RawFingerprint fingerprint = fingerprintRaw(raw_disabled);
+    const std::string canonical = canonicalLLSD(raw_disabled);
 
-    const bool changed = !s_snapshot_initialized || !s_last_fingerprint_valid ||
-                         fingerprint != s_last_fingerprint ||
+    const bool changed = !s_snapshot_initialized || !s_last_canonical_valid ||
+                         canonical != s_last_canonical ||
                          pitch != s_last_pitch || roll != s_last_roll ||
                          body_follow != s_last_body_follow;
     if (!changed)
@@ -234,8 +278,8 @@ const FSVRTrackingSettingsSnapshot& FSVRTrackingSettings::captureForFrame()
         return s_snapshot;
     }
 
-    s_last_fingerprint = fingerprint;
-    s_last_fingerprint_valid = true;
+    s_last_canonical = canonical;
+    s_last_canonical_valid = true;
     s_last_pitch = pitch;
     s_last_roll = roll;
     s_last_body_follow = body_follow;

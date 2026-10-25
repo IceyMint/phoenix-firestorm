@@ -25,8 +25,16 @@ struct FSVRTrackingFrameInput
 {
     U64 app_frame_token = 0;
     U64 settings_generation = 0;
-    // Published/consumed HMD locate generation for this frame.
+    // The locate generation of the head sample actually consumed by
+    // updateLookAt() (from the manager's head-consumption record).
     U64 locate_generation = 0;
+    // The locate generation of the currently published XR snapshot,
+    // sourced independently from the frame context (review finding
+    // P207A-S1-04). has_published_generation is false when no
+    // published snapshot is available; the trace then emits null
+    // rather than copying the consumed value.
+    U64 published_locate_generation = 0;
+    bool has_published_generation = false;
     S64 sample_time_ns = 0;
     bool sample_tracked = false;
     bool sample_valid = false;
@@ -72,8 +80,10 @@ enum class FSVRDecisionKind
 
 // Per-bone arbitration decision (spec 2.6). Desired and applied are
 // recorded separately: in Stage 1 the desired owner is a shadow
-// evaluation while the applied owner is whatever the unchanged
-// legacy path actually did this frame.
+// evaluation while the applied owner is a legacy-path POLICY
+// ESTIMATE (inferred from ownership/sample state), not a measured
+// final joint contribution. The Stage-2 audits supply measured
+// applied evidence.
 struct FSVRBoneDecision
 {
     std::string bone_id;

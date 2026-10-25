@@ -57,6 +57,9 @@ struct FSVRTrackingDisabledBoneSet
 // next frame boundary, never mid-blend.
 struct FSVRTrackingSettingsSnapshot
 {
+    // Observed settings-state revision: advances on any accepted raw
+    // change, including transitions to malformed or unsupported
+    // documents (it is not a count of valid configurations only).
     U64 generation = 0;
     FSVRTrackingDisabledBoneSet disabled_bones;
     bool head_pitch_enabled = true;

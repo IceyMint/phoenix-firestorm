@@ -43,15 +43,17 @@ void emitTrace(const FSVRTrackingFrameDecisions& decisions,
     if (snapshot.generation != s_last_traced_generation)
     {
         s_last_traced_generation = snapshot.generation;
+        // LLOpenXRTrace::writeRecord wraps the payload in the
+        // record's own braces: pass bare comma-separated fields,
+        // never an enclosing object (review finding P207A-S1-01).
         std::ostringstream settings_fields;
-        settings_fields << "{\"settings_generation\":" << snapshot.generation
+        settings_fields << "\"settings_generation\":" << snapshot.generation
                         << ",\"schema_version\":"
                         << snapshot.disabled_bones.schema_version
                         << ",\"schema_valid\":"
                         << (snapshot.schema_valid ? "true" : "false")
                         << ",\"selective_requested\":"
-                        << (snapshot.selective_requested ? "true" : "false")
-                        << "}";
+                        << (snapshot.selective_requested ? "true" : "false");
         LLOpenXRTrace::writeRecord("vr_tracking_settings",
                                    settings_fields.str());
     }
@@ -69,7 +71,7 @@ void emitTrace(const FSVRTrackingFrameDecisions& decisions,
     }
 
     std::ostringstream fields;
-    fields << "{\"settings_generation\":" << decisions.settings_generation
+    fields << "\"settings_generation\":" << decisions.settings_generation
            << ",\"schema_version\":" << snapshot.disabled_bones.schema_version
            << ",\"schema_valid\":"
            << (snapshot.schema_valid ? "true" : "false")
@@ -77,10 +79,27 @@ void emitTrace(const FSVRTrackingFrameDecisions& decisions,
            << ",\"selective_requested\":"
            << (decisions.selective_requested ? "true" : "false")
            << ",\"selective_applied\":false"
+           << ",\"applied_basis\":\"legacy_policy_estimate\""
            << ",\"app_frame_token\":" << decisions.app_frame_token
-           << ",\"hmd_locate_generation\":" << input.locate_generation
-           << ",\"hmd_consumed_generation\":" << input.locate_generation
-           << ",\"source_active\":"
+           << ",\"hmd_published_locate_generation\":";
+    if (input.has_published_generation)
+    {
+        fields << input.published_locate_generation;
+    }
+    else
+    {
+        fields << "null";
+    }
+    fields << ",\"hmd_consumed_generation\":";
+    if (input.has_sample)
+    {
+        fields << input.locate_generation;
+    }
+    else
+    {
+        fields << "null";
+    }
+    fields << ",\"source_active\":"
            << ((input.override_owned && input.has_sample) ? "true" : "false")
            << ",\"source_pose_valid\":"
            << ((input.has_sample && input.sample_valid && input.sample_tracked)
@@ -135,8 +154,22 @@ void emitTrace(const FSVRTrackingFrameDecisions& decisions,
                << "\""
                << ",\"shadow_only\":true}";
     }
-    fields << "]}";
+    fields << "]";
     LLOpenXRTrace::writeRecord("vr_tracking", fields.str());
+}
+
+void fillPublishedGeneration(FSVRTrackingFrameInput& input)
+{
+    // The published generation comes from the frame context's frozen
+    // snapshot, independently of the head-consumption record
+    // (review finding P207A-S1-04).
+    LLXRAvatarEyeFrame eye_frame;
+    if (LLOpenXRManager::instance().getAvatarEyeFrame(eye_frame) &&
+        eye_frame.valid)
+    {
+        input.published_locate_generation = eye_frame.locate_generation;
+        input.has_published_generation = true;
+    }
 }
 
 void publishDecisions(const FSVRTrackingFrameInput& input,
@@ -203,6 +236,7 @@ void FSVRTrackingCoordinator::finalizeAfterLookAt(
     input.look_direction = observation.look_direction;
     input.avatar_valid = !gAgentAvatarp.isNull();
     input.registry_generation = 1;
+    fillPublishedGeneration(input);
 
     s_pending_valid = false;
     publishDecisions(input, snapshot);
@@ -223,6 +257,7 @@ void FSVRTrackingCoordinator::finalizeWithoutObservation()
     input.vr_active = LLOpenXRManager::instance().isVRModeActive();
     input.avatar_valid = !gAgentAvatarp.isNull();
     input.registry_generation = 1;
+    fillPublishedGeneration(input);
 
     s_pending_valid = false;
     publishDecisions(input, snapshot);

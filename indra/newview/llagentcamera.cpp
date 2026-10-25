@@ -179,6 +179,14 @@ F32 sFSHeadObsPitch = 0.f;
 F32 sFSHeadObsRoll = 0.f;
 LLVector3 sFSHeadObsLookDirection = LLVector3::zero;
 unsigned long long sFSHeadObsFrameToken = 0;
+// Whether P2-04 actually accepted the current sample at the target
+// stamp (use_hmd_look && feed_head); a retained target rebuilt
+// during an interruption does not set this.
+bool sFSHeadObsSampleAccepted = false;
+unsigned long long sFSHeadObsAcceptedFrameToken = 0;
+// Prim presence is stamped every updateLookAt() under its own
+// token, so it never borrows the target stamp's freshness.
+unsigned long long sFSHeadObsPrimFrameToken = 0;
 // P2-04b (round-9): the VR-mode activation generation the
 // camera last reconciled against (manager-side record, bumped
 // in setMonoEnabled on every off->on edge).
@@ -413,13 +421,17 @@ bool LLAgentCamera::getViewpointOverrideHeadObservation(ViewpointOverrideHeadObs
     out.hmd_calibrated = sViewpointOverrideHmdCalibrated;
 
     const unsigned long long token = LLOpenXRTrace::currentAppFrameToken();
-    const bool fresh = (token != 0) && (sFSHeadObsFrameToken == token);
-    out.valid = fresh;
-    out.override_present = fresh && sFSHeadObsPrimPresent;
-    // Owned + calibrated but not freshly driven this frame means the
-    // frozen target is being retained: a P2-04 interruption hold.
-    out.interruption_hold =
-        out.override_owned && out.hmd_calibrated && !fresh;
+    // Presence is stamped every updateLookAt(); the target stamp is
+    // written only when the override look-axis block ran. Each stamp
+    // carries its own frame token so neither borrows the other's
+    // freshness (review finding P207A-S1-02).
+    const bool prim_fresh =
+        (token != 0) && (sFSHeadObsPrimFrameToken == token);
+    out.override_present = prim_fresh && sFSHeadObsPrimPresent;
+
+    const bool target_fresh =
+        (token != 0) && (sFSHeadObsFrameToken == token);
+    out.valid = target_fresh;
 
     unsigned long long sample_generation = 0;
     long long sample_time_ns = 0;
@@ -427,13 +439,22 @@ bool LLAgentCamera::getViewpointOverrideHeadObservation(ViewpointOverrideHeadObs
     const bool have_sample_info =
         LLOpenXRManager::instance().getHeadConsumedSampleInfo(
             sample_generation, sample_time_ns, sample_tracked);
-    out.sample_consumed = fresh && have_sample_info;
+    // A sample counts as consumed only when P2-04 actually accepted
+    // it this frame (use_hmd_look && feed_head at the stamp point).
+    // A retained target rebuilt during an interruption is a hold,
+    // not fresh tracking.
+    const bool accepted_fresh =
+        sFSHeadObsAcceptedFrameToken == token;
+    out.sample_consumed = target_fresh && accepted_fresh &&
+                          sFSHeadObsSampleAccepted && have_sample_info;
     if (have_sample_info)
     {
         out.sample_generation = sample_generation;
         out.sample_time_ns = sample_time_ns;
         out.sample_tracked = sample_tracked;
     }
+    out.interruption_hold =
+        out.override_owned && out.hmd_calibrated && !out.sample_consumed;
 
     out.target_yaw_rad = sFSHeadObsYaw;
     out.target_pitch_rad = sFSHeadObsPitch;
@@ -1695,6 +1716,10 @@ void LLAgentCamera::updateLookAt(const S32 mouse_x, const S32 mouse_y)
     LLViewerObject* viewpoint_override_mesh = nullptr;
     const ViewpointOverridePrimState prim_state = getViewpointOverridePrimState(viewpoint_override_mesh);
     const bool viewpoint_override_active = (prim_state == ViewpointOverridePrimState::Present);
+    // P2-07a Stage 1: stamp prim presence for this frame's head
+    // observation (diagnostic only).
+    sFSHeadObsPrimPresent = viewpoint_override_active;
+    sFSHeadObsPrimFrameToken = LLOpenXRTrace::currentAppFrameToken();
 
     if (sViewpointOverrideActivationOwned && !sViewpointOverrideRebinding &&
         gAgentAvatarp.notNull() && sViewpointOverrideActivationAvatar &&
@@ -1967,6 +1992,13 @@ void LLAgentCamera::updateLookAt(const S32 mouse_x, const S32 mouse_y)
                     -VIEWPOINT_OVERRIDE_HEAD_ROTATION_CONSTRAINT,
                     VIEWPOINT_OVERRIDE_HEAD_ROTATION_CONSTRAINT);
             }
+            // P2-07a Stage 1: record whether this frame's HMD
+            // sample was actually accepted (diagnostic only). The
+            // frame token guards the value: on frames where this
+            // block does not run, the stamp goes stale and the
+            // observation reports no consumption.
+            sFSHeadObsSampleAccepted = feed_head;
+            sFSHeadObsAcceptedFrameToken = LLOpenXRTrace::currentAppFrameToken();
         }
 
         else if (sViewpointOverrideMouseCaptured && !sViewpointOverrideActivationOwned)
@@ -2021,7 +2053,6 @@ void LLAgentCamera::updateLookAt(const S32 mouse_x, const S32 mouse_y)
 
         // P2-07a Stage 1: stamp the head observation for this
         // frame (diagnostic only; the applied target is unchanged).
-        sFSHeadObsPrimPresent = true;
         sFSHeadObsYaw = sViewpointOverrideHeadYaw;
         sFSHeadObsPitch = sViewpointOverrideHeadPitch;
         sFSHeadObsRoll = sViewpointOverrideHeadRoll;
