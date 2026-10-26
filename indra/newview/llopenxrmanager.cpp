@@ -2234,8 +2234,16 @@ bool LLOpenXRManager::getPublishedLocateGeneration(unsigned long long app_frame_
 #if LL_LINUX && LL_X11
     if (!mImpl || !mImpl->paced_frame.active ||
         mImpl->paced_frame.token != app_frame_token ||
-        !mImpl->paced_frame.locate_attempted)
+        !mImpl->paced_frame.locate_attempted ||
+        !mImpl->paced_frame.views_valid ||
+        mImpl->paced_frame.located_generation == 0)
     {
+        // No valid publication for this token: a failed or invalid
+        // locate adopts no generation, and reporting 0 would be
+        // indistinguishable from a real generation in the trace
+        // (finding S1-04b). views_valid is set exactly when
+        // located_generation > 0 at publication; the explicit zero
+        // check is defensive.
         return false;
     }
     out_locate_generation = mImpl->paced_frame.located_generation;
