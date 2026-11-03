@@ -1,3 +1,13 @@
+#ifdef FSVR_C2_POSITION_ONLY
+// P2-07B C2 (brief CP-2): standalone H2 harness build. Only the
+// pure position-adoption helper further down is compiled;
+// everything else in this file is viewer/OpenXR-coupled and
+// excluded by the matching guards.
+#include "v3math.h"
+
+#include <cmath>
+#include <cstdint>
+#else
 #include "llviewerprecompiledheaders.h"
 
 #include "llopenxrmanager.h"
@@ -41,8 +51,10 @@
 #include <sstream>
 #include <string>
 #include <vector>
-#endif
+#endif // LL_LINUX && LL_X11
+#endif // !FSVR_C2_POSITION_ONLY
 
+#ifndef FSVR_C2_POSITION_ONLY
 namespace
 {
 constexpr const char* OPENXR_MONO_ENV = "FS_OPENXR_MONO";
@@ -210,6 +222,141 @@ bool xr_diag_frame_loop_is_legacy()
     // cadence lock may engage.
     return !LLOpenXRManager::instance().isPacedFrameLoopSelected();
 }
+
+#endif // FSVR_C2_POSITION_ONLY
+
+#ifdef FSVR_C2_POSITION_ONLY
+namespace
+{
+#endif
+
+// P2-07B C2 (brief CP-2): the pure HMD-position adoption decision.
+// This file cannot link into the offline H2 harness, so the
+// adoption DECISION -- which position, what usability, what
+// stamp -- lives in this small pure function over plain values,
+// in the factoring style C1 set for
+// FSVRAdapterApply::computePlan; adopt_located_views() further
+// down is a thin caller that feeds it the located views and
+// stores its result in the impl (CP-3). The standalone harness
+// compiles ONLY this region of the file (FSVR_C2_POSITION_ONLY);
+// it sits in the file-scope anonymous namespace, ahead of the
+// OpenXR-coupled regions, so the guard regions stay balanced.
+struct FSVRHmdPositionAdoption
+{
+    // DP-1 fusion of the usable views' positions: the mean (the
+    // cyclopean midpoint); with exactly one usable view, that
+    // view's position as-is. Zero when no view's position was
+    // usable, so no fused value is ever published as usable.
+    LLVector3 position = LLVector3::zero;
+    // CP-2 [R1]/[R2]: at least one view supplied a usable
+    // (all-coordinates-finite) position. The caller stores this
+    // in adopted_position_valid; it is the PositionUsable term
+    // of the three-term validity predicate (CP-1 [R2]).
+    bool position_usable = false;
+    // The sample's position-tracked bit, carried through
+    // unchanged (the caller extracts it from the view-state
+    // flags; the extraction stays with the OpenXR-coupled code).
+    bool position_tracked = false;
+    // The stamp the stored state binds to (CP-3): the locate
+    // generation and predicted display time passed in, echoed
+    // back so the binding is part of the decision itself and
+    // the harness can check it.
+    unsigned long long locate_generation = 0;
+    long long predicted_display_time_ns = 0;
+};
+
+FSVRHmdPositionAdoption decide_hmd_position_adoption(
+    const LLVector3* view_positions,
+    uint32_t view_count,
+    bool position_tracked,
+    unsigned long long locate_generation,
+    long long predicted_display_time_ns)
+{
+    FSVRHmdPositionAdoption result;
+    result.position_tracked = position_tracked;
+    result.locate_generation = locate_generation;
+    result.predicted_display_time_ns = predicted_display_time_ns;
+
+    // CP-2 [R1]: position usability is decided per view,
+    // independently of orientation usability -- the orientation
+    // accumulation's view count is a caller-supplied extent, not
+    // a per-view position predicate, and is never consulted
+    // here. A view's position is usable only if all three
+    // coordinates are finite (NaN / +-inf rejected); only usable
+    // positions enter the DP-1 fusion.
+    LLVector3 accumulated = LLVector3::zero;
+    uint32_t usable_positions = 0;
+    for (uint32_t i = 0; i < view_count; ++i)
+    {
+        const LLVector3& view_position = view_positions[i];
+        if (std::isfinite(view_position.mV[0]) &&
+            std::isfinite(view_position.mV[1]) &&
+            std::isfinite(view_position.mV[2]))
+        {
+            accumulated += view_position;
+            ++usable_positions;
+        }
+    }
+    if (usable_positions > 0)
+    {
+        const F32 count = static_cast<F32>(usable_positions);
+        result.position.set(accumulated.mV[0] / count,
+                            accumulated.mV[1] / count,
+                            accumulated.mV[2] / count);
+        result.position_usable = true;
+    }
+    return result;
+}
+
+// CP-1 [R2]: the complete position-validity predicate, shared by
+// the CP-5 accessor and the CP-6 eye-frame decision below so the
+// two can never drift apart. PositionValid = SampleValid &&
+// PositionUsable && PositionTracked (spec section 5: a
+// valid-but-inferred position is unusable).
+bool hmd_position_publishable(bool sample_valid,
+                              bool position_usable,
+                              bool position_tracked)
+{
+    return sample_valid && position_usable && position_tracked;
+}
+
+// CP-6: the eye-frame freeze's position decision. The adopted
+// sample is accepted only when its locate generation IS the
+// frame's locate generation -- the same discipline the freeze
+// applies to the FOV sample. On any mismatch (or a zero frame
+// generation, which names no locate) the frame publishes
+// invalid and NO position: never a position from a different
+// locate.
+struct FSVREyeFramePosition
+{
+    LLVector3 position = LLVector3::zero;
+    bool valid = false;
+};
+
+FSVREyeFramePosition decide_eye_frame_position(
+    bool sample_valid,
+    bool position_usable,
+    bool position_tracked,
+    unsigned long long adopted_locate_generation,
+    unsigned long long frame_locate_generation,
+    const LLVector3& adopted_position)
+{
+    FSVREyeFramePosition result;
+    if (frame_locate_generation != 0 &&
+        adopted_locate_generation == frame_locate_generation &&
+        hmd_position_publishable(sample_valid, position_usable, position_tracked))
+    {
+        result.position = adopted_position;
+        result.valid = true;
+    }
+    return result;
+}
+
+#ifdef FSVR_C2_POSITION_ONLY
+} // namespace
+#endif
+
+#ifndef FSVR_C2_POSITION_ONLY
 }
 
 /*static*/ bool LLOpenXRManager::coherentOpticsEnabled()
@@ -1140,6 +1287,21 @@ struct LLOpenXRManagerImpl
     long long adopted_sample_time_ns = 0;
     bool adopted_sample_orientation_tracked = false;
     bool adopted_sample_valid = false;
+    // P2-07B C2 (brief CP-1): the adopted HMD position of the SAME
+    // locate the stamp above names -- raw LOCAL components
+    // (OpenXR metres), the DP-1 fusion of the usable views as
+    // decided by the CP-2 helper. adopted_position_valid stores
+    // the helper's per-view usability outcome as state ([R2]: it
+    // is the PositionUsable term of PositionValid = SampleValid
+    // && PositionUsable && PositionTracked, which no sample-level
+    // flag can reconstruct); adopted_sample_position_tracked is
+    // the sample's POSITION_TRACKED bit. Every write that clears
+    // adopted_sample_valid also clears both flags and zeroes the
+    // position (CP-4 [R1][R2]), so no stale position can outlive
+    // its sample.
+    LLVector3 adopted_sample_position = LLVector3::zero;
+    bool adopted_sample_position_tracked = false;
+    bool adopted_position_valid = false;
     unsigned long long head_consumed_sample_time_ns = 0;
     bool head_consumed_sample_orientation_tracked = false;
     bool head_consumed_sample_valid = false;
@@ -1918,6 +2080,11 @@ void LLOpenXRManager::processEvents()
             mImpl->has_hmd_up = false;
             mImpl->adopted_sample_valid = false;
             mImpl->head_consumed_sample_valid = false;
+            // P2-07B C2 (CP-4 [R1][R2]): position invalidated
+            // with the sample.
+            mImpl->adopted_sample_position = LLVector3::zero;
+            mImpl->adopted_sample_position_tracked = false;
+            mImpl->adopted_position_valid = false;
             mDisabled = true;
             return;
         }
@@ -3292,11 +3459,47 @@ unsigned long long adopt_located_views(LLOpenXRManagerImpl& impl,
         impl.adopted_sample_orientation_tracked =
             (view_state_flags & XR_VIEW_STATE_ORIENTATION_TRACKED_BIT) != 0;
         impl.adopted_sample_valid = true;
+        // P2-07B C2 (CP-3): adopt the located views' LOCAL
+        // position from THIS locate, in the same block, under
+        // the same generation/time stamp as the orientation
+        // above. The within-locate binding is the whole
+        // guarantee (brief section 1.1 [R1]: it confers NO
+        // comparability across a LOCAL transition -- C8 owns
+        // that seam). The decision is the CP-2 pure helper's;
+        // the raw LOCAL components are carried across
+        // uninterpreted, exactly as the orientation path carries
+        // raw quaternion components (section 2.4).
+        {
+            std::vector<LLVector3> view_positions;
+            view_positions.reserve(usable_view_count);
+            for (uint32_t i = 0; i < usable_view_count; ++i)
+            {
+                const XrVector3f& p = views[i].pose.position;
+                view_positions.emplace_back(p.x, p.y, p.z);
+            }
+            const FSVRHmdPositionAdoption position_adoption =
+                decide_hmd_position_adoption(
+                    view_positions.data(),
+                    static_cast<uint32_t>(view_positions.size()),
+                    (view_state_flags & XR_VIEW_STATE_POSITION_TRACKED_BIT) != 0,
+                    this_locate_generation,
+                    predicted_display_time_ns);
+            impl.adopted_sample_position = position_adoption.position;
+            impl.adopted_sample_position_tracked = position_adoption.position_tracked;
+            impl.adopted_position_valid = position_adoption.position_usable;
+        }
     }
     else
     {
         impl.has_hmd_forward = false;
         impl.adopted_sample_valid = false;
+        // P2-07B C2 (CP-3 failure branch / CP-4 [R1][R2]): the
+        // position dies with the sample -- tracked and
+        // usability flags cleared, stored position zeroed, so
+        // the accessor can never serve a stale position.
+        impl.adopted_sample_position = LLVector3::zero;
+        impl.adopted_sample_position_tracked = false;
+        impl.adopted_position_valid = false;
     }
 
     if (usable_view_count > 0 && accumulated_up.normalize() > 0.f)
@@ -4918,6 +5121,11 @@ void LLOpenXRManager::beginPacedFrame()
         // session_running && has_hmd_forward).
         mImpl->adopted_sample_valid = false;
         mImpl->head_consumed_sample_valid = false;
+        // P2-07B C2 (CP-4 [R1][R2]): position invalidated with
+        // the sample.
+        mImpl->adopted_sample_position = LLVector3::zero;
+        mImpl->adopted_sample_position_tracked = false;
+        mImpl->adopted_position_valid = false;
         mImpl->has_hmd_forward = false;
         mImpl->has_hmd_up = false;
         openxr_warn("xrWaitFrame failed (paced loop): " + format_xr_result(mImpl->instance, wait_result));
@@ -4958,6 +5166,11 @@ void LLOpenXRManager::beginPacedFrame()
         // part of the snapshot this exit retires.
         mImpl->adopted_sample_valid = false;
         mImpl->head_consumed_sample_valid = false;
+        // P2-07B C2 (CP-4 [R1][R2]): position invalidated with
+        // the sample.
+        mImpl->adopted_sample_position = LLVector3::zero;
+        mImpl->adopted_sample_position_tracked = false;
+        mImpl->adopted_position_valid = false;
         frame_ctx.pending_end_status = "skipped_should_render";
         return;
     }
@@ -4971,6 +5184,11 @@ void LLOpenXRManager::beginPacedFrame()
         mImpl->has_hmd_up = false;
         mImpl->adopted_sample_valid = false;
         mImpl->head_consumed_sample_valid = false;
+        // P2-07B C2 (CP-4 [R1][R2]): position invalidated with
+        // the sample.
+        mImpl->adopted_sample_position = LLVector3::zero;
+        mImpl->adopted_sample_position_tracked = false;
+        mImpl->adopted_position_valid = false;
         frame_ctx.pending_end_status = "locate_failed";
         return;
     }
@@ -5014,6 +5232,11 @@ void LLOpenXRManager::beginPacedFrame()
         // consumed against it.
         mImpl->adopted_sample_valid = false;
         mImpl->head_consumed_sample_valid = false;
+        // P2-07B C2 (CP-4 [R1][R2]): position invalidated with
+        // the sample.
+        mImpl->adopted_sample_position = LLVector3::zero;
+        mImpl->adopted_sample_position_tracked = false;
+        mImpl->adopted_position_valid = false;
         frame_ctx.pending_end_status = "locate_failed";
         return;
     }
@@ -5039,6 +5262,11 @@ void LLOpenXRManager::beginPacedFrame()
         mImpl->has_hmd_up = false;
         mImpl->adopted_sample_valid = false;
         mImpl->head_consumed_sample_valid = false;
+        // P2-07B C2 (CP-4 [R1][R2]): position invalidated with
+        // the sample.
+        mImpl->adopted_sample_position = LLVector3::zero;
+        mImpl->adopted_sample_position_tracked = false;
+        mImpl->adopted_position_valid = false;
         mImpl->has_left_eye_vertical_fov = false;
         mImpl->has_left_eye_aspect = false;
         mImpl->left_eye_fov_sample.valid = false;
@@ -5084,6 +5312,24 @@ static void freeze_avatar_eye_frame(LLOpenXRManagerImpl& impl,
         (long long)frame_ctx.frame_state.predictedDisplayTime;
     eye.view_state_flags = (unsigned int)frame_ctx.view_state.viewStateFlags;
     eye.coherent_optics = LLOpenXRManager::coherentOpticsEnabled();
+
+    // P2-07B C2 (CP-6): freeze the adopted HMD position under
+    // the same generation discipline the FOV check below
+    // enforces: the adopted sample must BE this frame's locate.
+    // The decision is the CP-2 helper's, over the same
+    // three-term predicate the CP-5 accessor uses; on mismatch
+    // the frame publishes invalid and no position.
+    {
+        const FSVREyeFramePosition frame_position = decide_eye_frame_position(
+            impl.adopted_sample_valid,
+            impl.adopted_position_valid,
+            impl.adopted_sample_position_tracked,
+            impl.adopted_sample_locate_generation,
+            frame_ctx.located_generation,
+            impl.adopted_sample_position);
+        eye.hmd_position_local = frame_position.position;
+        eye.hmd_position_valid = frame_position.valid;
+    }
 
     if (!frame_ctx.pending_end_status.empty())
     {
@@ -5586,6 +5832,36 @@ bool LLOpenXRManager::getHmdUp(LLVector3& out_up) const
 #endif
 }
 
+bool LLOpenXRManager::getHmdPosition(LLVector3& out_position) const
+{
+#if LL_LINUX && LL_X11
+    // P2-07B C2 (CP-5): the adopted HMD position (raw LOCAL
+    // components, OpenXR metres) of the CURRENT adopted sample,
+    // served only while the complete three-term predicate holds
+    // (CP-1 [R2]: sample valid && position usable && position
+    // tracked -- spec section 5's genuinely-tracked rule).
+    // Validity is derived from the current sample, never latched,
+    // so a later invalidation retires the position in the same
+    // write (CP-4). Unlike getHmdForward, NO consumed-side copy
+    // is stamped: no consumer with a P2-04b-style interlock is
+    // named for position (brief OQ-2). On false the out-param is
+    // untouched, mirroring getHmdForward.
+    if (!mImpl || !mImpl->session_running ||
+        !hmd_position_publishable(mImpl->adopted_sample_valid,
+                                  mImpl->adopted_position_valid,
+                                  mImpl->adopted_sample_position_tracked))
+    {
+        return false;
+    }
+
+    out_position = mImpl->adopted_sample_position;
+    return true;
+#else
+    (void)out_position;
+    return false;
+#endif
+}
+
 bool LLOpenXRManager::getLeftEyeVerticalFov(F32& out_vertical_fov_radians) const
 {
 #if LL_LINUX && LL_X11
@@ -5789,3 +6065,5 @@ void LLOpenXRManager::shutdown()
 
     mImpl.reset();
 }
+
+#endif // FSVR_C2_POSITION_ONLY

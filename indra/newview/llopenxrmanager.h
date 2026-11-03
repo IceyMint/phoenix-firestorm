@@ -51,6 +51,15 @@ struct LLXRAvatarEyeFrame
     unsigned long long head_consumed_pose_generation = 0;
     long long predicted_display_time_xr_ns = 0;
     unsigned int view_state_flags = 0;
+    // P2-07B C2 (CP-6): the adopted HMD position of this frame's
+    // locate (raw LOCAL components, OpenXR metres), frozen under
+    // the same generation discipline as the FOV sample:
+    // hmd_position_valid holds only when the adopted sample IS
+    // this frame's locate and the complete predicate (sample
+    // valid && position usable && position tracked) holds; on
+    // any mismatch the position is zero and the flag false.
+    LLVector3 hmd_position_local;
+    bool hmd_position_valid = false;
     // The located left-eye FOV sample as frozen at the seam, plus
     // the derived vertical FOV the desktop-path override consumes.
     LLXRLeftEyeFovSample fov_sample;
@@ -190,6 +199,12 @@ public:
     bool hasOpenPacedFrame() const;
     bool getHmdForward(LLVector3& out_forward) const;
     bool getHmdUp(LLVector3& out_up) const;
+    // P2-07B C2 (CP-5): the adopted HMD position (raw LOCAL
+    // components, OpenXR metres) of the current adopted locate;
+    // true only while the adopted sample is valid, its position
+    // was usable, and its position was genuinely tracked. No
+    // consumed-side stamp is recorded (brief OQ-2).
+    bool getHmdPosition(LLVector3& out_position) const;
     bool getLeftEyeVerticalFov(F32& out_vertical_fov_radians) const;
     bool getLeftEyeFovSample(LLXRLeftEyeFovSample& out_sample) const;
     bool getLeftEyeAspect(F32& out_aspect) const;
