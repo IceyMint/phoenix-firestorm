@@ -22,6 +22,10 @@
 
 namespace
 {
+// XR_HAND_JOINT_COUNT_EXT, restated (this TU carries no OpenXR
+// headers; see llvrtrackingframe.h's mask-helper contract).
+constexpr U32 kHandJointCount = 26;
+
 FSVRTrackingSettingsSnapshot s_pending_snapshot;
 U64 s_pending_token = 0;
 bool s_pending_valid = false;
@@ -62,11 +66,26 @@ void emitTrace(const FSVRTrackingFrameDecisions& decisions,
         FSVRBoneRegistry::computeRollups(
             snapshot.disabled_bones.known_disabled_ids);
     std::string head_rollup = "not_implemented";
+    std::string upper_body_rollup = "not_implemented";
+    std::string arms_rollup = "not_implemented";
+    std::string lower_body_rollup = "not_implemented";
     for (const FSVRRollupState& rollup : rollups)
     {
         if (rollup.group == FSVRRollup::HEAD)
         {
             head_rollup = rollup.derived_state;
+        }
+        else if (rollup.group == FSVRRollup::UPPER_BODY)
+        {
+            upper_body_rollup = rollup.derived_state;
+        }
+        else if (rollup.group == FSVRRollup::ARMS_INCLUDING_HANDS)
+        {
+            arms_rollup = rollup.derived_state;
+        }
+        else if (rollup.group == FSVRRollup::LOWER_BODY)
+        {
+            lower_body_rollup = rollup.derived_state;
         }
     }
 
@@ -108,7 +127,21 @@ void emitTrace(const FSVRTrackingFrameDecisions& decisions,
            << ",\"override_hold\":"
            << (input.interruption_hold ? "true" : "false")
            << ",\"head_rollup\":\"" << head_rollup << "\""
+           << ",\"upper_body_rollup\":\"" << upper_body_rollup << "\""
+           << ",\"arms_rollup\":\"" << arms_rollup << "\""
+           << ",\"lower_body_rollup\":\"" << lower_body_rollup << "\""
+           // AMEND-02 (code cross-check R1): other_rollups is a
+           // frozen legacy field -- CP-8 is additive-only, so it
+           // keeps its original value; LOWER_BODY's real state is
+           // the distinct lower_body_rollup field above.
            << ",\"other_rollups\":\"not_implemented\""
+           << ",\"hand_tracking_available\":"
+           << (input.hand_tracking_available ? "true" : "false")
+           << ",\"hmd_position_valid\":"
+           << (input.hmd_position_valid ? "true" : "false")
+           << ",\"hand_sample_present\":["
+           << (input.hand_sample_present[0] ? "true" : "false") << ","
+           << (input.hand_sample_present[1] ? "true" : "false") << "]"
            << ",\"bone_decisions\":[";
     bool first = true;
     for (const FSVRBoneDecision& bone : decisions.bones)
@@ -123,6 +156,18 @@ void emitTrace(const FSVRTrackingFrameDecisions& decisions,
                << FSVRTrackingCoordinator::decisionName(bone.desired_decision)
                << "\""
                << ",\"desired_source\":\"" << bone.desired_source << "\""
+               << ",\"desired_position\":\""
+               << FSVRTrackingCoordinator::decisionName(
+                      bone.desired_position_decision)
+               << "\""
+               << ",\"desired_position_source\":\""
+               << bone.desired_position_source << "\""
+               << ",\"desired_orientation\":\""
+               << FSVRTrackingCoordinator::decisionName(
+                      bone.desired_orientation_decision)
+               << "\""
+               << ",\"desired_orientation_source\":\""
+               << bone.desired_orientation_source << "\""
                << ",\"applied\":\""
                << FSVRTrackingCoordinator::decisionName(bone.applied_decision)
                << "\""
@@ -174,6 +219,75 @@ void fillPublishedGeneration(FSVRTrackingFrameInput& input)
     }
 }
 
+void fillHandFields(FSVRTrackingFrameInput& input)
+{
+    // P2-07B C3 (CP-8): fill the frame input's C3 fields from
+    // the manager's adopted sample of the SAME locate the head
+    // observation describes -- the paced adoption precedes idle
+    // and the accessors serve only the current adopted sample,
+    // so the generation binding is inherited from the manager's
+    // adopted-sample discipline, not re-checked field-by-field.
+    // On the legacy loop the inherited one-iteration lag applies
+    // (OQ-2). Absent hands keep the struct's zero defaults: the
+    // masks are written ONLY under the presence gate, so an
+    // absent hand can never carry stale bits [R1].
+    LLOpenXRManager& manager = LLOpenXRManager::instance();
+    input.hand_tracking_available = manager.getHandTrackingAvailable();
+    LLVector3 hmd_position;
+    if (manager.getHmdPosition(hmd_position))
+    {
+        input.hmd_position = hmd_position;
+        input.hmd_position_valid = true;
+    }
+    for (int side = 0; side < 2; ++side)
+    {
+        const bool right_hand = (side == 1);
+        LLVector3 joint_position;
+        LLQuaternion joint_orientation;
+        U32 joint_flags = 0;
+        // Presence is the hand-active gate: getHandJoint applies
+        // the sample/active gates (the wrist, joint 1, is the
+        // probe read; its values are not carried -- the wrist
+        // fields below come from the wrist accessors).
+        if (!manager.getHandJoint(right_hand, 1, joint_position,
+                                  joint_orientation, joint_flags))
+        {
+            continue;
+        }
+        input.hand_sample_present[side] = true;
+        LLVector3 wrist_position;
+        if (manager.getWristPosition(right_hand, wrist_position))
+        {
+            input.wrist_position[side] = wrist_position;
+            input.wrist_position_valid[side] = true;
+        }
+        LLQuaternion wrist_orientation;
+        if (manager.getWristOrientation(right_hand, wrist_orientation))
+        {
+            input.wrist_orientation[side] = wrist_orientation;
+            input.wrist_orientation_valid[side] = true;
+        }
+        // [R2 -- C3-R2-02]: mask construction is the production
+        // helper's, called once for this hand; no inline mask
+        // assembly anywhere.
+        U32 joint_location_flags[kHandJointCount] = {};
+        for (U32 j = 0; j < kHandJointCount; ++j)
+        {
+            LLVector3 p;
+            LLQuaternion q;
+            U32 flags = 0;
+            if (manager.getHandJoint(right_hand, j, p, q, flags))
+            {
+                joint_location_flags[j] = flags;
+            }
+        }
+        const FSVRHandValidityMasks masks =
+            buildHandValidityMasks(joint_location_flags);
+        input.hand_position_tracked_mask[side] = masks.position_mask;
+        input.hand_orientation_tracked_mask[side] = masks.orientation_mask;
+    }
+}
+
 void publishDecisions(const FSVRTrackingFrameInput& input,
                       const FSVRTrackingSettingsSnapshot& snapshot)
 {
@@ -186,9 +300,14 @@ void publishDecisions(const FSVRTrackingFrameInput& input,
 
     for (const FSVRTrackingBoneEntry& entry : FSVRBoneRegistry::entries())
     {
-        // Only HEAD-rollup bones get per-frame decisions in P2-07a;
-        // mSkull is audit-only and never decided for driving.
-        if (entry.group != FSVRRollup::HEAD)
+        // P2-07a decided HEAD-rollup bones only. P2-07B C3
+        // (CP-9): UPPER_BODY and ARMS_INCLUDING_HANDS bones are
+        // decided too (shadow decisions; selective_applied stays
+        // false). mSkull (NONE) is audit-only and never decided
+        // for driving; LOWER_BODY has no entries.
+        if (entry.group != FSVRRollup::HEAD &&
+            entry.group != FSVRRollup::UPPER_BODY &&
+            entry.group != FSVRRollup::ARMS_INCLUDING_HANDS)
         {
             continue;
         }
@@ -201,6 +320,33 @@ void publishDecisions(const FSVRTrackingFrameInput& input,
     emitTrace(decisions, input, snapshot);
 }
 } // namespace
+
+// P2-07B C3 [R2 -- C3-R2-02]: the contract is stated in
+// llvrtrackingframe.h (beside the frame-input code, so H3 links
+// this production function directly). The flag bit values are
+// XrSpaceLocationFlags (openxr.h), restated because this
+// translation unit carries no OpenXR headers.
+FSVRHandValidityMasks buildHandValidityMasks(const U32 joint_location_flags[26])
+{
+    const U32 kOrientationValid = 0x00000001;
+    const U32 kPositionValid = 0x00000002;
+    const U32 kOrientationTracked = 0x00000004;
+    const U32 kPositionTracked = 0x00000008;
+    FSVRHandValidityMasks masks;
+    for (U32 j = 0; j < 26; ++j)
+    {
+        const U32 flags = joint_location_flags[j];
+        if ((flags & kPositionValid) != 0 && (flags & kPositionTracked) != 0)
+        {
+            masks.position_mask |= (1u << j);
+        }
+        if ((flags & kOrientationValid) != 0 && (flags & kOrientationTracked) != 0)
+        {
+            masks.orientation_mask |= (1u << j);
+        }
+    }
+    return masks;
+}
 
 // static
 void FSVRTrackingCoordinator::beginFrame()
@@ -237,8 +383,14 @@ void FSVRTrackingCoordinator::finalizeAfterLookAt(
     input.hmd_roll = observation.target_roll_rad;
     input.look_direction = observation.look_direction;
     input.avatar_valid = !gAgentAvatarp.isNull();
-    input.registry_generation = 1;
+    // P2-07B C3 (DP-6): the decisions payload's bone set grew
+    // (3 decided bones -> up to 46) and hand-branch records
+    // carry two channel decisions; the single 1 -> 2 bump
+    // covers both changes ([R1] reconciliation -- no second
+    // bump).
+    input.registry_generation = 2;
     fillPublishedGeneration(input);
+    fillHandFields(input);
 
     s_pending_valid = false;
     publishDecisions(input, snapshot);
@@ -258,7 +410,7 @@ void FSVRTrackingCoordinator::finalizeWithoutObservation()
     input.settings_generation = snapshot.generation;
     input.vr_active = LLOpenXRManager::instance().isVRModeActive();
     input.avatar_valid = !gAgentAvatarp.isNull();
-    input.registry_generation = 1;
+    input.registry_generation = 2; // P2-07B C3 (DP-6), as above.
     fillPublishedGeneration(input);
 
     s_pending_valid = false;

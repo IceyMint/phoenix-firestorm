@@ -205,6 +205,22 @@ public:
     // was usable, and its position was genuinely tracked. No
     // consumed-side stamp is recorded (brief OQ-2).
     bool getHmdPosition(LLVector3& out_position) const;
+    // P2-07B C3 (CP-4): hand-tracking publication, mirroring
+    // getHmdPosition's contract (false leaves out-params
+    // untouched; no consumed-side stamp recorded).
+    // getHandTrackingAvailable is CP-2's capability fact (the
+    // four-term conjunction); the wrist accessors serve the
+    // adopted wrist pose of the current adopted sample under
+    // INDEPENDENT per-channel predicates (spec section 6.2,
+    // mixed sourcing); getHandJoint serves the full located
+    // joint set under the sample/active gates, with per-joint
+    // validity left to the caller's predicate over the returned
+    // flags.
+    bool getHandTrackingAvailable() const;
+    bool getWristPosition(bool right_hand, LLVector3& out_position) const;
+    bool getWristOrientation(bool right_hand, LLQuaternion& out_orientation) const;
+    bool getHandJoint(bool right_hand, U32 joint_index, LLVector3& out_position,
+                      LLQuaternion& out_orientation, U32& out_location_flags) const;
     bool getLeftEyeVerticalFov(F32& out_vertical_fov_radians) const;
     bool getLeftEyeFovSample(LLXRLeftEyeFovSample& out_sample) const;
     bool getLeftEyeAspect(F32& out_aspect) const;

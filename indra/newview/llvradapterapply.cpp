@@ -813,18 +813,29 @@ namespace
 {
 
 // C3 owns the constraint_adapter_id vocabulary (spec section
-// 1/C3). At the Package A baseline every registry entry's id is
-// empty ("Stage 2, after audits A1-A10", llvrboneregistry.cpp),
-// which maps to no solver domain; an unrecognized future id also
-// maps to NONE until this mapper is extended with its component.
-// Conservative by construction: no domain, no writes.
-// RECORDED CLARIFICATION (code cross-check round 1): when C3
-// establishes the vocabulary, THIS mapper must gain the real
-// id-to-domain entries -- registering bones in the registry alone
-// changes nothing here, and every id keeps mapping to NONE until
-// the mapper is extended.
-FSVRAdapterDomain domainForAdapterId(const std::string& /*adapter_id*/)
+// 1/C3). P2-07B C3 (CP-6) landed it: "spine_chain" (the spine
+// chain), "arm_left" / "arm_right" (shoulder/elbow/wrist per
+// side -- the mapper receives only the id string, so the side
+// lives in the string, DP-2). Empty and unrecognized ids still
+// map to NONE: the stub's conservative contract, preserved
+// verbatim (no domain, no writes). This fulfils the code
+// cross-check round 1 recorded clarification: registering bones
+// in the registry alone changed nothing here until this mapper
+// gained the real entries.
+FSVRAdapterDomain domainForAdapterId(const std::string& adapter_id)
 {
+    if (adapter_id == "spine_chain")
+    {
+        return FSVRAdapterDomain::SPINE;
+    }
+    if (adapter_id == "arm_left")
+    {
+        return FSVRAdapterDomain::ARM_LEFT;
+    }
+    if (adapter_id == "arm_right")
+    {
+        return FSVRAdapterDomain::ARM_RIGHT;
+    }
     return FSVRAdapterDomain::NONE;
 }
 
