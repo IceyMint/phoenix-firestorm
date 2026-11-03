@@ -903,6 +903,18 @@ void LLMotionController::updateMotions(bool force_update)
         else
         {
             mPoseBlender.blendAndApply();
+
+            // P2-07B C1: Stage-2 adapter apply point (spec
+            // section 1/C1, amended G1). Placement inside this
+            // branch is the structural gate: the paused branch
+            // above, the hidden path, and the same-quantum early
+            // return never reach here. No-op unless the character
+            // is the self avatar (applyVRAdapterPostBlend is
+            // overridden only by LLVOAvatarSelf).
+            if (mCharacter)
+            {
+                mCharacter->applyVRAdapterPostBlend();
+            }
         }
     }
 
