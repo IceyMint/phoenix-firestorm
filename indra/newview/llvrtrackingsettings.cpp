@@ -27,6 +27,18 @@ const char* const FSVRTrackingSettings::SETTING_DIAG_FORCE_UNIT_SCALE = "FSVRDia
 const char* const FSVRTrackingSettings::SETTING_DIAG_POSITIONAL_SOLVE = "FSVRDiagPositionalSolve";
 const char* const FSVRTrackingSettings::SETTING_DIAG_FULL_CHAIN_SOLVE = "FSVRDiagFullChainSolve";
 
+// P2-07B C6-E Gate-1 authorization (CP-5 part 1a). NONE in every
+// ordinary build. Advanced ONLY by a dedicated authorization
+// commit that changes this constant and nothing else, citing its
+// evidence (CP-5 part 4: Stage A candidate verification, then
+// Stage B production activation). captureForFrame derives the
+// snapshot's stage2_constraint_authorized and
+// gate1_authorization_stage fields from this value and from
+// nothing else. There is no other producer: no settings control,
+// debug toggle, environment variable, or file input exists.
+static constexpr FSVRGate1Authorization kGate1Authorization =
+    FSVRGate1Authorization::NONE;
+
 // static
 FSVRTrackingDisabledBoneSet FSVRTrackingSettings::parseDisabledBones(
     const LLSD& document, const std::set<std::string>& known_ids)
@@ -445,6 +457,16 @@ const FSVRTrackingSettingsSnapshot& FSVRTrackingSettings::captureForFrame()
         !next.disabled_bones.isBoneDisabled("mHead") && pitch && roll;
     next.selective_requested = !next.legacy_equivalent;
     next.selective_verified = false; // Stage 1: hard gate.
+    // P2-07B C6-E (CP-5 part 1a): the Gate-1 authorization
+    // derivation, beside the selective_verified hard-false and
+    // independent of it. The constant is build-time, so the
+    // derivation rides the snapshot build like every other
+    // field here; it is not part of the change detection above
+    // because it cannot change within a build.
+    next.stage2_constraint_authorized =
+        (kGate1Authorization != FSVRGate1Authorization::NONE);
+    next.gate1_authorization_stage =
+        static_cast<U8>(kGate1Authorization);
 
     s_snapshot = next;
     s_snapshot_initialized = true;

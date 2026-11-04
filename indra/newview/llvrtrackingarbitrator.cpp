@@ -113,9 +113,23 @@ FSVRBoneDecision FSVRTrackingArbitrator::evaluateBone(
     decision.bone_id = entry.canonical_id;
     decision.frame_token = input.app_frame_token;
     decision.settings_generation = snapshot.generation;
-    decision.shadow_only = true; // Stage 1 never drives joints.
     decision.audit_verified =
         entry.audit_status == FSVRTrackingBoneEntry::AuditStatus::VERIFIED;
+    // P2-07B C6-E (Package B spec section 7.3, PB-R1-05 /
+    // DP-B5 conditional (a)): runtime-effective form is
+    // emitted ONLY for explicitly authorized head/spine
+    // constraint decisions -- the spine-chain bones under
+    // C6's authority -- ONLY for a bone whose Stage-2
+    // audit proof stands, and ONLY in a build carrying
+    // the release authorization (CP-5 part 1a). Every other
+    // decision family remains shadow-only regardless of
+    // the head path's activation state; Stage-1 mHead/
+    // mNeck rotation ownership is not created, altered, or
+    // re-derived here.
+    decision.shadow_only =
+        !(snapshot.stage2_constraint_authorized &&
+          decision.audit_verified &&
+          entry.constraint_adapter_id == "spine_chain");
     decision.direct_tracking_eligible =
         entry.direct_tracking_eligible && decision.audit_verified &&
         snapshot.selective_verified;
@@ -360,4 +374,56 @@ FSVRBoneDecision FSVRTrackingArbitrator::evaluateBone(
     decision.desired_orientation_source = decision.desired_source;
     decision.desired_orientation_decision = decision.desired_decision;
     return decision;
+}
+
+namespace
+{
+// P2-07B C6-E (CP-5 part 3): one domain's runtime-effective
+// fact over a published set. The domain is named by its
+// registry constraint_adapter_id values (one for the spine
+// chain, two for the arms). True iff at least one published
+// decision belongs to the domain and no member is
+// shadow-only; see the declarations in the header for the
+// full contract.
+bool domainDecisionsRuntimeEffective(
+    const FSVRTrackingFrameDecisions& decisions,
+    const char* adapter_id_a, const char* adapter_id_b)
+{
+    bool any_member = false;
+    for (const FSVRBoneDecision& bone : decisions.bones)
+    {
+        const FSVRTrackingBoneEntry* entry =
+            FSVRBoneRegistry::find(bone.bone_id);
+        if (!entry)
+        {
+            continue;
+        }
+        if (entry->constraint_adapter_id != adapter_id_a &&
+            (!adapter_id_b ||
+             entry->constraint_adapter_id != adapter_id_b))
+        {
+            continue;
+        }
+        any_member = true;
+        if (bone.shadow_only)
+        {
+            return false;
+        }
+    }
+    return any_member;
+}
+} // namespace
+
+bool spineDecisionsRuntimeEffective(
+    const FSVRTrackingFrameDecisions& decisions)
+{
+    return domainDecisionsRuntimeEffective(decisions, "spine_chain",
+                                           nullptr);
+}
+
+bool armDecisionsRuntimeEffective(
+    const FSVRTrackingFrameDecisions& decisions)
+{
+    return domainDecisionsRuntimeEffective(decisions, "arm_left",
+                                           "arm_right");
 }

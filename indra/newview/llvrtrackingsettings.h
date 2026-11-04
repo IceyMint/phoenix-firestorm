@@ -52,6 +52,20 @@ struct FSVRTrackingDisabledBoneSet
     }
 };
 
+// P2-07B C6-E (CP-5 part 1a): the Gate-1 release authorization
+// stage of this BUILD. The representation is the tree itself: the
+// value is produced by exactly one source constant in
+// llvrtrackingsettings.cpp, advanced only by a dedicated
+// authorization commit citing its evidence (Package B spec
+// section 7.3 / brief CP-5 part 4). No settings control, debug
+// toggle, environment variable, or file input exists for it.
+enum class FSVRGate1Authorization : U8
+{
+    NONE = 0,       // ordinary build: no authorization
+    CANDIDATE = 1,  // Stage A: candidate verification build
+    PRODUCTION = 2  // Stage B: production activation
+};
+
 // Immutable effective settings for one frame. Captured exactly once
 // per frame by the coordinator; a settings change takes effect on the
 // next frame boundary, never mid-blend.
@@ -90,6 +104,21 @@ struct FSVRTrackingSettingsSnapshot
     // Always false in Stage 1; becomes a runtime gate after the
     // Stage-2 audit proofs and build verification.
     bool selective_verified = false;
+    // P2-07B C6-E (CP-5 part 1a): the Gate-1 release
+    // authorization (Package B spec section 7.3). Derived in
+    // captureForFrame from the authorization constant in
+    // llvrtrackingsettings.cpp; false in every build whose tree
+    // does not contain an authorization commit. Not a setting:
+    // no control, file, or environment input exists. Beside
+    // selective_verified and independent of it: that field's
+    // capture line and its one consumer are untouched.
+    bool stage2_constraint_authorized = false;
+    // The authorization stage of this build, recorded for
+    // traces and evidence labeling: 0 = none, 1 = Stage A
+    // candidate verification, 2 = Stage B production (the
+    // FSVRGate1Authorization value). Derived with the field
+    // above, from the same constant.
+    U8 gate1_authorization_stage = 0;
 };
 
 // P2-07B C4 (spec section 3.3): the load validator's result over a

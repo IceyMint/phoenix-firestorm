@@ -23,6 +23,7 @@
 #include "llvradapterapply.h"
 
 #include "llvrcalibration.h"
+#include "llvrspinesolver.h"
 
 #include <set>
 
@@ -269,6 +270,77 @@ bool FSVRAdapterApply::continuityCarries(
            continuity_epoch == previous_continuity_epoch;
 }
 
+bool decideSpineSampleValid(const FSVRSpineSampleInputs& in)
+{
+    // P2-07B C6-E (CP-2): the E5-E9 conjunction, verbatim.
+    // Extracted so H10 tests the production composition
+    // (Package B spec section 9); the glue supplies the
+    // cycle's values, this function only composes them.
+    return in.record_usable_for_head && in.neutral_established &&
+           in.hmd_position_valid && in.sitting_signals_clear &&
+           !in.calibration_in_progress;
+}
+
+bool composeHeadTargetBlock(
+    const FSVRSessionNeutralView& session,
+    const LLVector3& hmd_position_local, F32 session_base_yaw_rad,
+    const LLQuaternion& root_world_rotation,
+    const LLVector3& root_world_position, bool diag_force_unit_scale,
+    LLVector3& out_head_target_world,
+    LLVector3& out_cornea_offset_head_local)
+{
+    // P2-07B C6-E (CP-4; Package B spec section 7.3). Pure
+    // over its named inputs; the glue calls it only when the
+    // CP-2 conjunction holds for the cycle, and the
+    // established check below is the composition's own
+    // presence condition (a session without a neutral has
+    // nothing to compose from).
+    if (!session.established)
+    {
+        return false;
+    }
+    // Step 1: the displacement from the session anchor, both
+    // in the current LOCAL space (the anchor makes no floor
+    // claim). hmd_position_local is the cycle's ONE manager
+    // read -- the same sample E7 judged (DP-C6E-3).
+    const LLVector3 d_local =
+        hmd_position_local - session.anchor_hmd_local;
+    // Step 2: the rotation path's placement pipeline in its
+    // vector form (brief section 2.13): P re-expresses the
+    // raw (right, up, back) components as (forward, left,
+    // up) components -- the correspondence stage 2's scalar
+    // reading implies -- q_yaw is the session's yaw-only
+    // frame alignment (theta_B, ICR-1), and the plan's root
+    // frame is the avatar-side carrier, substituted for the
+    // camera's chest basis by the spec's own ruling
+    // (PB-R1-03 bars the arbitrated pose here).
+    const LLVector3 p_mapped(-d_local.mV[VZ], -d_local.mV[VX],
+                             d_local.mV[VY]);
+    const LLQuaternion q_yaw(session_base_yaw_rad, LLVector3::z_axis);
+    const LLVector3 d_world =
+        (p_mapped * q_yaw) * root_world_rotation;
+    // Step 3: the neutral cornea, fixed root-relative at
+    // establishment (PB-R1-03), re-expressed in the CURRENT
+    // root frame -- the composition's only per-cycle
+    // pose-dependent input. The cycle's arbitrated pose is
+    // never read here.
+    const LLVector3 neutral_cornea_world =
+        session.neutral_cornea_root * root_world_rotation +
+        root_world_position;
+    // Step 4: C6's shipped composition seam, called in
+    // production for the first time. The ratio is the
+    // record's, read through the view (CP-3); the diagnostic
+    // is consumed here, at composition, per spec section
+    // 3.4 -- the record is not touched.
+    out_head_target_world = FSVRSpineSolver::composeHeadTarget(
+        neutral_cornea_world, d_world,
+        static_cast<F32>(session.record.head_ratio),
+        diag_force_unit_scale);
+    // Step 5: the section 4.6 cornea offset, verbatim.
+    out_cornea_offset_head_local = session.cornea_offset_head_local;
+    return true;
+}
+
 // static
 FSVRAdapterPlanResult FSVRAdapterApply::computePlan(
     const FSVRAdapterPlanInput& input,
@@ -383,9 +455,13 @@ FSVRAdapterPlanResult FSVRAdapterApply::computePlan(
     }
     // Gate 1: frame identity. Consuming Stage-1 shadow decisions
     // as if they were grants is the failure mode this gate exists
-    // to prevent.
+    // to prevent. P2-07B C6-E (CP-5 part 3): the test is the
+    // scoped disjunction over the per-domain facts -- a domain's
+    // shadow state never blocks the other domain, and the legacy
+    // all-bones field no longer gates (recorded fact only).
     if (!input.decisions_published || !input.decisions_current ||
-        !input.decisions_runtime_effective)
+        !(input.spine_decisions_runtime_effective ||
+          input.arm_decisions_runtime_effective))
     {
         return fail(FSVRAdapterGate::FRAME_IDENTITY);
     }
@@ -400,11 +476,16 @@ FSVRAdapterPlanResult FSVRAdapterApply::computePlan(
         return fail(FSVRAdapterGate::POSITIONAL_MASTER);
     }
     // Gate 4 [R1]: per-solver enablement and per-solver positional
-    // sample validity, evaluated independently.
+    // sample validity, evaluated independently. P2-07B C6-E
+    // (CP-5 part 3): each domain's authority additionally
+    // requires that domain's scoped runtime-effective fact, so
+    // no authority forms on shadow decisions for its domain.
     const bool spine_authority =
-        input.head_position_enabled && input.spine_sample_valid;
+        input.head_position_enabled && input.spine_sample_valid &&
+        input.spine_decisions_runtime_effective;
     const bool arm_authority =
-        input.hand_position_enabled && input.arm_sample_valid;
+        input.hand_position_enabled && input.arm_sample_valid &&
+        input.arm_decisions_runtime_effective;
     if (!spine_authority && !arm_authority)
     {
         return fail(FSVRAdapterGate::NO_SOLVER);
@@ -917,11 +998,13 @@ FSVRAdapterPlanResult FSVRAdapterApplyOnce::apply(
 
 #include "llcharacter.h"
 #include "lljoint.h"
+#include "llopenxrmanager.h"
 #include "llopenxrtrace.h"
 #include "llvrarmsolver.h"
 #include "llvrcontinuity.h"
 #include "llvrboneregistry.h"
 #include "llvrspinesolver.h"
+#include "llvrtrackingarbitrator.h"
 #include "llvrtrackingframe.h"
 #include "llvrtrackingsettings.h"
 
@@ -998,6 +1081,19 @@ void FSVRAdapterApplyForCharacter(LLCharacter* character, bool preview_cycle)
     // here rather than producing a hold cycle after a gap.
     FSVRCalibration::preCycleCheck();
 
+    // P2-07B C6-E (C6E-CODE-R1-01): refresh C5's ICR-2
+    // sitting fact from THIS cycle's avatar signals before
+    // the assembly below copies the session view. Without
+    // this the view's sitting_signals_clear would be the
+    // value the post-apply step hook wrote LAST cycle, and
+    // E8 would judge the first sitting cycle by the previous
+    // cycle's standing state. The refresh is C5's own entry
+    // point and the fact's only writer remains the session
+    // machine's noteSittingSignals; the step hook at the
+    // tail of this function refreshes again from the same
+    // character through the same signal read.
+    FSVRCalibration::refreshSittingSignals(character);
+
     const FSVRTrackingSettingsSnapshot& snapshot =
         FSVRTrackingSettings::captureForFrame();
 
@@ -1033,8 +1129,8 @@ void FSVRAdapterApplyForCharacter(LLCharacter* character, bool preview_cycle)
     input.decisions_published = (decisions != nullptr);
     input.decisions_current =
         decisions && (snapshot.generation == decisions->settings_generation);
-    // Runtime-effective means the C4 decision form; Stage-1
-    // decisions are shadow-only, so this is false until C4 lands.
+    // The legacy all-bones form, retained as a recorded fact
+    // (C6-E CP-5 part 3): it no longer gates anything.
     input.decisions_runtime_effective = false;
     if (decisions)
     {
@@ -1047,33 +1143,75 @@ void FSVRAdapterApplyForCharacter(LLCharacter* character, bool preview_cycle)
                 break;
             }
         }
+        // Gate 1, scoped (P2-07B C6-E, CP-5 part 3):
+        // runtime-effective is tested per solver domain over
+        // the decisions the arbitrator emitted -- this glue
+        // reads the emitted shadow_only form through the
+        // arbitrator's pure derivations; it never reinterprets
+        // it. Each fact holds iff the published set contains
+        // the domain's decisions and none of them is
+        // shadow-only.
+        input.spine_decisions_runtime_effective =
+            spineDecisionsRuntimeEffective(*decisions);
+        input.arm_decisions_runtime_effective =
+            armDecisionsRuntimeEffective(*decisions);
     }
 
-    // Gate 2 inputs: vr_active is carried by FSVRTrackingFrameInput,
-    // which the coordinator does not publish, and the spine/arm
-    // sample-validity flags have no source yet; those stay
-    // conservative. The six enablement/diagnostic fields are
-    // P2-07B C4 (CP-6): they read the user's actual positional
-    // settings and diagnostic values from the frame snapshot
-    // captured above, so the adapter now plans on them. Nothing
-    // downstream of the plan changes: gate 1 already renders the
-    // glue inert at baseline (DP-5), and no gate is bypassed.
-    input.vr_active = false;
+    // Gate 2 input (P2-07B C6-E, CP-1): the manager's own
+    // VR-mode fact -- the identical call the coordinator
+    // makes for the same fact (llvrtrackingframe.cpp). This
+    // discharges C4 brief DP-5's deferred half. It lands
+    // inert: gate 1 is evaluated before gate 2 and stays
+    // closed in every build without an authorization commit
+    // (CP-5), so the plan's output is unchanged in all
+    // production states (H10-12).
+    input.vr_active = LLOpenXRManager::instance().isVRModeActive();
+    // The six enablement/diagnostic fields are P2-07B C4
+    // (CP-6): they read the user's actual positional settings
+    // and diagnostic values from the frame snapshot captured
+    // above, so the adapter plans on them.
     input.positional_solve_enabled = snapshot.diag_positional_solve;
     input.head_position_enabled = snapshot.track_head_position;
     input.hand_position_enabled = snapshot.track_hand_position;
-    input.spine_sample_valid = false;
+    // P2-07B C6-E (CP-2/CP-3): the spine sample-validity
+    // conjunction over this cycle's facts. The session view
+    // is read once, here, as a copy: E5/E6/E8 and the CP-4
+    // composition below all consume this same cycle's view.
+    // E9 is C5's transaction state, read once at population;
+    // the same read populates calibration_hold_active below
+    // (CP-3: one fact, one read, never latched).
+    const FSVRSessionNeutralView session_view =
+        FSVRCalibration::sessionNeutralView();
+    const bool calibration_active = FSVRCalibration::transactionActive();
+    // The cycle's ONE HMD position read (CP-4 step 1,
+    // DP-C6E-3): its bool is E7, and the same vector feeds
+    // the composition below, so the sample judged valid is
+    // the sample composed from -- never two reads that
+    // could straddle an adoption.
+    LLVector3 hmd_position_local;
+    const bool hmd_position_read =
+        LLOpenXRManager::instance().getHmdPosition(hmd_position_local);
+    FSVRSpineSampleInputs sample_inputs;
+    sample_inputs.record_usable_for_head =
+        session_view.record.status ==
+            FSVRCalibrationRecordValidation::RecordStatus::USABLE_FULL ||
+        session_view.record.status ==
+            FSVRCalibrationRecordValidation::RecordStatus::USABLE_HEAD_ONLY;
+    sample_inputs.neutral_established = session_view.established;
+    sample_inputs.hmd_position_valid = hmd_position_read;
+    sample_inputs.sitting_signals_clear = session_view.sitting_signals_clear;
+    sample_inputs.calibration_in_progress = calibration_active;
+    input.spine_sample_valid = decideSpineSampleValid(sample_inputs);
+    // Section 7.4: a standing false, not a conjunction
+    // awaiting inputs -- no arm sample source exists in
+    // this component (Package C's fact).
     input.arm_sample_valid = false;
     input.bend_disabled_bones = snapshot.solver_bend_disabled_bones;
     input.diag_bend_limits = snapshot.diag_bend_limits;
     input.diag_full_chain_solve = snapshot.diag_full_chain_solve;
     // C6/C7 (CP-7): the soft-preference diagnostic and the
-    // snapshot generation reach the plan from the same snapshot.
-    // The positional block (head/wrist targets) stays invalid
-    // and the sample-validity flags above stay false: nothing
-    // here can produce a production write (DP-8) -- the wiring
-    // changes which objects sit in the solver slots and which
-    // snapshot fields reach the plan, nothing else.
+    // snapshot generation reach the plan from the same
+    // snapshot.
     input.diag_soft_preference = snapshot.diag_soft_preference;
     input.settings_generation = snapshot.generation;
     // P2-07B C8 (CP-3): the continuity stamp, read once at
@@ -1082,11 +1220,13 @@ void FSVRAdapterApplyForCharacter(LLCharacter* character, bool preview_cycle)
     // previous apply's stamp.
     input.continuity_epoch = FSVRContinuity::continuityEpoch();
 
-    // P2-07B C5 (CP-4 item 2): the calibration hold flag,
-    // read once at input assembly from C5's live transaction
-    // state. The apply point gains no second mode channel:
-    // the flag rides the plan input like every other field.
-    input.calibration_hold_active = FSVRCalibration::transactionActive();
+    // P2-07B C5 (CP-4 item 2): the calibration hold flag.
+    // The apply point gains no second mode channel: the flag
+    // rides the plan input like every other field. P2-07B
+    // C6-E (CP-3): the value is the population block's single
+    // transactionActive() read, shared with E9 -- the same
+    // fact, read once.
+    input.calibration_hold_active = calibration_active;
 
     // Build the plan joint list from the registry (OQ-7: C1
     // iterates registry/decisions; it does not hard-code a bone
@@ -1189,6 +1329,31 @@ void FSVRAdapterApplyForCharacter(LLCharacter* character, bool preview_cycle)
         input.root_world_rotation = root_joint->getWorldRotation();
         input.root_world_position = root_joint->getWorldPosition();
     }
+
+    // P2-07B C6-E (CP-4): the per-cycle head-target block.
+    // Composition is gated on the E5-E9 conjunction only
+    // (DP-C6E-8): the block is composed whenever the
+    // conjunction holds, whether or not gates 1-4 will pass
+    // this cycle -- the transaction's gates decide use;
+    // validity describes the inputs. It rides the root
+    // frame populated immediately above, so displacement
+    // and neutral are never composed against different
+    // poses. head_target_valid is assigned every cycle,
+    // never latched: a lapsed cycle leaves it false and the
+    // target fields at their defaults, unread (solveSpine
+    // guards on the flag). The wrist block is written false
+    // explicitly, every cycle (section 7.4).
+    input.head_target_valid =
+        input.spine_sample_valid &&
+        composeHeadTargetBlock(session_view, hmd_position_local,
+                               session_view.anchor_forward_yaw_rad,
+                               input.root_world_rotation,
+                               input.root_world_position,
+                               snapshot.diag_force_unit_scale,
+                               input.head_target_world,
+                               input.cornea_offset_head_local);
+    input.wrist_target_valid[0] = false;
+    input.wrist_target_valid[1] = false;
 
     // One apply-once instance and the solvers for the process
     // (the self avatar is unique). C6/C7 (CP-7): the real

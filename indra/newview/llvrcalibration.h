@@ -32,9 +32,10 @@
  * the anchor, written at establishment/install; ICR-2 --
  * the view carries sitting_signals_clear, the section 4.2
  * step-3 not-sitting fact evaluated per cycle at view
- * production (the shell refreshes it on every stepped glue
- * cycle, which is every cycle on which the view can be
- * consumed by C6-E's composition path).
+ * production (the shell refreshes it pre-assembly and in
+ * the post-apply step hook on every glue cycle, which is
+ * every cycle on which the view can be consumed by C6-E's
+ * composition path -- C6E-CODE-R1-01).
  */
 
 #ifndef LL_LLVRCALIBRATION_H
@@ -456,8 +457,12 @@ public:
     void step(const FSVRSessionStepInputs& inputs);
 
     // ICR-2: the per-cycle not-sitting fact, refreshed by the
-    // shell on every stepped glue cycle (independent of the
-    // acquisition stepping above).
+    // shell on every glue cycle (independent of the
+    // acquisition stepping above). This is the fact's only
+    // writer: the shell refreshes it pre-assembly through
+    // FSVRCalibration::refreshSittingSignals and again in
+    // the post-apply step hook, both from the one signal
+    // read (C6E-CODE-R1-01).
     void noteSittingSignals(bool clear)
     {
         mView.sitting_signals_clear = clear;
@@ -659,6 +664,19 @@ public:
     // CP-4 item 3: starvation abort, executed (with its
     // report) before the flag is populated for this cycle.
     static void preCycleCheck();
+    // C6E-CODE-R1-01: the pre-assembly sitting refresh. The
+    // glue calls this with the cycle's character BEFORE it
+    // copies sessionNeutralView() for plan-input assembly,
+    // so a same-cycle consumer (C6-E's E8) reads this
+    // cycle's signals, not the previous cycle's. Ownership
+    // is unchanged: the fact lives in the session machine's
+    // view and its only writer is noteSittingSignals; this
+    // entry point performs the same write the post-apply
+    // step hook performs, computed by the same signal read
+    // over the same character, so the cycle's two refresh
+    // points agree by construction and neither creates a
+    // second store.
+    static void refreshSittingSignals(LLCharacter* character);
     // CP-4 item 4: the glue's post-apply step hook. Reads
     // the cycle's fresh shell facts, advances both machines,
     // and executes the transaction's emitted actions in

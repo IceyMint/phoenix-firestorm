@@ -1757,6 +1757,41 @@ F64 shellNowSeconds()
         .count();
 }
 
+// The section 4.2 step-3 avatar signals, read once over one
+// avatar (plain member reads). This is the ONE read of the
+// signal set: the post-apply step hook consumes the four
+// facts individually (transaction / session step inputs),
+// and both of the ICR-2 fact's refresh points -- the step
+// hook and the pre-assembly refreshSittingSignals -- take
+// the fact's value from this same read over the same
+// character, so the cycle's two refresh points can never
+// disagree (C6E-CODE-R1-01).
+struct ShellSittingSignals
+{
+    bool sitting_on_object = false;
+    bool parented = false;
+    bool ground_sit = false;
+    bool in_air = false;
+
+    // The ICR-2 not-sitting fact over these signals.
+    bool clear() const
+    {
+        return !sitting_on_object && !parented && !ground_sit &&
+               !in_air;
+    }
+};
+
+ShellSittingSignals readSittingSignals(LLVOAvatar* avatar)
+{
+    ShellSittingSignals signals;
+    signals.parented = avatar->getParent() != nullptr;
+    signals.sitting_on_object = avatar->isSitting() && signals.parented;
+    signals.ground_sit =
+        avatar->isMotionActive(ANIM_AGENT_SIT_GROUND_CONSTRAINED);
+    signals.in_air = avatar->mInAir;
+    return signals;
+}
+
 void executeActions(const std::vector<FSVRTransactionAction>& actions)
 {
     for (const FSVRTransactionAction& action : actions)
@@ -1843,6 +1878,28 @@ void FSVRCalibration::preCycleCheck()
 }
 
 // static
+void FSVRCalibration::refreshSittingSignals(LLCharacter* character)
+{
+    // C6E-CODE-R1-01: the glue invokes this before it
+    // copies the session view for plan-input assembly, so
+    // the view's ICR-2 fact is this cycle's. The write is
+    // the session machine's own noteSittingSignals, fed by
+    // the shell's one signal read over the glue's
+    // character -- the same write, value, and source the
+    // post-apply step hook performs later in the cycle.
+    // No state lives here: a non-avatar character simply
+    // leaves the fact as the step hook last wrote it (the
+    // same early-out the step hook itself takes).
+    LLVOAvatar* avatar = dynamic_cast<LLVOAvatar*>(character);
+    if (!avatar)
+    {
+        return;
+    }
+    s_session_neutral.noteSittingSignals(
+        readSittingSignals(avatar).clear());
+}
+
+// static
 void FSVRCalibration::stepFromAdapterCycle(
     LLCharacter* character, const FSVRAdapterPlanInput& input,
     const FSVRAdapterPlanResult& result)
@@ -1861,17 +1918,22 @@ void FSVRCalibration::stepFromAdapterCycle(
     const F64 now_s = shellNowSeconds();
 
     // The section 4.2 step-3 avatar signals, read once
-    // (plain member reads -- the steady-state cost class
-    // CP-4 item 4 budgets for).
-    const bool parented = avatar->getParent() != nullptr;
-    const bool sitting_on_object = avatar->isSitting() && parented;
-    const bool ground_sit =
-        avatar->isMotionActive(ANIM_AGENT_SIT_GROUND_CONSTRAINED);
-    const bool in_air = avatar->mInAir;
+    // through the shell's one signal read (plain member
+    // reads -- the steady-state cost class CP-4 item 4
+    // budgets for).
+    const ShellSittingSignals signals = readSittingSignals(avatar);
+    const bool parented = signals.parented;
+    const bool sitting_on_object = signals.sitting_on_object;
+    const bool ground_sit = signals.ground_sit;
+    const bool in_air = signals.in_air;
     // ICR-2: the per-cycle not-sitting fact, refreshed on
-    // every stepped glue cycle.
-    s_session_neutral.noteSittingSignals(
-        !sitting_on_object && !parented && !ground_sit && !in_air);
+    // every stepped glue cycle. The pre-assembly refresh
+    // (refreshSittingSignals) wrote this same value from
+    // this same read earlier in the cycle; this write is
+    // the hook's own refresh and stays so a cycle whose
+    // step hook runs without an assembly-side consumer
+    // still refreshes the fact.
+    s_session_neutral.noteSittingSignals(signals.clear());
 
     if (!s_transaction.active() &&
         s_session_neutral.state() == FSVRSessionState::ESTABLISHED)
