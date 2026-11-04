@@ -217,7 +217,10 @@ set(viewer_SOURCE_FILES
     llagentbenefits.cpp
     llagentcamera.cpp
     llvradapterapply.cpp
+    llvrarmsolver.cpp
     llvrboneregistry.cpp
+    llvrjointlimits.cpp
+    llvrspinesolver.cpp
     llvrtrackingarbitrator.cpp
     llvrtrackingframe.cpp
     llvrtrackingsettings.cpp
@@ -1072,7 +1075,10 @@ set(viewer_HEADER_FILES
     llagentbenefits.h
     llagentcamera.h
     llvradapterapply.h
+    llvrarmsolver.h
     llvrboneregistry.h
+    llvrjointlimits.h
+    llvrspinesolver.h
     llvrtrackingarbitrator.h
     llvrtrackingframe.h
     llvrtrackingsettings.h

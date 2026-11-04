@@ -191,6 +191,53 @@ struct FSVRAdapterPlanInput
     // caller supplies, never a C1-accumulated baseline (H1
     // no-drift check).
     std::map<S32, LLQuaternion> previous_targets;
+
+    // C6/C7 positional targets and solver inputs (brief CP-2;
+    // additions only -- no existing field changes meaning).
+    // Production glue leaves the positional block invalid and
+    // the sample-validity flags false, so the production path
+    // stays inert exactly as C1/C4 left it; harnesses populate
+    // all of it.
+
+    // FSVRDiagSoftPreference pass-through (D3): the C6 soft term
+    // is read from here (the snapshot via the glue, CP-7).
+    bool diag_soft_preference = true;
+    // Continuity identity (CP-7/DP-4): the settings snapshot
+    // generation these inputs were assembled under. A change
+    // retires the caller's continuity history (previous targets
+    // and pole state) before the next apply.
+    U64 settings_generation = 0;
+
+    // C6's target: the cornea-midpoint world position (already
+    // composed and ratio-scaled by the CP-3 seam's caller;
+    // Packages B/C supply it in production), with the
+    // skeleton-derived cornea offset in the mHead local frame.
+    // head_target_valid == false is "no constraint": C6 returns
+    // an empty map.
+    bool head_target_valid = false;
+    LLVector3 head_target_world = LLVector3::zero;
+    LLVector3 cornea_offset_head_local = LLVector3::zero;
+
+    // C7's targets, per side (index 0 = LEFT, 1 = RIGHT):
+    // wrist world positions, already composed (CP-3's
+    // provisional seam in Package A). wrist_target_valid[side]
+    // == false is "no constraint" for that side.
+    bool wrist_target_valid[2] = {false, false};
+    LLVector3 wrist_target_world[2] = {LLVector3::zero,
+                                       LLVector3::zero};
+
+    // Caller-owned pole history, per side [R2 -- C6C7-03
+    // transport]: the pole direction (world frame) the caller
+    // adopted from the last committed apply, carried beside
+    // previous_targets under the same lifecycle (retired on
+    // authority lapse, frame-token discontinuity, or settings
+    // generation change; LOCAL-transition and skeleton
+    // invalidation are C8's signals, brief OQ-3). C7 reads pole
+    // history only from the solver context's copies of these
+    // fields; it stores none itself.
+    bool previous_pole_valid[2] = {false, false};
+    LLVector3 previous_pole_world[2] = {LLVector3::zero,
+                                        LLVector3::zero};
 };
 
 // Read-only view handed to the solvers: the plan input plus the
@@ -201,6 +248,12 @@ struct FSVRAdapterSolverContext
     std::vector<LLQuaternion> base_world_rotations;
     std::vector<LLVector3> base_world_positions;
     std::map<S32, LLQuaternion> previous_targets;
+    // The plan input's caller-owned pole history, copied in by
+    // the transaction beside previous_targets [R2 -- C6C7-03
+    // transport]. Indexed 0 = LEFT, 1 = RIGHT as on the plan.
+    bool previous_pole_valid[2] = {false, false};
+    LLVector3 previous_pole_world[2] = {LLVector3::zero,
+                                        LLVector3::zero};
 };
 
 // The solver boundary is the target-world list (brief section 5):
@@ -353,6 +406,16 @@ struct FSVRAdapterWriteThroughOutcome
     // post-clamp wrist-error recompute (contract point (d)).
     bool has_wrist_target = false;
     LLVector3 wrist_target_world = LLVector3::zero;
+    // The pole the solver actually selected this call [R2 --
+    // C6C7-03 transport]: has_pole is set ONLY when the RP3
+    // procedure ran and selected a pole; the aim/flex modes and
+    // the no-target return leave it false. pole_world is a world
+    // direction. The transaction forwards it to the side's arm
+    // outcome only after the side has been accepted (post-clamp
+    // and commit processing complete), so a discarded side
+    // exposes no provisional pole.
+    bool has_pole = false;
+    LLVector3 pole_world = LLVector3::zero;
 };
 
 // A write-through arm solver: C7's RP3 pass, when C7 lands. Runs
@@ -432,6 +495,15 @@ struct FSVRAdapterArmOutcome
     FSVRAdapterArmAbortReason abort_reason = FSVRAdapterArmAbortReason::NONE;
     bool wrist_error_valid = false;
     F32 wrist_error = 0.f;
+    // The pole the caller adopts as this side's history for the
+    // next cycle [R2 -- C6C7-03 transport]: pole_valid is set
+    // ONLY when the side ran, was not aborted, its post-clamp
+    // ran, and its result was committed -- the assignment
+    // happens at the end of the side's transaction processing,
+    // never mechanically beside the solver's return. An aborted
+    // or discarded side exposes no provisional pole.
+    bool pole_valid = false;
+    LLVector3 pole_world = LLVector3::zero;
 };
 
 struct FSVRAdapterPlanResult

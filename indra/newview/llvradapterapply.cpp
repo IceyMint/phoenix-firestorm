@@ -324,6 +324,12 @@ FSVRAdapterPlanResult FSVRAdapterApply::computePlan(
     context.base_world_rotations = base_world_rotations;
     context.base_world_positions = base_world_positions;
     context.previous_targets = input.previous_targets;
+    // [R2 -- C6C7-03 transport] The caller-owned pole history
+    // rides beside previous_targets by the same mechanical copy.
+    context.previous_pole_valid[0] = input.previous_pole_valid[0];
+    context.previous_pole_valid[1] = input.previous_pole_valid[1];
+    context.previous_pole_world[0] = input.previous_pole_world[0];
+    context.previous_pole_world[1] = input.previous_pole_world[1];
 
     // Committed state for the transaction: starts as the base
     // pose and is updated joint by joint, parents first.
@@ -577,6 +583,7 @@ FSVRAdapterPlanResult FSVRAdapterApply::computePlan(
         // readback local; everything else carries its base local
         // over the just-committed parents, exactly as the target
         // path does.
+        const size_t writes_before_side = result.writes.size();
         for (S32 i : chain)
         {
             const FSVRAdapterJointInput& joint = input.joints[i];
@@ -625,6 +632,21 @@ FSVRAdapterPlanResult FSVRAdapterApply::computePlan(
                         .length();
                 outcome.wrist_error_valid = true;
             }
+        }
+
+        // [R2 -- C6C7-03 transport] Forward the solver's pole to
+        // the side's arm outcome only now: the side ran, was not
+        // aborted, its post-clamp ran, and its commit processing
+        // is complete, with at least one of its writes committed.
+        // Assigning this beside the solver's return (before the
+        // post-clamp and eligibility/commit processing) would
+        // expose a provisional pole for a side the transaction
+        // may still discard; the aborted paths above return
+        // before this point and forward nothing.
+        if (wt.has_pole && result.writes.size() > writes_before_side)
+        {
+            outcome.pole_valid = true;
+            outcome.pole_world = wt.pole_world;
         }
         return true;
     };
@@ -802,7 +824,9 @@ FSVRAdapterPlanResult FSVRAdapterApplyOnce::apply(
 
 #include "llcharacter.h"
 #include "lljoint.h"
+#include "llvrarmsolver.h"
 #include "llvrboneregistry.h"
+#include "llvrspinesolver.h"
 #include "llvrtrackingframe.h"
 #include "llvrtrackingsettings.h"
 
@@ -909,6 +933,15 @@ void FSVRAdapterApplyForCharacter(LLCharacter* character, bool preview_cycle)
     input.bend_disabled_bones = snapshot.solver_bend_disabled_bones;
     input.diag_bend_limits = snapshot.diag_bend_limits;
     input.diag_full_chain_solve = snapshot.diag_full_chain_solve;
+    // C6/C7 (CP-7): the soft-preference diagnostic and the
+    // snapshot generation reach the plan from the same snapshot.
+    // The positional block (head/wrist targets) stays invalid
+    // and the sample-validity flags above stay false: nothing
+    // here can produce a production write (DP-8) -- the wiring
+    // changes which objects sit in the solver slots and which
+    // snapshot fields reach the plan, nothing else.
+    input.diag_soft_preference = snapshot.diag_soft_preference;
+    input.settings_generation = snapshot.generation;
 
     // Build the plan joint list from the registry (OQ-7: C1
     // iterates registry/decisions; it does not hard-code a bone
@@ -1009,14 +1042,185 @@ void FSVRAdapterApplyForCharacter(LLCharacter* character, bool preview_cycle)
         input.root_world_position = root_joint->getWorldPosition();
     }
 
-    // One apply-once instance and the null solvers for the process
-    // (the self avatar is unique). Real solvers arrive with C6/C7.
+    // One apply-once instance and the solvers for the process
+    // (the self avatar is unique). C6/C7 (CP-7): the real
+    // solvers sit in the slots -- C6 in the spine slot, C7 in
+    // the write-through slot with its mandatory post-clamp; the
+    // plain target-world arm slot stays the null solver (with a
+    // write-through solver supplied it is never invoked).
     static FSVRAdapterApplyOnce s_apply_once;
-    static FSVRAdapterNullSpineSolver s_spine_solver;
-    static FSVRAdapterNullArmSolver s_arm_solver;
+    static FSVRSpineSolver s_spine_solver;
+    static FSVRAdapterNullArmSolver s_plain_arm_solver;
+    static FSVRArmSolver s_arm_solver;
+    static FSVRArmPostClamp s_arm_post_clamp;
 
-    const FSVRAdapterPlanResult result =
-        s_apply_once.apply(input, s_spine_solver, s_arm_solver);
+    // Continuity bookkeeping (CP-7/DP-4): the glue owns the
+    // cross-cycle history the pure plan cannot hold -- the last
+    // committed target map and, per side, the adopted pole --
+    // each stamped with the frame token and settings generation
+    // it was produced under. The solvers stay pure: history
+    // reaches them only as plan inputs.
+    static std::map<S32, LLQuaternion> s_previous_targets;
+    static bool s_have_previous = false;
+    static U64 s_previous_token = 0;
+    static U64 s_previous_settings_generation = 0;
+    static bool s_pole_valid[2] = {false, false};
+    static LLVector3 s_pole_world[2] = {LLVector3::zero,
+                                        LLVector3::zero};
+
+    // Retirement is evaluated before each apply, whether or not
+    // a side will be invoked: history carries only when the
+    // previous apply's token is the immediate predecessor (a gap
+    // is a tracking loss, an authority lapse, or a
+    // non-invocation) and the settings generation is unchanged.
+    // Anything else retires BOTH histories entire here, at the
+    // glue, with no invocation [R2 -- C6C7-CODE-03: retirement
+    // is applied BEFORE the transaction, separate from the
+    // aborted-side preservation on the success path below --
+    // previously the stored target map survived a discontinuity
+    // and the success path rebuilt from it, resurrecting stale
+    // membership with non-solved poses].
+    const bool continuity_carries =
+        s_have_previous &&
+        input.frame_token == s_previous_token + 1 &&
+        input.settings_generation == s_previous_settings_generation;
+    if (!continuity_carries)
+    {
+        s_previous_targets.clear();
+        s_pole_valid[0] = false;
+        s_pole_valid[1] = false;
+    }
+    // Per-side retirement [R2 -- C6C7-CODE-03]: a side that
+    // loses its authority this cycle -- no wrist target, or the
+    // arm authority off -- retires its pole and its share of
+    // the target map here, even when the other side stays
+    // active and the cycle's continuity as a whole carries; a
+    // dead side's pole no longer persists indefinitely beside
+    // a live one. (Package A production never populates wrist
+    // targets, so this is inert until Packages B/C supply
+    // them.)
+    {
+        const bool arm_authority =
+            input.hand_position_enabled && input.arm_sample_valid;
+        const FSVRAdapterDomain side_domains[2] = {
+            FSVRAdapterDomain::ARM_LEFT, FSVRAdapterDomain::ARM_RIGHT};
+        for (S32 s = 0; s < 2; ++s)
+        {
+            if (arm_authority && input.wrist_target_valid[s])
+            {
+                continue;
+            }
+            s_pole_valid[s] = false;
+            for (auto it = s_previous_targets.begin();
+                 it != s_previous_targets.end();)
+            {
+                if (it->first >= 0 &&
+                    it->first < static_cast<S32>(input.joints.size()) &&
+                    input.joints[it->first].domain == side_domains[s])
+                {
+                    it = s_previous_targets.erase(it);
+                }
+                else
+                {
+                    ++it;
+                }
+            }
+        }
+    }
+    if (continuity_carries)
+    {
+        input.previous_targets = s_previous_targets;
+        for (S32 s = 0; s < 2; ++s)
+        {
+            if (s_pole_valid[s])
+            {
+                input.previous_pole_valid[s] = true;
+                input.previous_pole_world[s] = s_pole_world[s];
+            }
+        }
+    }
+
+    const FSVRAdapterPlanResult result = s_apply_once.apply(
+        input, s_spine_solver, s_plain_arm_solver, &s_arm_solver,
+        &s_arm_post_clamp);
+
+    if (result.first_failing_gate == FSVRAdapterGate::TOKEN)
+    {
+        // A duplicate token: the apply did not happen; the
+        // bookkeeping stands exactly as it was.
+    }
+    else if (result.first_failing_gate == FSVRAdapterGate::NONE)
+    {
+        // Store the committed-domain target worlds as the new
+        // history, and adopt each side's pole only where the
+        // side's outcome carries one: by construction that means
+        // the side ran, was not aborted, its post-clamp ran, and
+        // its result was committed. An aborted or discarded side
+        // updates no history: neither its pole state nor its
+        // share of previous_targets changes on account of this
+        // call ([R2] lifecycle), so the new map starts from the
+        // (post-retirement) stored one and refreshes ONLY the
+        // joints this cycle actually committed [R2 --
+        // C6C7-CODE-03: entries for joints not written this
+        // cycle keep their stored values -- refreshing them
+        // from the resolved pose would replace a solved history
+        // with the joint's base composition, a non-solved pose].
+        std::map<S32, LLQuaternion> new_targets = s_previous_targets;
+        auto side_aborted = [&](FSVRAdapterDomain domain) {
+            if (domain == FSVRAdapterDomain::ARM_LEFT)
+            {
+                return result.arm_outcome_left.write_through_aborted;
+            }
+            if (domain == FSVRAdapterDomain::ARM_RIGHT)
+            {
+                return result.arm_outcome_right.write_through_aborted;
+            }
+            return false;
+        };
+        auto refresh = [&](S32 joint_index) {
+            if (joint_index >= 0 &&
+                joint_index <
+                    static_cast<S32>(
+                        result.resolved_world_rotations.size()) &&
+                !side_aborted(input.joints[joint_index].domain))
+            {
+                new_targets[joint_index] =
+                    result.resolved_world_rotations[joint_index];
+            }
+        };
+        for (const FSVRAdapterWrite& write : result.writes)
+        {
+            refresh(write.joint_index);
+        }
+        s_previous_targets = new_targets;
+        s_previous_token = input.frame_token;
+        s_previous_settings_generation = input.settings_generation;
+        s_have_previous = true;
+        if (result.arm_outcome_left.pole_valid)
+        {
+            s_pole_valid[0] = true;
+            s_pole_world[0] = result.arm_outcome_left.pole_world;
+        }
+        if (result.arm_outcome_right.pole_valid)
+        {
+            s_pole_valid[1] = true;
+            s_pole_world[1] = result.arm_outcome_right.pole_world;
+        }
+    }
+    else
+    {
+        // A pre-solver gate failed: no solver ran, so the stored
+        // targets are stale and both poles retire (the sides'
+        // authority lapsed this cycle). The token stamp still
+        // advances, so the next cycle's contiguity is judged
+        // against this apply and finds an empty map.
+        s_previous_targets.clear();
+        s_previous_token = input.frame_token;
+        s_previous_settings_generation = input.settings_generation;
+        s_have_previous = true;
+        s_pole_valid[0] = false;
+        s_pole_valid[1] = false;
+    }
 
     // The committed writes: C1 is the sole owner of the final
     // committed output. Locals only, via setRotation -- never
