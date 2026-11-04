@@ -155,6 +155,16 @@ public:
 public:
     typedef std::vector<LLAvatarJoint*> avatar_joint_list_t;
     const avatar_joint_list_t& getSkeleton() { return mSkeleton; }
+    // P2-07B C8 (CP-5, AMEND-C8-R1-01): the authoritative
+    // skeleton-rebuild generation. Incremented as the first
+    // statement of buildSkeleton() -- the single funnel every
+    // skeleton (re)construction passes through -- so it
+    // advances on exactly the geometry-resetting events,
+    // whether a rebuild replaces the joint objects or
+    // re-initializes them in place. Consumers (C8's routing)
+    // sample it per cycle and test for change; llappearance
+    // itself holds no session state and applies no filtering.
+    U64                 getSkeletonRebuildGeneration() const { return mSkeletonRebuildGeneration; }
     typedef std::map<std::string, std::string, std::less<>> joint_alias_map_t;
     const joint_alias_map_t& getJointAliases();
     typedef std::map<std::string, std::string> joint_parent_map_t; // matrix plus parent
@@ -178,6 +188,11 @@ protected:
     void                clearSkeleton();
     bool                mIsBuilt{ false }; // state of deferred character building
     avatar_joint_list_t mSkeleton;
+    // P2-07B C8 (CP-5, AMEND-C8-R1-01): see
+    // getSkeletonRebuildGeneration(). Monotonic per instance;
+    // never reset (clearSkeleton is teardown or funnel-internal
+    // and is deliberately not hooked).
+    U64                 mSkeletonRebuildGeneration{ 0 };
     LLVector3OverrideMap    mPelvisFixups;
     joint_alias_map_t   mJointAliasMap;
 

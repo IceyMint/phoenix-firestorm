@@ -208,6 +208,18 @@ struct FSVRAdapterPlanInput
     // and pole state) before the next apply.
     U64 settings_generation = 0;
 
+    // P2-07B C8 (CP-3): the session continuity epoch these
+    // inputs were assembled under -- C8's dedicated counter,
+    // advanced by a finalized LOCAL transition or a skeleton
+    // reinitialization since the previous apply. A change
+    // retires the caller's continuity history exactly as a
+    // settings-generation change does (Package B spec section
+    // 6.3): those two events produce neither a frame-token
+    // gap nor a generation change, so without this stamp both
+    // histories would carry across them. Supplied by the glue
+    // from FSVRContinuity at assembly; a stamp, not a callback.
+    U64 continuity_epoch = 0;
+
     // C6's target: the cornea-midpoint world position (already
     // composed and ratio-scaled by the CP-3 seam's caller;
     // Packages B/C supply it in production), with the
@@ -561,6 +573,23 @@ public:
     // dependency shape (C5 depends on the plan, never the
     // reverse). Any addition is a spec amendment.
     static const std::vector<std::string>& calibrationHoldJointNames();
+
+    // P2-07B C8 (CP-3): the glue's continuity predicate,
+    // extracted verbatim from FSVRAdapterApplyForCharacter so
+    // H8 fixtures the production expression (the house pattern:
+    // C4's couplingWouldFire, C5's exposed helpers). Continuity
+    // carries iff a previous apply exists, the frame token is
+    // its immediate successor, and BOTH the settings generation
+    // and the continuity epoch are unchanged since it. The
+    // epoch term is C8's addition: a mismatch retires both
+    // histories pre-transaction, through the glue's existing
+    // whole-history clear, whether or not a solver is invoked.
+    static bool continuityCarries(bool have_previous,
+                                  U64 frame_token, U64 previous_token,
+                                  U64 settings_generation,
+                                  U64 previous_settings_generation,
+                                  U64 continuity_epoch,
+                                  U64 previous_continuity_epoch);
 
     // The pure plan (brief section 4). No globals, no cross-cycle
     // pose state: identical inputs give identical outputs.

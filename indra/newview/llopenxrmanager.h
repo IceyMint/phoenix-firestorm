@@ -12,6 +12,7 @@
 #include "llrect.h"
 #include "v3math.h"
 #include "llquaternion.h"
+#include "llvrcontinuity.h"
 
 #include <memory>
 #include <string>
@@ -318,6 +319,14 @@ public:
     void retireEligibleLocalTransitions(long long sample_time_ns, const char* reason);
     // P2-04b: queued-transition diagnostics.
     unsigned long long pendingLocalTransitionCount() const;
+    // P2-07B C8 (CP-1): pull-only drain of the finalized
+    // LOCAL transition batches recorded by the finalization
+    // fan-out (FSVRFinalizationObserver, a member of the
+    // impl). Returns the accumulated batches and clears the
+    // buffer; empty when nothing finalized since the last
+    // drain. Observation only: no queue state is read or
+    // mutated here beyond the observer's own buffer.
+    std::vector<FSVRFinalizedBatch> drainFinalizedLocalTransitionBatches();
     void shutdown();
 
 private:

@@ -253,6 +253,23 @@ FSVRAdapterApply::calibrationHoldJointNames()
 }
 
 // static
+bool FSVRAdapterApply::continuityCarries(
+    bool have_previous, U64 frame_token, U64 previous_token,
+    U64 settings_generation, U64 previous_settings_generation,
+    U64 continuity_epoch, U64 previous_continuity_epoch)
+{
+    // P2-07B C8 (CP-3): the glue's retirement predicate, with
+    // the continuity-epoch conjunct added to the committed
+    // token/generation terms. See the header for the contract;
+    // the glue calls this function, so what H8 fixtures is
+    // what production evaluates.
+    return have_previous &&
+           frame_token == previous_token + 1 &&
+           settings_generation == previous_settings_generation &&
+           continuity_epoch == previous_continuity_epoch;
+}
+
+// static
 FSVRAdapterPlanResult FSVRAdapterApply::computePlan(
     const FSVRAdapterPlanInput& input,
     FSVRAdapterSpineSolver& spine_solver,
@@ -902,6 +919,7 @@ FSVRAdapterPlanResult FSVRAdapterApplyOnce::apply(
 #include "lljoint.h"
 #include "llopenxrtrace.h"
 #include "llvrarmsolver.h"
+#include "llvrcontinuity.h"
 #include "llvrboneregistry.h"
 #include "llvrspinesolver.h"
 #include "llvrtrackingframe.h"
@@ -948,6 +966,22 @@ void FSVRAdapterApplyForCharacter(LLCharacter* character, bool preview_cycle)
     {
         return;
     }
+
+    // P2-07B C8 (CP-1/CP-4/CP-5): service this cycle's
+    // continuity signals first, before anything reads them:
+    // drain the manager's finalized LOCAL-transition batches
+    // (routing each through the rebase decision; a Suspend
+    // invalidates the session neutral through C5's entry
+    // point) and sample the self avatar's skeleton rebuild
+    // generation (a change invalidates likewise). Placement
+    // is the contract: the plan input assembled below stamps
+    // the post-service continuity epoch, and C5's step hook
+    // at the tail reads C5's epoch advanced by the same
+    // service, so no cycle can assemble or step on
+    // pre-transition state. The service runs on published
+    // and bypass cycles alike; idle cost is one empty drain
+    // plus one integer load + compare.
+    FSVRContinuity::serviceCycleSignals();
 
     const FSVRTrackingFrameDecisions* decisions =
         FSVRTrackingCoordinator::currentDecisions();
@@ -1042,6 +1076,11 @@ void FSVRAdapterApplyForCharacter(LLCharacter* character, bool preview_cycle)
     // snapshot fields reach the plan, nothing else.
     input.diag_soft_preference = snapshot.diag_soft_preference;
     input.settings_generation = snapshot.generation;
+    // P2-07B C8 (CP-3): the continuity stamp, read once at
+    // input assembly from C8's router (post-service, above).
+    // The retirement predicate below compares it against the
+    // previous apply's stamp.
+    input.continuity_epoch = FSVRContinuity::continuityEpoch();
 
     // P2-07B C5 (CP-4 item 2): the calibration hold flag,
     // read once at input assembly from C5's live transaction
@@ -1173,6 +1212,10 @@ void FSVRAdapterApplyForCharacter(LLCharacter* character, bool preview_cycle)
     static bool s_have_previous = false;
     static U64 s_previous_token = 0;
     static U64 s_previous_settings_generation = 0;
+    // P2-07B C8 (CP-3): the continuity epoch the previous
+    // apply's inputs were stamped with, refreshed on the
+    // same paths that refresh the token/generation stamps.
+    static U64 s_previous_continuity_epoch = 0;
     static bool s_pole_valid[2] = {false, false};
     static LLVector3 s_pole_world[2] = {LLVector3::zero,
                                         LLVector3::zero};
@@ -1189,10 +1232,16 @@ void FSVRAdapterApplyForCharacter(LLCharacter* character, bool preview_cycle)
     // previously the stored target map survived a discontinuity
     // and the success path rebuilt from it, resurrecting stale
     // membership with non-solved poses].
-    const bool continuity_carries =
-        s_have_previous &&
-        input.frame_token == s_previous_token + 1 &&
-        input.settings_generation == s_previous_settings_generation;
+    // P2-07B C8 (CP-3): the predicate itself is
+    // FSVRAdapterApply::continuityCarries (plan TU, H8-
+    // fixtured); the epoch term retires both histories here
+    // when a LOCAL transition or a skeleton reinit landed
+    // between the two applies -- events that produce neither
+    // a token gap nor a settings-generation change.
+    const bool continuity_carries = FSVRAdapterApply::continuityCarries(
+        s_have_previous, input.frame_token, s_previous_token,
+        input.settings_generation, s_previous_settings_generation,
+        input.continuity_epoch, s_previous_continuity_epoch);
     if (!continuity_carries)
     {
         s_previous_targets.clear();
@@ -1304,6 +1353,7 @@ void FSVRAdapterApplyForCharacter(LLCharacter* character, bool preview_cycle)
         s_previous_targets = new_targets;
         s_previous_token = input.frame_token;
         s_previous_settings_generation = input.settings_generation;
+        s_previous_continuity_epoch = input.continuity_epoch;
         s_have_previous = true;
         if (result.arm_outcome_left.pole_valid)
         {
@@ -1326,6 +1376,7 @@ void FSVRAdapterApplyForCharacter(LLCharacter* character, bool preview_cycle)
         s_previous_targets.clear();
         s_previous_token = input.frame_token;
         s_previous_settings_generation = input.settings_generation;
+        s_previous_continuity_epoch = input.continuity_epoch;
         s_have_previous = true;
         s_pole_valid[0] = false;
         s_pole_valid[1] = false;

@@ -1509,6 +1509,15 @@ struct LLOpenXRManagerImpl
     // the queue under any generation. Bounded by the event
     // count of one manager lifetime.
     std::set<std::pair<unsigned long long, long long>> finalized_local_transitions;
+    // P2-07B C8 (CP-1): the finalization fan-out observer.
+    // Owned here, beside the queue it observes; the take and
+    // retire paths below append each call's finalized
+    // non-stale keys to it, and the session machinery pulls
+    // them back out through
+    // LLOpenXRManager::drainFinalizedLocalTransitionBatches().
+    // The manager never calls out through it: no callback, no
+    // registration, no pointer to session state.
+    FSVRFinalizationObserver finalization_observer;
     bool runtime_authenticated = false;
     std::string runtime_name;
     std::string runtime_version;
@@ -2759,6 +2768,12 @@ bool LLOpenXRManager::takeNewestEligibleLocalTransition(long long sample_time_ns
     std::deque<LLLocalSpaceTransition> keep;
     LLLocalSpaceTransition newest;
     bool found = false;
+    // P2-07B C8 (CP-1): this call's finalized non-stale keys,
+    // collected for the fan-out below -- superseded keys in
+    // displacement order, the consumed-newest key last.
+    // Stale-epoch drops are never collected: they belong to a
+    // dead session generation and signal nothing.
+    std::vector<FSVRFinalizedTransitionKey> finalized_keys;
     for (const auto& transition : mImpl->pending_local_transitions)
     {
         if (transition.incarnation != mImpl->incarnation ||
@@ -2782,6 +2797,13 @@ bool LLOpenXRManager::takeNewestEligibleLocalTransition(long long sample_time_ns
                 mImpl->finalized_local_transitions.insert(
                     std::make_pair(newest.incarnation, newest.change_time_ns));
                 ++superseded_count;
+                // P2-07B C8 (CP-1): the displaced newest is
+                // finalized as superseded by this call.
+                FSVRFinalizedTransitionKey key;
+                key.incarnation = newest.incarnation;
+                key.generation = newest.generation;
+                key.change_time_ns = newest.change_time_ns;
+                finalized_keys.push_back(key);
                 newest = transition;
             }
             else if (found)
@@ -2791,6 +2813,12 @@ bool LLOpenXRManager::takeNewestEligibleLocalTransition(long long sample_time_ns
                 mImpl->finalized_local_transitions.insert(
                     std::make_pair(transition.incarnation, transition.change_time_ns));
                 ++superseded_count;
+                // P2-07B C8 (CP-1): superseded by this call.
+                FSVRFinalizedTransitionKey key;
+                key.incarnation = transition.incarnation;
+                key.generation = transition.generation;
+                key.change_time_ns = transition.change_time_ns;
+                finalized_keys.push_back(key);
             }
             else
             {
@@ -2809,6 +2837,22 @@ bool LLOpenXRManager::takeNewestEligibleLocalTransition(long long sample_time_ns
         mImpl->finalized_local_transitions.insert(
             std::make_pair(newest.incarnation, newest.change_time_ns));
         out_transition = newest;
+        // P2-07B C8 (CP-1): the consumed-newest key completes
+        // this call's batch.
+        FSVRFinalizedTransitionKey key;
+        key.incarnation = newest.incarnation;
+        key.generation = newest.generation;
+        key.change_time_ns = newest.change_time_ns;
+        finalized_keys.push_back(key);
+    }
+    if (!finalized_keys.empty())
+    {
+        // P2-07B C8 (CP-1): one fan-out presentation per
+        // finalizing call, after the queue and the finalized
+        // set have reached their post-call state. Observation
+        // only -- nothing above reads the observer, and this
+        // call mutates nothing but the observer's own buffer.
+        mImpl->finalization_observer.noteFinalizedBatch(finalized_keys);
     }
     return found;
 #else
@@ -2832,6 +2876,10 @@ void LLOpenXRManager::retireEligibleLocalTransitions(long long sample_time_ns, c
     }
     const std::string reason_str = reason ? reason : "retired";
     std::deque<LLLocalSpaceTransition> keep;
+    // P2-07B C8 (CP-1): this call's finalized non-stale keys
+    // (the retired ones), for the fan-out below. Stale-epoch
+    // drops are never collected.
+    std::vector<FSVRFinalizedTransitionKey> finalized_keys;
     for (const auto& transition : mImpl->pending_local_transitions)
     {
         if (transition.incarnation != mImpl->incarnation ||
@@ -2847,6 +2895,15 @@ void LLOpenXRManager::retireEligibleLocalTransitions(long long sample_time_ns, c
             emit_local_transition_record(reason_str.c_str(), transition, "");
             mImpl->finalized_local_transitions.insert(
                 std::make_pair(transition.incarnation, transition.change_time_ns));
+            // P2-07B C8 (CP-1): retired by this call. A
+            // transition retired on the not-feeding path
+            // redefined LOCAL exactly as much as an applied
+            // one did, so it is presented identically.
+            FSVRFinalizedTransitionKey key;
+            key.incarnation = transition.incarnation;
+            key.generation = transition.generation;
+            key.change_time_ns = transition.change_time_ns;
+            finalized_keys.push_back(key);
         }
         else
         {
@@ -2854,6 +2911,12 @@ void LLOpenXRManager::retireEligibleLocalTransitions(long long sample_time_ns, c
         }
     }
     mImpl->pending_local_transitions.swap(keep);
+    if (!finalized_keys.empty())
+    {
+        // P2-07B C8 (CP-1): one fan-out presentation per
+        // finalizing call. Observation only.
+        mImpl->finalization_observer.noteFinalizedBatch(finalized_keys);
+    }
 #else
     (void)sample_time_ns;
     (void)reason;
@@ -2866,6 +2929,16 @@ unsigned long long LLOpenXRManager::pendingLocalTransitionCount() const
     return mImpl ? static_cast<unsigned long long>(mImpl->pending_local_transitions.size()) : 0;
 #else
     return 0;
+#endif
+}
+
+std::vector<FSVRFinalizedBatch> LLOpenXRManager::drainFinalizedLocalTransitionBatches()
+{
+#if LL_LINUX && LL_X11
+    return mImpl ? mImpl->finalization_observer.drainBatches()
+                 : std::vector<FSVRFinalizedBatch>();
+#else
+    return std::vector<FSVRFinalizedBatch>();
 #endif
 }
 
