@@ -238,6 +238,13 @@ struct FSVRAdapterPlanInput
     bool previous_pole_valid[2] = {false, false};
     LLVector3 previous_pole_world[2] = {LLVector3::zero,
                                         LLVector3::zero};
+
+    // P2-07B C5: an active calibration transaction (Package B
+    // spec section 3.1). Set only by the glue from C5's
+    // transaction state; the apply's calibration-hold branch
+    // keys on this field alone. Independent of gates 1-5 by
+    // design (spec section 3.1 authorization contract).
+    bool calibration_hold_active = false;
 };
 
 // Read-only view handed to the solvers: the plan input plus the
@@ -542,6 +549,18 @@ public:
     // gate's defense in depth and are fed by the harness only.)
     static FSVRAdapterCycleKind classifyCycle(bool preview_cycle,
                                               bool controller_paused);
+
+    // P2-07B C5 (CP-5): the calibration hold set -- spec
+    // section 3.1's in-scope joints by skeleton joint name
+    // (the D7 spine chain, mNeck, mHead, and per side
+    // collar/shoulder/elbow/wrist; fingers are not held).
+    // The canonical list lives in this TU so the plan's
+    // hold branch and C5's transaction machinery
+    // (FSVRCalibration::holdJointNames forwards here) can
+    // never drift, and so the plan keeps its one-directional
+    // dependency shape (C5 depends on the plan, never the
+    // reverse). Any addition is a spec amendment.
+    static const std::vector<std::string>& calibrationHoldJointNames();
 
     // The pure plan (brief section 4). No globals, no cross-cycle
     // pose state: identical inputs give identical outputs.

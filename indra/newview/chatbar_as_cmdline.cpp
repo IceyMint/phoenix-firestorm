@@ -49,6 +49,7 @@
 #include "llinventorymodel.h"
 #include "llnotificationmanager.h"
 #include "llopenxrmanager.h"
+#include "llvrcalibration.h"
 #include "llparcel.h"
 #include "llslurl.h"
 #include "lltooldraganddrop.h"
@@ -785,6 +786,26 @@ bool cmd_line_chat(std::string_view revised_text, EChatType type, bool from_gest
                 LLStringUtil::toLower(xr_arg);
 
                 LLOpenXRManager& openxr = LLOpenXRManager::instance();
+                if (has_arg && xr_arg == "calibrate")
+                {
+                    // P2-07B C5 (CP-1): /xr calibrate, no
+                    // arguments (OPEN-1, DECIDED by Leah
+                    // 2026-11-03). Any further token is a
+                    // usage error; the entry point applies
+                    // the in-progress and no-session refusals
+                    // itself. Returns before the mono
+                    // fall-through below, and touches nothing
+                    // else: no settings write, no recenter,
+                    // no yaw-base access (spec section 4.1).
+                    std::string extra_arg;
+                    if (i >> extra_arg)
+                    {
+                        FSCommon::report_to_nearby_chat("Usage: /xr calibrate");
+                        return false;
+                    }
+                    FSVRCalibration::requestCalibration();
+                    return false;
+                }
                 if (!has_arg || xr_arg == "toggle")
                 {
                     openxr.setMonoEnabled(!openxr.isMonoEnabled());
@@ -799,7 +820,7 @@ bool cmd_line_chat(std::string_view revised_text, EChatType type, bool from_gest
                 }
                 else if (xr_arg != "status")
                 {
-                    FSCommon::report_to_nearby_chat("Usage: /xr [on|off|toggle|status]");
+                    FSCommon::report_to_nearby_chat("Usage: /xr [on|off|toggle|status|calibrate]");
                     return false;
                 }
 

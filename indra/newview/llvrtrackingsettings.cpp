@@ -595,9 +595,12 @@ FSVRTrackingSettings::validateCalibrationRecord(const LLSD& raw_record)
     {
         return FSVRCalibrationRecordValidation{};
     }
-    // Capture-completion is implied by floor_verified == true; a
-    // record whose floor was not verified MUST NOT be used (and
-    // per section 3.3 must never have been committed).
+    // floor_verified records that the capture's anchor was
+    // verified through the section 4.2 gates (Package B spec
+    // section 4.3 / DP-B1: the field's meaning is the
+    // calibration-anchored verification, not a physical-floor
+    // check); a record without it MUST NOT be used (and per
+    // section 3.3 must never have been committed).
     if (!raw_record.has("floor_verified") ||
         !raw_record["floor_verified"].isBoolean() ||
         !raw_record["floor_verified"].asBoolean())

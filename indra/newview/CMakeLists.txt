@@ -219,6 +219,7 @@ set(viewer_SOURCE_FILES
     llvradapterapply.cpp
     llvrarmsolver.cpp
     llvrboneregistry.cpp
+    llvrcalibration.cpp
     llvrjointlimits.cpp
     llvrspinesolver.cpp
     llvrtrackingarbitrator.cpp
@@ -1077,6 +1078,7 @@ set(viewer_HEADER_FILES
     llvradapterapply.h
     llvrarmsolver.h
     llvrboneregistry.h
+    llvrcalibration.h
     llvrjointlimits.h
     llvrspinesolver.h
     llvrtrackingarbitrator.h

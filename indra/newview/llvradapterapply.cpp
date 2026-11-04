@@ -22,6 +22,8 @@
 
 #include "llvradapterapply.h"
 
+#include "llvrcalibration.h"
+
 #include <set>
 
 namespace
@@ -233,6 +235,24 @@ FSVRAdapterCycleKind FSVRAdapterApply::classifyCycle(
 }
 
 // static
+const std::vector<std::string>&
+FSVRAdapterApply::calibrationHoldJointNames()
+{
+    // Spec section 3.1's in-scope set, by skeleton joint
+    // name (brief section 2.7, confirmed against
+    // llvrboneregistry.cpp): the D7 spine chain, mNeck,
+    // mHead, and per side collar/shoulder/elbow/wrist.
+    // Fingers are not held and not read.
+    static const std::vector<std::string> names = {
+        "mSpine1",      "mSpine2",      "mTorso",
+        "mSpine3",      "mSpine4",      "mChest",
+        "mNeck",        "mHead",
+        "mCollarLeft",  "mShoulderLeft", "mElbowLeft", "mWristLeft",
+        "mCollarRight", "mShoulderRight", "mElbowRight", "mWristRight"};
+    return names;
+}
+
+// static
 FSVRAdapterPlanResult FSVRAdapterApply::computePlan(
     const FSVRAdapterPlanInput& input,
     FSVRAdapterSpineSolver& spine_solver,
@@ -287,6 +307,62 @@ FSVRAdapterPlanResult FSVRAdapterApply::computePlan(
     if (!input.context_armed)
     {
         return fail(FSVRAdapterGate::CONTEXT);
+    }
+    // P2-07B C5 (CP-5): the calibration-hold branch (Package B
+    // spec section 3.1's authorization contract). Entered iff
+    // the plan input carries an active C5 calibration
+    // transaction; its authority derives from that transaction
+    // alone and is independent of gates 1-5 by design, so it
+    // sits after the cycle/context checks that precede gate 1
+    // and before every gate exit. In a hold cycle the solver
+    // phases do not run and no solver is invoked: the result
+    // is the held pose -- bind locals (identity, C0 section 1)
+    // for exactly the section 3.1 hold set, base locals
+    // carried over their held parents for every other joint --
+    // with exactly one write per hold-set joint present in
+    // the input, and no other writes (no targets, no pole
+    // state, no continuity bookkeeping).
+    if (input.calibration_hold_active)
+    {
+        const std::vector<std::string>& hold_names =
+            FSVRAdapterApply::calibrationHoldJointNames();
+        std::vector<char> is_hold(count, 0);
+        for (S32 i = 0; i < count; ++i)
+        {
+            for (const std::string& name : hold_names)
+            {
+                if (input.joints[i].name == name)
+                {
+                    is_hold[i] = 1;
+                    break;
+                }
+            }
+        }
+        result.applied = true;
+        for (S32 i = 0; i < count; ++i)
+        {
+            const FSVRAdapterJointInput& joint = input.joints[i];
+            LLQuaternion parent_rot = input.root_world_rotation;
+            LLVector3 parent_pos = input.root_world_position;
+            if (joint.parent_index >= 0)
+            {
+                parent_rot = result.resolved_world_rotations[joint.parent_index];
+                parent_pos = result.resolved_world_positions[joint.parent_index];
+            }
+            const LLQuaternion local =
+                is_hold[i] ? LLQuaternion() : joint.base_local;
+            LLQuaternion world = local * parent_rot;
+            world.normalize();
+            result.resolved_locals[i] = local;
+            result.resolved_world_rotations[i] = world;
+            result.resolved_world_positions[i] =
+                parent_pos + (joint.rest_offset * parent_rot);
+            if (is_hold[i])
+            {
+                result.writes.push_back({i, LLQuaternion()});
+            }
+        }
+        return result;
     }
     // Gate 1: frame identity. Consuming Stage-1 shadow decisions
     // as if they were grants is the failure mode this gate exists
@@ -824,6 +900,7 @@ FSVRAdapterPlanResult FSVRAdapterApplyOnce::apply(
 
 #include "llcharacter.h"
 #include "lljoint.h"
+#include "llopenxrtrace.h"
 #include "llvrarmsolver.h"
 #include "llvrboneregistry.h"
 #include "llvrspinesolver.h"
@@ -874,16 +951,30 @@ void FSVRAdapterApplyForCharacter(LLCharacter* character, bool preview_cycle)
 
     const FSVRTrackingFrameDecisions* decisions =
         FSVRTrackingCoordinator::currentDecisions();
-    if (!decisions)
+    if (!decisions && !FSVRCalibration::cycleWorkPending())
     {
-        // Nothing published for this frame: nothing to process.
+        // Nothing published for this frame, and calibration
+        // has no work: nothing to process.
         return;
     }
+
+    // P2-07B C5 (CP-4 item 3): the pre-cycle staleness check
+    // runs before input assembly on both the decisions path
+    // and the bypass path, so a starved transaction aborts
+    // here rather than producing a hold cycle after a gap.
+    FSVRCalibration::preCycleCheck();
+
     const FSVRTrackingSettingsSnapshot& snapshot =
         FSVRTrackingSettings::captureForFrame();
 
     FSVRAdapterPlanInput input;
-    input.frame_token = decisions->app_frame_token;
+    // On the no-decisions bypass path (CP-4 item 6) the
+    // token comes from the trace's current app frame token:
+    // the same fallback the coordinator itself uses when it
+    // has no pending token (llvrtrackingframe.cpp).
+    input.frame_token =
+        decisions ? decisions->app_frame_token
+                  : static_cast<U64>(LLOpenXRTrace::currentAppFrameToken());
     // The hook is post-blend by construction (brief section 3.2);
     // the cycle classification comes from production state: the
     // Animation Preview flag the override read from the avatar,
@@ -899,19 +990,28 @@ void FSVRAdapterApplyForCharacter(LLCharacter* character, bool preview_cycle)
     // Gate 1 inputs. Decisions are current when the snapshot they
     // were finalized against is still the captured snapshot
     // (brief section 2.3: arbitration is finalized earlier in the
-    // same frame than the motion update).
-    input.decisions_published = true;
+    // same frame than the motion update). On the no-decisions
+    // bypass path (C5 CP-4 item 6) the three decisions fields
+    // are false and the per-bone decision loops below are
+    // skipped (the decision map stays empty, so every joint
+    // takes its no-decision defaults); the rest of the
+    // assembly is unchanged.
+    input.decisions_published = (decisions != nullptr);
     input.decisions_current =
-        (snapshot.generation == decisions->settings_generation);
+        decisions && (snapshot.generation == decisions->settings_generation);
     // Runtime-effective means the C4 decision form; Stage-1
     // decisions are shadow-only, so this is false until C4 lands.
-    input.decisions_runtime_effective = !decisions->bones.empty();
-    for (const FSVRBoneDecision& bone : decisions->bones)
+    input.decisions_runtime_effective = false;
+    if (decisions)
     {
-        if (bone.shadow_only)
+        input.decisions_runtime_effective = !decisions->bones.empty();
+        for (const FSVRBoneDecision& bone : decisions->bones)
         {
-            input.decisions_runtime_effective = false;
-            break;
+            if (bone.shadow_only)
+            {
+                input.decisions_runtime_effective = false;
+                break;
+            }
         }
     }
 
@@ -942,6 +1042,12 @@ void FSVRAdapterApplyForCharacter(LLCharacter* character, bool preview_cycle)
     // snapshot fields reach the plan, nothing else.
     input.diag_soft_preference = snapshot.diag_soft_preference;
     input.settings_generation = snapshot.generation;
+
+    // P2-07B C5 (CP-4 item 2): the calibration hold flag,
+    // read once at input assembly from C5's live transaction
+    // state. The apply point gains no second mode channel:
+    // the flag rides the plan input like every other field.
+    input.calibration_hold_active = FSVRCalibration::transactionActive();
 
     // Build the plan joint list from the registry (OQ-7: C1
     // iterates registry/decisions; it does not hard-code a bone
@@ -989,9 +1095,12 @@ void FSVRAdapterApplyForCharacter(LLCharacter* character, bool preview_cycle)
     }
 
     std::map<std::string, const FSVRBoneDecision*> decision_by_bone;
-    for (const FSVRBoneDecision& bone : decisions->bones)
+    if (decisions)
     {
-        decision_by_bone[bone.bone_id] = &bone;
+        for (const FSVRBoneDecision& bone : decisions->bones)
+        {
+            decision_by_bone[bone.bone_id] = &bone;
+        }
     }
 
     input.joints.reserve(ordered.size());
@@ -1233,6 +1342,15 @@ void FSVRAdapterApplyForCharacter(LLCharacter* character, bool preview_cycle)
             ordered[write.joint_index]->setRotation(write.local);
         }
     }
+
+    // P2-07B C5 (CP-4 item 4): the post-apply step hook. The
+    // transaction and session machines advance on this
+    // cycle's plan input and plan result plus the shell's
+    // fresh reads (manager samples, avatar signals, eye
+    // state, read at step time, once, inside the module's
+    // shell). When neither machine has work the hook is two
+    // flag reads.
+    FSVRCalibration::stepFromAdapterCycle(character, input, result);
 }
 
 #endif // FSVR_ADAPTER_PLAN_ONLY
