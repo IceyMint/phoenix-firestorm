@@ -891,21 +891,24 @@ void FSVRAdapterApplyForCharacter(LLCharacter* character, bool preview_cycle)
         }
     }
 
-    // Gate 2 and the Stage-2 snapshot fields (gates 3/4) are C3/C4
-    // inputs: vr_active is carried by FSVRTrackingFrameInput,
-    // which the coordinator does not publish, and the snapshot has
-    // no FSVRTrackHeadPosition / FSVRTrackHandPosition /
-    // FSVRDiag* fields yet (brief OQ-6). The glue passes the
-    // conservative values; gate 1 already renders the glue inert
-    // at baseline, and no gate is bypassed -- each will read its
-    // real source when C3/C4 land.
+    // Gate 2 inputs: vr_active is carried by FSVRTrackingFrameInput,
+    // which the coordinator does not publish, and the spine/arm
+    // sample-validity flags have no source yet; those stay
+    // conservative. The six enablement/diagnostic fields are
+    // P2-07B C4 (CP-6): they read the user's actual positional
+    // settings and diagnostic values from the frame snapshot
+    // captured above, so the adapter now plans on them. Nothing
+    // downstream of the plan changes: gate 1 already renders the
+    // glue inert at baseline (DP-5), and no gate is bypassed.
     input.vr_active = false;
-    input.positional_solve_enabled = false;
-    input.head_position_enabled = false;
-    input.hand_position_enabled = false;
+    input.positional_solve_enabled = snapshot.diag_positional_solve;
+    input.head_position_enabled = snapshot.track_head_position;
+    input.hand_position_enabled = snapshot.track_hand_position;
     input.spine_sample_valid = false;
     input.arm_sample_valid = false;
-    input.bend_disabled_bones = false;
+    input.bend_disabled_bones = snapshot.solver_bend_disabled_bones;
+    input.diag_bend_limits = snapshot.diag_bend_limits;
+    input.diag_full_chain_solve = snapshot.diag_full_chain_solve;
 
     // Build the plan joint list from the registry (OQ-7: C1
     // iterates registry/decisions; it does not hard-code a bone

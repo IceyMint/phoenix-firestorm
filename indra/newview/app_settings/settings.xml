@@ -62,6 +62,83 @@
       <key>Value</key>
       <integer>1</integer>
     </map>
+    <key>FSVRTrackHeadPosition</key>
+    <map>
+      <key>Comment</key>
+      <string>Enable positional head tracking (P2-07B): the spine/neck chain solves so the head reaches the headset's tracked position. Enabled automatically when the Upper body tracking group is enabled.</string>
+      <key>Persist</key>
+      <integer>1</integer>
+      <key>Type</key>
+      <string>Boolean</string>
+      <key>Value</key>
+      <integer>0</integer>
+    </map>
+    <key>FSVRTrackHandPosition</key>
+    <map>
+      <key>Comment</key>
+      <string>Enable positional hand tracking (P2-07B): the arm chain solves so the wrist reaches the hand's tracked position. Toggled independently of Head position.</string>
+      <key>Persist</key>
+      <integer>1</integer>
+      <key>Type</key>
+      <string>Boolean</string>
+      <key>Value</key>
+      <integer>0</integer>
+    </map>
+    <key>FSVRDiagBendLimits</key>
+    <map>
+      <key>Comment</key>
+      <string>P2-07B diagnostic (spec section 3.4): enforce authored bend limits in the positional solver. DEBUG/TESTING ONLY -- leaving this enabled in a build that ships positional solving disabled-by-diagnostic would silently change tracking fidelity.</string>
+      <key>Persist</key>
+      <integer>1</integer>
+      <key>Type</key>
+      <string>Boolean</string>
+      <key>Value</key>
+      <integer>1</integer>
+    </map>
+    <key>FSVRDiagSoftPreference</key>
+    <map>
+      <key>Comment</key>
+      <string>P2-07B diagnostic (spec section 3.4): prefer solutions near the animated pose inside the hard bend limits.</string>
+      <key>Persist</key>
+      <integer>1</integer>
+      <key>Type</key>
+      <string>Boolean</string>
+      <key>Value</key>
+      <integer>1</integer>
+    </map>
+    <key>FSVRDiagForceUnitScale</key>
+    <map>
+      <key>Comment</key>
+      <string>P2-07B diagnostic (spec section 3.4): force per-tracker scale ratios to 1.0, ignoring calibration.</string>
+      <key>Persist</key>
+      <integer>1</integer>
+      <key>Type</key>
+      <string>Boolean</string>
+      <key>Value</key>
+      <integer>0</integer>
+    </map>
+    <key>FSVRDiagPositionalSolve</key>
+    <map>
+      <key>Comment</key>
+      <string>P2-07B diagnostic (spec section 3.4): master switch for the positional solve.</string>
+      <key>Persist</key>
+      <integer>1</integer>
+      <key>Type</key>
+      <string>Boolean</string>
+      <key>Value</key>
+      <integer>1</integer>
+    </map>
+    <key>FSVRDiagFullChainSolve</key>
+    <map>
+      <key>Comment</key>
+      <string>P2-07B diagnostic (spec section 3.4): solve the full anatomical chain per limb instead of a reduced domain.</string>
+      <key>Persist</key>
+      <integer>1</integer>
+      <key>Type</key>
+      <string>Boolean</string>
+      <key>Value</key>
+      <integer>1</integer>
+    </map>
   <key>FSEnforceStrictObjectCheck</key>
   <map>
     <key>Comment</key>
