@@ -139,6 +139,17 @@
       <key>Value</key>
       <integer>1</integer>
     </map>
+    <key>FSVRLeanResponseGain</key>
+    <map>
+      <key>Comment</key>
+      <string>Stage 1 provisional lean response (P2-07B redesign section 4): multiplies the head-target displacement produced from a sync-established neutral. 1.0 is the baseline response; this is a user feel preference, not a body measurement and not a per-avatar profile. Accepted range 0.05 to 3.0; a value outside it is rejected (no positional lean), never clamped.</string>
+      <key>Persist</key>
+      <integer>1</integer>
+      <key>Type</key>
+      <string>F32</string>
+      <key>Value</key>
+      <real>1.0</real>
+    </map>
   <key>FSEnforceStrictObjectCheck</key>
   <map>
     <key>Comment</key>

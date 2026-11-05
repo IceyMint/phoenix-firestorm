@@ -257,17 +257,24 @@ FSVRAdapterApply::calibrationHoldJointNames()
 bool FSVRAdapterApply::continuityCarries(
     bool have_previous, U64 frame_token, U64 previous_token,
     U64 settings_generation, U64 previous_settings_generation,
-    U64 continuity_epoch, U64 previous_continuity_epoch)
+    U64 continuity_epoch, U64 previous_continuity_epoch,
+    U64 install_generation, U64 previous_install_generation)
 {
     // P2-07B C8 (CP-3): the glue's retirement predicate, with
     // the continuity-epoch conjunct added to the committed
     // token/generation terms. See the header for the contract;
     // the glue calls this function, so what H8 fixtures is
     // what production evaluates.
+    // P2-07B Stage 1 (CP-S1-2): the installation-generation
+    // conjunct (S1-BRIEF-R1-01) -- carried history was
+    // produced relative to the neutral installed under
+    // previous_install_generation; a resync (any producer)
+    // advances the view's generation and retires it.
     return have_previous &&
            frame_token == previous_token + 1 &&
            settings_generation == previous_settings_generation &&
-           continuity_epoch == previous_continuity_epoch;
+           continuity_epoch == previous_continuity_epoch &&
+           install_generation == previous_install_generation;
 }
 
 bool decideSpineSampleValid(const FSVRSpineSampleInputs& in)
@@ -276,7 +283,10 @@ bool decideSpineSampleValid(const FSVRSpineSampleInputs& in)
     // Extracted so H10 tests the production composition
     // (Package B spec section 9); the glue supplies the
     // cycle's values, this function only composes them.
-    return in.record_usable_for_head && in.neutral_established &&
+    // P2-07B Stage 1 (CP-S1-4): E5's input is the renamed
+    // scale_input_valid; the conjunction's shape is
+    // unchanged.
+    return in.scale_input_valid && in.neutral_established &&
            in.hmd_position_valid && in.sitting_signals_clear &&
            !in.calibration_in_progress;
 }
@@ -286,6 +296,7 @@ bool composeHeadTargetBlock(
     const LLVector3& hmd_position_local, F32 session_base_yaw_rad,
     const LLQuaternion& root_world_rotation,
     const LLVector3& root_world_position, bool diag_force_unit_scale,
+    F32 lean_gain,
     LLVector3& out_head_target_world,
     LLVector3& out_cornea_offset_head_local)
 {
@@ -317,8 +328,40 @@ bool composeHeadTargetBlock(
     const LLVector3 p_mapped(-d_local.mV[VZ], -d_local.mV[VX],
                              d_local.mV[VY]);
     const LLQuaternion q_yaw(session_base_yaw_rad, LLVector3::z_axis);
-    const LLVector3 d_world =
+    LLVector3 d_world =
         (p_mapped * q_yaw) * root_world_rotation;
+    // P2-07B Stage 1 (CP-S1-3): the provisional mapping. For
+    // a sync-established neutral, the user's lean gain
+    // scales the target displacement BEFORE the solver sees
+    // it -- applied to d_world, not to the seam ratio, so
+    // FSVRDiagForceUnitScale keeps its exact shipped
+    // meaning (it forces the *calibration* ratio to 1.0;
+    // the gain is a user preference and survives the
+    // diagnostic). At gain 1.0 the cornea target moves
+    // exactly as far as the headset moved, in world units:
+    // a baseline response, not an anatomical proportion
+    // (REDESIGN-R1-01).
+    // The post-multiplication finite guard (S1-BRIEF-R1-02)
+    // lives in this branch only: this is the one path where
+    // a user-supplied multiplier meets an unbounded
+    // displacement, and a nonfinite target must never reach
+    // the solver from it. The measured path introduces no
+    // new multiplication and keeps its shipped behaviour
+    // exactly (its inputs remain bounded by the record
+    // validator); guarding it too would break the measured
+    // path's pinned bit-identity for no Stage 1 need.
+    const bool provisional =
+        session.scale_source == FSVRScaleSource::PROVISIONAL_SYNC;
+    if (provisional)
+    {
+        d_world *= lean_gain;
+        if (!std::isfinite(d_world.mV[VX]) ||
+            !std::isfinite(d_world.mV[VY]) ||
+            !std::isfinite(d_world.mV[VZ]))
+        {
+            return false;
+        }
+    }
     // Step 3: the neutral cornea, fixed root-relative at
     // establishment (PB-R1-03), re-expressed in the CURRENT
     // root frame -- the composition's only per-cycle
@@ -327,15 +370,36 @@ bool composeHeadTargetBlock(
     const LLVector3 neutral_cornea_world =
         session.neutral_cornea_root * root_world_rotation +
         root_world_position;
-    // Step 4: C6's shipped composition seam, called in
-    // production for the first time. The ratio is the
-    // record's, read through the view (CP-3); the diagnostic
-    // is consumed here, at composition, per spec section
-    // 3.4 -- the record is not touched.
+    // Step 4: C6's shipped composition seam. P2-07B Stage 1
+    // (CP-S1-3): the ratio is selected by the view's scale
+    // source -- the record's head_ratio for a measured
+    // neutral (bit-identical to the shipped line), the
+    // provisional baseline constant for a sync-established
+    // one (whose record is a default NO_RECORD basis whose
+    // head_ratio is never read). For NONE the block is
+    // unreachable in production (E5 has already failed the
+    // cycle, CP-S1-4) and the baseline is the safe value
+    // regardless. The diagnostic is consumed here, at
+    // composition, per spec section 3.4 -- the record is
+    // not touched.
+    const F32 scale_ratio =
+        (session.scale_source == FSVRScaleSource::MEASURED_RECORD)
+            ? static_cast<F32>(session.record.head_ratio)
+            : static_cast<F32>(
+                  FSVRCalibration::PROVISIONAL_LEAN_BASELINE);
     out_head_target_world = FSVRSpineSolver::composeHeadTarget(
-        neutral_cornea_world, d_world,
-        static_cast<F32>(session.record.head_ratio),
+        neutral_cornea_world, d_world, scale_ratio,
         diag_force_unit_scale);
+    if (provisional &&
+        (!std::isfinite(out_head_target_world.mV[VX]) ||
+         !std::isfinite(out_head_target_world.mV[VY]) ||
+         !std::isfinite(out_head_target_world.mV[VZ])))
+    {
+        // S1-BRIEF-R1-02: no target is published from a
+        // nonfinite provisional composition.
+        out_head_target_world = LLVector3::zero;
+        return false;
+    }
     // Step 5: the section 4.6 cornea offset, verbatim.
     out_cornea_offset_head_local = session.cornea_offset_head_local;
     return true;
@@ -1192,11 +1256,20 @@ void FSVRAdapterApplyForCharacter(LLCharacter* character, bool preview_cycle)
     const bool hmd_position_read =
         LLOpenXRManager::instance().getHmdPosition(hmd_position_local);
     FSVRSpineSampleInputs sample_inputs;
-    sample_inputs.record_usable_for_head =
-        session_view.record.status ==
-            FSVRCalibrationRecordValidation::RecordStatus::USABLE_FULL ||
-        session_view.record.status ==
-            FSVRCalibrationRecordValidation::RecordStatus::USABLE_HEAD_ONLY;
+    // P2-07B Stage 1 (CP-S1-4): E5 is scale-input validity
+    // -- the view carries a named scale source (a measured
+    // record validated at its producers, or the provisional
+    // baseline), and the snapshot's lean gain is inside its
+    // bounded domain. An invalid gain fails the cycle
+    // closed for EVERY scale source: the user who typed a
+    // broken value gets no positional spine -- the
+    // diagnosable state -- not a quietly different feel.
+    // (Pre-Stage-1 this field read the record's USABLE_*
+    // status; a sync-established neutral has no record to
+    // read, which is the redesign's whole point.)
+    sample_inputs.scale_input_valid =
+        session_view.scale_source != FSVRScaleSource::NONE &&
+        snapshot.lean_gain_valid;
     sample_inputs.neutral_established = session_view.established;
     sample_inputs.hmd_position_valid = hmd_position_read;
     sample_inputs.sitting_signals_clear = session_view.sitting_signals_clear;
@@ -1350,6 +1423,7 @@ void FSVRAdapterApplyForCharacter(LLCharacter* character, bool preview_cycle)
                                input.root_world_rotation,
                                input.root_world_position,
                                snapshot.diag_force_unit_scale,
+                               snapshot.lean_gain,
                                input.head_target_world,
                                input.cornea_offset_head_local);
     input.wrist_target_valid[0] = false;
@@ -1381,6 +1455,13 @@ void FSVRAdapterApplyForCharacter(LLCharacter* character, bool preview_cycle)
     // apply's inputs were stamped with, refreshed on the
     // same paths that refresh the token/generation stamps.
     static U64 s_previous_continuity_epoch = 0;
+    // P2-07B Stage 1 (CP-S1-2, S1-BRIEF-R1-01): the session
+    // view's installation generation the stored history was
+    // produced under, refreshed on the same paths. A
+    // resync advances the view's generation, the predicate
+    // below sees the mismatch, and history earned under the
+    // old anchor retires before the next solve.
+    static U64 s_previous_install_generation = 0;
     static bool s_pole_valid[2] = {false, false};
     static LLVector3 s_pole_world[2] = {LLVector3::zero,
                                         LLVector3::zero};
@@ -1406,7 +1487,8 @@ void FSVRAdapterApplyForCharacter(LLCharacter* character, bool preview_cycle)
     const bool continuity_carries = FSVRAdapterApply::continuityCarries(
         s_have_previous, input.frame_token, s_previous_token,
         input.settings_generation, s_previous_settings_generation,
-        input.continuity_epoch, s_previous_continuity_epoch);
+        input.continuity_epoch, s_previous_continuity_epoch,
+        session_view.install_generation, s_previous_install_generation);
     if (!continuity_carries)
     {
         s_previous_targets.clear();
@@ -1519,6 +1601,7 @@ void FSVRAdapterApplyForCharacter(LLCharacter* character, bool preview_cycle)
         s_previous_token = input.frame_token;
         s_previous_settings_generation = input.settings_generation;
         s_previous_continuity_epoch = input.continuity_epoch;
+        s_previous_install_generation = session_view.install_generation;
         s_have_previous = true;
         if (result.arm_outcome_left.pole_valid)
         {
@@ -1542,6 +1625,7 @@ void FSVRAdapterApplyForCharacter(LLCharacter* character, bool preview_cycle)
         s_previous_token = input.frame_token;
         s_previous_settings_generation = input.settings_generation;
         s_previous_continuity_epoch = input.continuity_epoch;
+        s_previous_install_generation = session_view.install_generation;
         s_have_previous = true;
         s_pole_valid[0] = false;
         s_pole_valid[1] = false;

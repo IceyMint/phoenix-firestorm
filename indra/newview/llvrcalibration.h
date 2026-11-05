@@ -187,6 +187,37 @@ struct FSVRCalSettleObservation
 // DP-C5-11, plus ICR-1/ICR-2).
 // ---------------------------------------------------------------------------
 
+// P2-07B Stage 1 (CP-S1-1): the scale contract an established
+// neutral carries (redesign section 4). NONE: no scale basis
+// -- an established view with NONE is not a solvable basis
+// (E5 fails closed). MEASURED_RECORD: the view's record was
+// validated USABLE_* and its head_ratio is the scale
+// (Package B's contract, the transaction's and section 5's
+// establishments). PROVISIONAL_SYNC: no record; the scale is
+// the Stage 1 provisional baseline mapping with the user's
+// lean gain (redesign section 4 -- a baseline response, not
+// an anatomical proportion).
+//
+// OPEN-S1-3 documentation obligation: installation from the
+// measured path remains possible only through its current
+// gated routes -- the transaction's entry and section 5
+// acquisition, both stationarity-gated shut at HEAD (the
+// production stationarity source is unmeasured). If those
+// parameters are ever installed, an invalidated provisional
+// neutral could be succeeded by a measured establishment
+// with no user act; the precedence rule between the two
+// scale sources must be settled BEFORE any future change
+// makes that route operational again, not as part of
+// re-enabling it. Stage 1's obligation is only that the
+// stamping below stays honest, which CP-S1-1's producer
+// rule does.
+enum class FSVRScaleSource : U8
+{
+    NONE             = 0,
+    MEASURED_RECORD  = 1,
+    PROVISIONAL_SYNC = 2,
+};
+
 struct FSVRSessionNeutralView
 {
     bool established = false;
@@ -207,6 +238,24 @@ struct FSVRSessionNeutralView
     // cycle being populated, refreshed by the shell on every
     // stepped glue cycle. Not latched at acquisition.
     bool sitting_signals_clear = false;
+    // P2-07B Stage 1 (CP-S1-1): which scale contract this
+    // neutral carries, stamped by every producer of an
+    // established view. The default-constructed state is
+    // scale-less, fail-closed by construction: a view whose
+    // established is true with NONE is never a solvable
+    // basis (E5, CP-S1-4).
+    FSVRScaleSource scale_source = FSVRScaleSource::NONE;
+    // P2-07B Stage 1 (CP-S1-1/CP-S1-2, S1-BRIEF-R1-01): the
+    // session-neutral installation generation this view was
+    // installed under -- the machine's monotonic counter,
+    // advanced exactly once per successful installation by
+    // any producer and stamped here by the same writes.
+    // Refusals, failed derivations, and invalidations never
+    // advance it. The adapter's history-carry predicate
+    // requires its carried history's generation to match
+    // this value; 0 is the never-installed default and no
+    // established view ever carries it.
+    U32 install_generation = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -477,13 +526,22 @@ public:
     // CP-2's INSTALL path (DP-B11(a)): the one route to
     // ESTABLISHED that does not run the acquisition
     // procedure. Called by the shell when it executes the
-    // transaction's INSTALL_NEUTRAL action.
+    // transaction's INSTALL_NEUTRAL action, and (P2-07B
+    // Stage 1, CP-S1-2) by the shell when it executes a
+    // pending sync. The scale_source argument is CP-S1-1's
+    // stamping rule: the transaction passes MEASURED_RECORD
+    // (its payload is a built, validated record), the sync
+    // passes PROVISIONAL_SYNC with a default NO_RECORD
+    // basis. A successful installation advances the
+    // installation generation exactly once and stamps it
+    // into the view (S1-BRIEF-R1-01).
     void installFromCapture(
         const FSVRCalibrationRecordValidation& record,
         const LLVector3& anchor_hmd_local,
         F32 anchor_forward_yaw_rad,
         const LLVector3& cornea_offset_head_local,
-        const LLVector3& neutral_cornea_root);
+        const LLVector3& neutral_cornea_root,
+        FSVRScaleSource scale_source);
 
 private:
     void dropToSuspended();
@@ -491,6 +549,16 @@ private:
 
     FSVRSessionState mState = FSVRSessionState::UNCALIBRATED;
     FSVRSessionNeutralView mView;
+    // P2-07B Stage 1 (S1-BRIEF-R1-01): the installation
+    // generation counter. Monotonic for the machine's
+    // lifetime: advanced exactly once per successful
+    // established-view installation (installFromCapture and
+    // section 5's establishment write), by nothing else --
+    // in particular NOT reset by dropToSuspended, so a
+    // post-invalidation install stamps a fresh, larger
+    // value and stale carried history can never match it
+    // by wraparound to a previously used generation.
+    U32 mInstallGeneration = 0;
     FSVRCalibrationRecordValidation mRecordBasis;
     bool mHaveRecordBasis = false;
     std::vector<FSVRCalSample> mWindow;
@@ -649,17 +717,55 @@ public:
     static constexpr U32 SETTLE_WINDOW_CYCLES = 300;
     static constexpr F64 STARVATION_BOUND_S = 10.0;
 
+    // P2-07B Stage 1 (CP-S1-1): redesign section 4's Stage 1
+    // provisional scale -- the baseline mapping. The HMD
+    // displacement, expressed in world units by the
+    // composition's existing frame mapping, is applied to
+    // the cornea target at this factor before the user's
+    // lean gain. 1.0 is the only baseline that introduces
+    // no unmeasured body dimension: the target translates
+    // exactly as far as the headset moved (gain aside). It
+    // is a baseline response, NOT an anatomical proportion
+    // (REDESIGN-R1-01).
+    static constexpr F64 PROVISIONAL_LEAN_BASELINE = 1.0;
+
+    // P2-07B Stage 1 (CP-S1-2): the pending-sync lifecycle's
+    // stamp decision (S1-BRIEF-R1-03), factored pure so H5
+    // group G fixtures the exact decision the shell
+    // executes. A sync request is stamped at request time
+    // with the OpenXR session incarnation and the avatar
+    // skeleton-rebuild generation; it may execute only
+    // while both stamps still name the current session and
+    // skeleton. True iff the request is still bound to the
+    // current session/avatar; false cancels it (it can
+    // never execute in a later incarnation or against a
+    // rebuilt skeleton). Pure over the four stamps.
+    static bool syncRequestBoundToCurrent(
+        U64 request_incarnation, U64 request_skeleton_gen,
+        U64 current_incarnation, U64 current_skeleton_gen);
+
     // ---- Viewer shell (below the guard in the .cpp) ----
 
-    // CP-1's entry point: refuses (in progress / no VR
-    // session) via nearby chat, else begins the transaction.
+    // CP-1's entry point, rerouted by P2-07B Stage 1
+    // (CP-S1-2): this is now the SYNC request. It refuses
+    // (in progress / no VR session) via nearby chat, else
+    // raises a pending sync request stamped with the
+    // current session incarnation and skeleton generation;
+    // the next stepped adapter cycle's hook executes it
+    // (one atomic capture, no transaction begun, no record
+    // read). The transaction machine remains in the tree
+    // as the retained diagnostic path; after this reroute
+    // it has no production entry point.
     static void requestCalibration();
     // CP-4 item 2: the glue populates the plan input's hold
     // flag from this.
     static bool transactionActive();
     // CP-4 item 6: the glue's amended guard consults this --
     // true iff a calibration transaction is active or the
-    // session machine is ACQUIRING.
+    // session machine is ACQUIRING. P2-07B Stage 1
+    // (CP-S1-2): a pending sync request also makes this
+    // true, so a requested sync reaches the step hook on
+    // the next motion cycle whatever the machine's state.
     static bool cycleWorkPending();
     // CP-4 item 3: starvation abort, executed (with its
     // report) before the flag is populated for this cycle.

@@ -26,6 +26,7 @@ const char* const FSVRTrackingSettings::SETTING_DIAG_SOFT_PREFERENCE = "FSVRDiag
 const char* const FSVRTrackingSettings::SETTING_DIAG_FORCE_UNIT_SCALE = "FSVRDiagForceUnitScale";
 const char* const FSVRTrackingSettings::SETTING_DIAG_POSITIONAL_SOLVE = "FSVRDiagPositionalSolve";
 const char* const FSVRTrackingSettings::SETTING_DIAG_FULL_CHAIN_SOLVE = "FSVRDiagFullChainSolve";
+const char* const FSVRTrackingSettings::SETTING_LEAN_RESPONSE_GAIN = "FSVRLeanResponseGain";
 
 // P2-07B C6-E Gate-1 authorization (CP-5 part 1a). NONE in every
 // ordinary build. Advanced ONLY by a dedicated authorization
@@ -308,6 +309,18 @@ bool s_last_diag_soft_preference = true;
 bool s_last_diag_force_unit_scale = false;
 bool s_last_diag_positional_solve = true;
 bool s_last_diag_full_chain_solve = true;
+// P2-07B Stage 1 (CP-S1-3): last-observed lean gain, in
+// the snapshot's derived form -- the (validity, sanitized
+// value) pair -- initialized to the declared default's
+// derived form so a fresh settings file's first capture is
+// not a spurious "change" beyond the initialization
+// capture itself. Change detection compares this derived
+// pair, never the raw F32 [S1-CODE-R1-01]: a NaN raw
+// value never equals itself, so the raw comparison
+// registered a persistent NaN as a change on every
+// capture and churned the snapshot generation.
+F32 s_last_lean_gain = 1.f;
+bool s_last_lean_gain_valid = true;
 FSVRTrackingSettingsSnapshot s_snapshot;
 bool s_snapshot_initialized = false;
 
@@ -393,6 +406,23 @@ const FSVRTrackingSettingsSnapshot& FSVRTrackingSettings::captureForFrame()
         gSavedSettings.getBOOL(SETTING_DIAG_POSITIONAL_SOLVE);
     const bool diag_full_chain_solve =
         gSavedSettings.getBOOL(SETTING_DIAG_FULL_CHAIN_SOLVE);
+    // P2-07B Stage 1 (CP-S1-3): the lean gain's raw value,
+    // read beside the diag reads, and the snapshot
+    // derivation, computed here rather than in the snapshot
+    // fill below so change detection can compare the
+    // derived pair (see the tuple below and
+    // [S1-CODE-R1-01]). Validation is finite AND within
+    // the bounded domain 0.05..3.0 (DP-S1-2 /
+    // S1-BRIEF-R1-02 -- control limits, not body
+    // measurements): an out-of-domain value is rejected
+    // outright, never clamped to a value the user did
+    // not set.
+    const F32 lean_gain_raw =
+        gSavedSettings.getF32(SETTING_LEAN_RESPONSE_GAIN);
+    const bool lean_gain_valid = std::isfinite(lean_gain_raw) &&
+                                 lean_gain_raw >= 0.05f &&
+                                 lean_gain_raw <= 3.0f;
+    const F32 lean_gain = lean_gain_valid ? lean_gain_raw : 1.f;
     const std::string canonical = canonicalLLSD(raw_disabled);
 
     const bool changed = !s_snapshot_initialized || !s_last_canonical_valid ||
@@ -407,7 +437,9 @@ const FSVRTrackingSettingsSnapshot& FSVRTrackingSettings::captureForFrame()
                          diag_soft_preference != s_last_diag_soft_preference ||
                          diag_force_unit_scale != s_last_diag_force_unit_scale ||
                          diag_positional_solve != s_last_diag_positional_solve ||
-                         diag_full_chain_solve != s_last_diag_full_chain_solve;
+                         diag_full_chain_solve != s_last_diag_full_chain_solve ||
+                         lean_gain != s_last_lean_gain ||
+                         lean_gain_valid != s_last_lean_gain_valid;
     if (!changed)
     {
         return s_snapshot;
@@ -426,6 +458,8 @@ const FSVRTrackingSettingsSnapshot& FSVRTrackingSettings::captureForFrame()
     s_last_diag_force_unit_scale = diag_force_unit_scale;
     s_last_diag_positional_solve = diag_positional_solve;
     s_last_diag_full_chain_solve = diag_full_chain_solve;
+    s_last_lean_gain = lean_gain;
+    s_last_lean_gain_valid = lean_gain_valid;
 
     FSVRTrackingSettingsSnapshot next;
     next.generation = s_snapshot_initialized ? s_snapshot.generation + 1 : 1;
@@ -447,6 +481,26 @@ const FSVRTrackingSettingsSnapshot& FSVRTrackingSettings::captureForFrame()
     next.diag_force_unit_scale = diag_force_unit_scale;
     next.diag_positional_solve = diag_positional_solve;
     next.diag_full_chain_solve = diag_full_chain_solve;
+    // P2-07B Stage 1 (CP-S1-3): the lean gain's snapshot
+    // fields, from the derivation beside the raw read
+    // above. E5 fails closed on the validity flag
+    // (CP-S1-4). When invalid, lean_gain is pinned to
+    // 1.0 -- inert under the failed E5 -- so the snapshot
+    // never carries a non-finite or out-of-domain F32
+    // downstream. LL controls do not clamp F32 values;
+    // this derivation is the enforcement. A missing or
+    // mistyped control degrades through getF32 to the
+    // declared 1.0, valid: the control is declared in
+    // settings.xml in the same change, so that path is
+    // belt-and-braces, in the C4 idiom. The derived pair
+    // rides the change tuple above, so a change in the
+    // snapshot's gain state advances the generation and
+    // retires continuity history through the existing
+    // term -- a solved pose produced under one gain is
+    // never a soft-preference witness under another
+    // (OPEN-S1-5).
+    next.lean_gain_valid = lean_gain_valid;
+    next.lean_gain = lean_gain;
     next.schema_valid =
         next.disabled_bones.parse_status ==
         FSVRTrackingDisabledBoneSet::ParseStatus::VALID;

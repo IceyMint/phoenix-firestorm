@@ -157,6 +157,18 @@ bool FSVRCalibration::productionStationarityParams(
 }
 
 // static
+bool FSVRCalibration::syncRequestBoundToCurrent(
+    U64 request_incarnation, U64 request_skeleton_gen,
+    U64 current_incarnation, U64 current_skeleton_gen)
+{
+    // CP-S1-2 (S1-BRIEF-R1-03): the pending sync's binding.
+    // Both stamps must still name the live session and
+    // skeleton; either mismatch cancels the request.
+    return request_incarnation == current_incarnation &&
+           request_skeleton_gen == current_skeleton_gen;
+}
+
+// static
 FSVRStationarityVerdict FSVRCalibration::decideStationarity(
     const std::vector<FSVRCalSample>& window,
     const FSVRStationarityParams& params)
@@ -1498,7 +1510,8 @@ void FSVRSessionNeutral::installFromCapture(
     const FSVRCalibrationRecordValidation& record,
     const LLVector3& anchor_hmd_local, F32 anchor_forward_yaw_rad,
     const LLVector3& cornea_offset_head_local,
-    const LLVector3& neutral_cornea_root)
+    const LLVector3& neutral_cornea_root,
+    FSVRScaleSource scale_source)
 {
     const bool sitting_clear = mView.sitting_signals_clear;
     mView = FSVRSessionNeutralView();
@@ -1509,6 +1522,13 @@ void FSVRSessionNeutral::installFromCapture(
     mView.anchor_forward_yaw_rad = anchor_forward_yaw_rad;
     mView.cornea_offset_head_local = cornea_offset_head_local;
     mView.neutral_cornea_root = neutral_cornea_root;
+    // CP-S1-1 stamping + S1-BRIEF-R1-01 generation advance:
+    // exactly once per successful installation, here and at
+    // section 5's establishment write -- the two producers
+    // that do not share this entry. Nothing else advances
+    // the counter.
+    mView.scale_source = scale_source;
+    mView.install_generation = ++mInstallGeneration;
     mRecordBasis = record;
     mHaveRecordBasis = true;
     mState = FSVRSessionState::ESTABLISHED;
@@ -1713,6 +1733,13 @@ void FSVRSessionNeutral::step(const FSVRSessionStepInputs& inputs)
     mView.anchor_forward_yaw_rad = stage2YawOfForward(inputs.hmd_forward);
     mView.cornea_offset_head_local = session_offset;
     mView.neutral_cornea_root = neutral_root;
+    // CP-S1-1 stamping + S1-BRIEF-R1-01 generation advance:
+    // this site writes the view directly rather than
+    // calling installFromCapture, so it stamps and advances
+    // independently -- exactly once per successful
+    // establishment, as there.
+    mView.scale_source = FSVRScaleSource::MEASURED_RECORD;
+    mView.install_generation = ++mInstallGeneration;
     mState = FSVRSessionState::ESTABLISHED;
     resetAcquisition();
 }
@@ -1737,6 +1764,7 @@ void FSVRSessionNeutral::step(const FSVRSessionStepInputs& inputs)
 #include "llcharacter.h"
 #include "llopenxrmanager.h"
 #include "llvoavatar.h"
+#include "llvoavatarself.h"
 
 #include <chrono>
 #include <ctime>
@@ -1748,6 +1776,20 @@ FSVRCalibrationTransaction s_transaction;
 FSVRSessionNeutral s_session_neutral;
 FSVRCalibrationRecordValidation s_prior_record;
 U64 s_local_transition_epoch = 0;
+
+// P2-07B Stage 1 (CP-S1-2): the pending sync request. The
+// command (FSVRCalibration::requestCalibration) raises it;
+// the next stepped adapter cycle's hook executes it. The
+// stamps bind the request to one OpenXR session incarnation
+// and one avatar skeleton generation (S1-BRIEF-R1-03): a
+// request whose stamps no longer name the current session
+// or skeleton is cancelled, never executed. The stamp types
+// follow the shipped counters they copy (the manager's
+// getIncarnation and LLAvatarAppearance's rebuild
+// generation, both U64-width).
+bool s_sync_pending = false;
+U64 s_sync_request_incarnation = 0;  // OpenXR incarnation at request time
+U64 s_sync_request_skeleton_gen = 0; // skeleton-rebuild generation at request time
 
 F64 shellNowSeconds()
 {
@@ -1774,6 +1816,22 @@ struct ShellSittingSignals
     bool in_air = false;
 
     // The ICR-2 not-sitting fact over these signals.
+    // P2-07B Stage 1 (CP-S1-5): this conjunction is E8's
+    // policy, re-documented as the five-row matrix in the
+    // Stage 1 brief section 3.5. All four clear -- avatar
+    // standing, unparented, grounded, no ground-sit -- is
+    // the one Stage 1 permit row (the feel-test case).
+    // sitting_on_object, ground_sit, parented-without-
+    // sitting, and in_air each fail closed, for separate
+    // stated reasons; the object-sit row (pelvis planted
+    // by the seat, following above it) is the first
+    // post-Stage-1 row to revisit. The user's physical
+    // posture is not an input to any row: it never reaches
+    // the viewer as a signal, and the design forbids
+    // inferring it. Stage 1 changes no signal, read,
+    // refresh, or verdict here -- this conjunction is
+    // bit-identical -- so a future stage can permit rows
+    // individually instead of re-litigating a boolean.
     bool clear() const
     {
         return !sitting_on_object && !parented && !ground_sit &&
@@ -1808,15 +1866,126 @@ void executeActions(const std::vector<FSVRTransactionAction>& actions)
             FSVRTrackingSettings::writeCalibrationRecord(action.record);
             break;
         case FSVRTransactionAction::Kind::INSTALL_NEUTRAL:
+            // CP-S1-1: the transaction's payload is a built,
+            // validated record by construction (RESOLVE
+            // re-validates it), so its install stamps
+            // MEASURED_RECORD.
             s_session_neutral.installFromCapture(
                 action.installed_record,
                 action.install_anchor_hmd_local,
                 action.install_anchor_forward_yaw_rad,
                 action.install_cornea_offset_head_local,
-                action.install_neutral_cornea_root);
+                action.install_neutral_cornea_root,
+                FSVRScaleSource::MEASURED_RECORD);
             break;
         }
     }
+}
+
+// P2-07B Stage 1 (CP-S1-2): execute a pending sync request
+// against the executing cycle's own reads. The capture is
+// atomic within this call: every input is the step hook's
+// current cycle (C8's fence has already run for the cycle,
+// and invalidation arrives only through later cycles'
+// fences). The request has already been consumed by the
+// caller; every path out of this function is final for it
+// -- install, refusal with its named reason, or silent
+// cancellation on a stale stamp binding. There are no
+// retries. Deliberately NOT checked: posture. There is no
+// upright gate and no stillness gate -- syncing while
+// leaning installs that pose as neutral -- and no sitting
+// refusal: whether the installed neutral may drive the
+// spine in a given avatar state is E8's per-cycle policy,
+// not the capture's.
+void executeSync(const FSVRAdapterPlanInput& input,
+                 const FSVRAdapterPlanResult& result,
+                 bool hmd_position_valid, const LLVector3& hmd_position,
+                 bool hmd_forward_valid, const LLVector3& hmd_forward,
+                 bool eye_valid, const LLVector3& cornea_midpoint,
+                 U64 current_incarnation, U64 current_skeleton_gen)
+{
+    // Lifecycle binding (S1-BRIEF-R1-03), validated before
+    // any capture step: an incarnation or skeleton mismatch
+    // cancels the request. Nothing is installed and no
+    // success is reported; a cancellation is silent by
+    // design (the user's session or avatar changed under a
+    // request that was never executable in the new one).
+    if (!FSVRCalibration::syncRequestBoundToCurrent(
+            s_sync_request_incarnation, s_sync_request_skeleton_gen,
+            current_incarnation, current_skeleton_gen))
+    {
+        return;
+    }
+    // Step 1: position valid -- the transaction GATES'
+    // existing string for the identical condition.
+    if (!hmd_position_valid)
+    {
+        FSCommon::report_to_nearby_chat(
+            "calibration failed: headset not tracked");
+        return;
+    }
+    // Step 2: the forward carries a yaw (ICR-1's evidence
+    // predicate, the same one section 5 establishment
+    // requires).
+    if (!adoptedForwardHasYaw(hmd_forward, hmd_forward_valid))
+    {
+        FSCommon::report_to_nearby_chat(
+            "calibration failed: headset orientation unavailable");
+        return;
+    }
+    // Step 3: the cornea landmark needs the cycle's
+    // genuinely prim-derived eye reading.
+    if (!eye_valid)
+    {
+        FSCommon::report_to_nearby_chat(
+            "calibration failed: eye reference unavailable");
+        return;
+    }
+    // Step 4: derive the coherent pair's second half from
+    // this cycle's composed head transform (the section 4.6
+    // lookup shape). Absent mHead, or a non-finite
+    // derivation, refuses with the eye-reference reason.
+    S32 head_index = -1;
+    for (S32 i = 0; i < static_cast<S32>(input.joints.size()); ++i)
+    {
+        if (input.joints[i].name == "mHead" &&
+            i < static_cast<S32>(result.resolved_world_positions.size()) &&
+            i < static_cast<S32>(result.resolved_world_rotations.size()))
+        {
+            head_index = i;
+            break;
+        }
+    }
+    if (head_index < 0)
+    {
+        FSCommon::report_to_nearby_chat(
+            "calibration failed: eye reference unavailable");
+        return;
+    }
+    const LLVector3 offset =
+        FSVRCalibration::deriveCorneaOffsetHeadLocal(
+            cornea_midpoint,
+            result.resolved_world_positions[head_index],
+            result.resolved_world_rotations[head_index]);
+    const LLVector3 neutral_root =
+        neutralCorneaRootRelative(input, head_index, offset);
+    if (!finiteVec(offset) || !finiteVec(neutral_root))
+    {
+        FSCommon::report_to_nearby_chat(
+            "calibration failed: eye reference unavailable");
+        return;
+    }
+    // Step 5: install through the machine's one install
+    // entry, with a default NO_RECORD basis -- a sync never
+    // fabricates a record (CP-S1-4's anti-masquerade rule)
+    // -- and report success. This report is the only
+    // "calibration synced" emission in the tree: success is
+    // reported only by an install.
+    s_session_neutral.installFromCapture(
+        FSVRCalibrationRecordValidation{},
+        hmd_position, stage2YawOfForward(hmd_forward), offset,
+        neutral_root, FSVRScaleSource::PROVISIONAL_SYNC);
+    FSCommon::report_to_nearby_chat("calibration synced");
 }
 
 } // namespace
@@ -1824,26 +1993,55 @@ void executeActions(const std::vector<FSVRTransactionAction>& actions)
 // static
 void FSVRCalibration::requestCalibration()
 {
-    // CP-1 items 4-5: the entry refusals. The running
-    // transaction is undisturbed by a refused second
-    // invocation.
-    if (s_transaction.active())
+    // P2-07B Stage 1 (CP-S1-2): the sync request. CP-1's
+    // entry point, rerouted: it raises a pending sync and
+    // the next stepped adapter cycle's hook executes it.
+    // It reads no record, begins no transaction, and does
+    // not claim success -- installation is reported by the
+    // executing cycle (executeSync). The transaction
+    // machine remains in the tree as the retained
+    // diagnostic path; it has no production entry point
+    // after this reroute.
+    LLOpenXRManager& openxr = LLOpenXRManager::instance();
+    const U64 incarnation = openxr.getIncarnation();
+    const U64 skeleton_gen =
+        gAgentAvatarp ? gAgentAvatarp->getSkeletonRebuildGeneration()
+                      : 0;
+    // Lifecycle cleanup (S1-BRIEF-R1-03): a pending request
+    // whose stamps no longer name the current session or
+    // skeleton is already cancelled by its binding -- it
+    // can never execute -- so clear it here rather than
+    // letting it refuse a legitimate new-session request
+    // as "already in progress" when no adapter cycle ran
+    // to consume it (a session can end with a request
+    // still pending and no further cycle executing).
+    if (s_sync_pending &&
+        !syncRequestBoundToCurrent(s_sync_request_incarnation,
+                                   s_sync_request_skeleton_gen,
+                                   incarnation, skeleton_gen))
+    {
+        s_sync_pending = false;
+    }
+    // The entry refusals (CP-1 items 4-5, verbatim). A
+    // running transaction or a live pending sync makes
+    // this "already in progress"; the running work is
+    // undisturbed by a refused second invocation.
+    if (s_transaction.active() || s_sync_pending)
     {
         FSCommon::report_to_nearby_chat(
             "calibration failed: already in progress");
         return;
     }
-    LLOpenXRManager& openxr = LLOpenXRManager::instance();
     if (!openxr.isSessionRunning() || !openxr.isVRModeActive())
     {
         FSCommon::report_to_nearby_chat("calibration failed: no VR session");
         return;
     }
-    // The prior record's validation, read once at entry:
-    // carry-forward's input (CP-3c rule 3).
-    s_prior_record = FSVRTrackingSettings::validateCalibrationRecord(
-        FSVRTrackingSettings::calibrationRecordRaw());
-    s_transaction.begin();
+    // Stamp the request with the session incarnation and
+    // skeleton generation it is bound to, and raise it.
+    s_sync_request_incarnation = incarnation;
+    s_sync_request_skeleton_gen = skeleton_gen;
+    s_sync_pending = true;
 }
 
 // static
@@ -1861,8 +2059,17 @@ bool FSVRCalibration::cycleWorkPending()
     // uncalibrated session waits on a record, not on
     // cycles; a SUSPENDED machine re-enters ACQUIRING on a
     // stepped cycle once frames publish again.
+    // P2-07B Stage 1 (CP-S1-2): a pending sync also makes
+    // this true, so the glue runs a cycle it would
+    // otherwise early-return for lack of decisions,
+    // whatever the machine's state. This guarantees an
+    // opportunity to reach the step hook, nothing more:
+    // the cycle's remaining gates and control flow still
+    // decide whether executeSync runs (S1-BRIEF-R1-03's
+    // lifecycle contract).
     return s_transaction.active() ||
-           s_session_neutral.state() == FSVRSessionState::ACQUIRING;
+           s_session_neutral.state() == FSVRSessionState::ACQUIRING ||
+           s_sync_pending;
 }
 
 // static
@@ -1936,11 +2143,17 @@ void FSVRCalibration::stepFromAdapterCycle(
     s_session_neutral.noteSittingSignals(signals.clear());
 
     if (!s_transaction.active() &&
-        s_session_neutral.state() == FSVRSessionState::ESTABLISHED)
+        s_session_neutral.state() == FSVRSessionState::ESTABLISHED &&
+        !s_sync_pending)
     {
         // Neither machine has work: the hook's cost in
         // steady state is the flag reads above (CP-4
-        // item 4).
+        // item 4). P2-07B Stage 1 (CP-S1-2): a pending sync
+        // is work even against an established neutral (a
+        // resync replaces it), so it falls through to the
+        // sample reads and the sync's execution below; the
+        // steady-state cost with no sync pending is one
+        // additional flag read.
         return;
     }
 
@@ -2011,6 +2224,35 @@ void FSVRCalibration::stepFromAdapterCycle(
     FSVRStationarityParams params;
     const bool params_installed = productionStationarityParams(params);
     const U64 epoch = s_local_transition_epoch;
+
+    // P2-07B Stage 1 (CP-S1-2): execute a pending sync
+    // against this cycle's own reads, before the
+    // transaction/session stepping below (a same-cycle
+    // session step then sees the installed neutral and
+    // returns at its ESTABLISHED early-out). The pending
+    // flag is consumed here, before the call: an executed
+    // cycle's refusal consumes the request, and the only
+    // retention path is never reaching this point (the
+    // frame-token early-out above keeps the flag set for
+    // the next valid-token cycle, bounded by the same
+    // session incarnation -- S1-BRIEF-R1-03). Availability:
+    // the installed neutral is NOT visible to the plan this
+    // cycle assembled (population copied the view before
+    // this hook ran); it is available to the next assembled
+    // plan, exactly as the transaction's installs always
+    // behaved.
+    if (s_sync_pending)
+    {
+        s_sync_pending = false;
+        executeSync(input, result,
+                    hmd_position_valid, hmd_position,
+                    hmd_forward_valid, hmd_forward,
+                    eye_valid, cornea_midpoint,
+                    openxr.getIncarnation(),
+                    gAgentAvatarp
+                        ? gAgentAvatarp->getSkeletonRebuildGeneration()
+                        : 0);
+    }
 
     if (s_transaction.active())
     {

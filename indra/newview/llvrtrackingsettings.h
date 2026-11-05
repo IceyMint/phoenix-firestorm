@@ -94,6 +94,15 @@ struct FSVRTrackingSettingsSnapshot
     bool diag_force_unit_scale = false; // FSVRDiagForceUnitScale
     bool diag_positional_solve = true;  // FSVRDiagPositionalSolve
     bool diag_full_chain_solve = true;  // FSVRDiagFullChainSolve
+    // P2-07B Stage 1 (CP-S1-3): the provisional lean gain
+    // (redesign section 4). lean_gain is the raw user value
+    // when lean_gain_valid, and 1.0 otherwise; consumers
+    // use the value only under the validity flag (E5
+    // carries it, CP-S1-4). A global gSavedSettings F32,
+    // deliberately NOT per-account: it is a feel
+    // preference, not a profile (redesign sections 5/11).
+    F32  lean_gain       = 1.f;  // FSVRLeanResponseGain
+    bool lean_gain_valid = true;
     bool schema_valid = false;
     // Effective head/neck selections equal the legacy behavior:
     // mNeck and mHead enabled, pitch and roll enabled, schema valid.
@@ -218,6 +227,7 @@ public:
     static const char* const SETTING_DIAG_FORCE_UNIT_SCALE;
     static const char* const SETTING_DIAG_POSITIONAL_SOLVE;
     static const char* const SETTING_DIAG_FULL_CHAIN_SOLVE;
+    static const char* const SETTING_LEAN_RESPONSE_GAIN;
 };
 
 #endif // LL_LLVRTRACKINGSETTINGS_H

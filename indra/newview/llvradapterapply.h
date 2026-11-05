@@ -131,8 +131,16 @@ struct FSVRAdapterJointInput
 // state (E9).
 struct FSVRSpineSampleInputs
 {
-    bool record_usable_for_head = false; // E5: the C5 view's
-        // record status (USABLE_FULL or USABLE_HEAD_ONLY)
+    bool scale_input_valid = false;      // E5: scale-input
+        // validity (P2-07B Stage 1, CP-S1-4): the C5 view's
+        // scale source is not NONE (a MEASURED_RECORD view's
+        // record was validated USABLE_* at its producers; a
+        // PROVISIONAL_SYNC view's scale is the baseline
+        // constant) AND the settings snapshot's lean gain is
+        // valid (bounded domain, CP-S1-3). Renamed from
+        // record_usable_for_head: the redesign falsified the
+        // old name -- a sync-established neutral carries no
+        // usable record at all.
     bool neutral_established = false;    // E6: the C5 view's
         // established flag, post any C8 invalidation
     bool hmd_position_valid = false;     // E7: the manager
@@ -601,7 +609,7 @@ struct FSVRAdapterPlanResult
 // reimplementation (Package B spec section 9). Defined above
 // the plan-only line in llvradapterapply.cpp with the other
 // extracted plan helpers.
-// == in.record_usable_for_head && in.neutral_established
+// == in.scale_input_valid && in.neutral_established
 //  && in.hmd_position_valid && in.sitting_signals_clear
 //  && !in.calibration_in_progress
 bool decideSpineSampleValid(const FSVRSpineSampleInputs& in);
@@ -619,6 +627,16 @@ bool decideSpineSampleValid(const FSVRSpineSampleInputs& in);
 // P(dx, dy, dz) = (-dz, -dx, dy) (brief section 2.13), and
 // out_cornea_offset_head_local is the session's section 4.6
 // value verbatim. Defined beside decideSpineSampleValid.
+// P2-07B Stage 1 (CP-S1-3): lean_gain is the settings
+// snapshot's provisional lean gain, consumed only when the
+// session's scale source is PROVISIONAL_SYNC -- it
+// multiplies the mapped displacement before the solver,
+// and the composition's ratio argument is selected by the
+// scale source (the record's head_ratio for MEASURED_RECORD,
+// the provisional baseline constant otherwise).
+// FSVRDiagForceUnitScale keeps its shipped meaning (it
+// forces the *calibration* ratio to 1.0); the gain is a
+// user preference and survives the diagnostic.
 bool composeHeadTargetBlock(
     const FSVRSessionNeutralView& session,
     const LLVector3& hmd_position_local,
@@ -626,6 +644,7 @@ bool composeHeadTargetBlock(
     const LLQuaternion& root_world_rotation,
     const LLVector3& root_world_position,
     bool diag_force_unit_scale,
+    F32 lean_gain,
     LLVector3& out_head_target_world,
     LLVector3& out_cornea_offset_head_local);
 
@@ -665,12 +684,26 @@ public:
     // epoch term is C8's addition: a mismatch retires both
     // histories pre-transaction, through the glue's existing
     // whole-history clear, whether or not a solver is invoked.
+    // P2-07B Stage 1 (CP-S1-2, S1-BRIEF-R1-01): the
+    // installation-generation term is Stage 1's addition,
+    // on the same terms -- the carried history's install
+    // generation (the session view's, recorded when the
+    // history was stored) must equal the current view's
+    // install generation. A resync replaces the neutral the
+    // history was produced against, so unchanged token,
+    // settings generation, and epoch do NOT make old-anchor
+    // history a valid continuity witness under a new one.
+    // C8's epochs remain independently authoritative; this
+    // is an additional necessary condition, never a
+    // replacement.
     static bool continuityCarries(bool have_previous,
                                   U64 frame_token, U64 previous_token,
                                   U64 settings_generation,
                                   U64 previous_settings_generation,
                                   U64 continuity_epoch,
-                                  U64 previous_continuity_epoch);
+                                  U64 previous_continuity_epoch,
+                                  U64 install_generation,
+                                  U64 previous_install_generation);
 
     // The pure plan (brief section 4). No globals, no cross-cycle
     // pose state: identical inputs give identical outputs.
