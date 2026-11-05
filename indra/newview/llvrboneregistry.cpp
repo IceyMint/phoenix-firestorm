@@ -79,7 +79,9 @@ std::vector<FSVRTrackingBoneEntry> buildEntries()
                                const char* parent_dependency,
                                std::vector<std::string> ownership_priority,
                                const char* constraint_adapter_id,
-                               S32 xr_hand_joint_index) {
+                               S32 xr_hand_joint_index,
+                               FSVRTrackingBoneEntry::AuditStatus audit_status =
+                                   FSVRTrackingBoneEntry::AuditStatus::DEFERRED) {
         FSVRTrackingBoneEntry entry;
         entry.canonical_id = canonical_id;
         entry.group = group;
@@ -89,7 +91,7 @@ std::vector<FSVRTrackingBoneEntry> buildEntries()
         entry.registration_phase = "P2-07b";
         entry.target_space = "joint_local";
         entry.constraint_adapter_id = constraint_adapter_id;
-        entry.audit_status = FSVRTrackingBoneEntry::AuditStatus::DEFERRED;
+        entry.audit_status = audit_status;
         entry.direct_tracking_eligible = false;
         entry.xr_hand_joint_index = xr_hand_joint_index;
         result.push_back(entry);
@@ -97,12 +99,17 @@ std::vector<FSVRTrackingBoneEntry> buildEntries()
 
     // Spine chain (UPPER_BODY), in skeleton parent order
     // (mPelvis -> mSpine1 -> ... -> mChest).
-    add_entry("mSpine1", FSVRRollup::UPPER_BODY, "mPelvis", {"body_estimation"}, "spine_chain", -1);
-    add_entry("mSpine2", FSVRRollup::UPPER_BODY, "mSpine1", {"body_estimation"}, "spine_chain", -1);
-    add_entry("mTorso", FSVRRollup::UPPER_BODY, "mSpine2", {"body_estimation"}, "spine_chain", -1);
-    add_entry("mSpine3", FSVRRollup::UPPER_BODY, "mTorso", {"body_estimation"}, "spine_chain", -1);
-    add_entry("mSpine4", FSVRRollup::UPPER_BODY, "mSpine3", {"body_estimation"}, "spine_chain", -1);
-    add_entry("mChest", FSVRRollup::UPPER_BODY, "mSpine4", {"body_estimation"}, "spine_chain", -1);
+    // P2-07B Stage-2 spine audit, package D2: F1-F10
+    // verified for these six spine_chain entries (Muse
+    // source-check, P2-07B-STAGE2-AUDIT-VERIFICATION.md).
+    // This is audit registration only; Gate-1
+    // authorization stays NONE.
+    add_entry("mSpine1", FSVRRollup::UPPER_BODY, "mPelvis", {"body_estimation"}, "spine_chain", -1, FSVRTrackingBoneEntry::AuditStatus::VERIFIED);
+    add_entry("mSpine2", FSVRRollup::UPPER_BODY, "mSpine1", {"body_estimation"}, "spine_chain", -1, FSVRTrackingBoneEntry::AuditStatus::VERIFIED);
+    add_entry("mTorso", FSVRRollup::UPPER_BODY, "mSpine2", {"body_estimation"}, "spine_chain", -1, FSVRTrackingBoneEntry::AuditStatus::VERIFIED);
+    add_entry("mSpine3", FSVRRollup::UPPER_BODY, "mTorso", {"body_estimation"}, "spine_chain", -1, FSVRTrackingBoneEntry::AuditStatus::VERIFIED);
+    add_entry("mSpine4", FSVRRollup::UPPER_BODY, "mSpine3", {"body_estimation"}, "spine_chain", -1, FSVRTrackingBoneEntry::AuditStatus::VERIFIED);
+    add_entry("mChest", FSVRRollup::UPPER_BODY, "mSpine4", {"body_estimation"}, "spine_chain", -1, FSVRTrackingBoneEntry::AuditStatus::VERIFIED);
 
     // Arm chains (ARMS_INCLUDING_HANDS), hanging from mChest.
     add_entry("mCollarLeft", FSVRRollup::ARMS_INCLUDING_HANDS, "mChest", {}, "", -1);
