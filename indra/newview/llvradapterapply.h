@@ -47,10 +47,13 @@
 struct FSVRSessionNeutralView;
 
 // Which solver domain a joint belongs to. NONE joints are never
-// written by C1: the head and neck (brief section 3.5 [R1]: C1
-// never writes mHead or mNeck in Package A), the collars (never
-// written by the positional solve, spec section 6.2), the pelvis
-// root, and structural ancestors pulled into the plan tree.
+// written by the C1 solvers: the head and neck (brief section 3.5
+// [R1]: C1 never writes mHead or mNeck in Package A -- the one
+// narrow exception is Fix 1's head-group reconciliation, which
+// conditionally writes mNeck/mHead outside the solver domains),
+// the collars (never written by the positional solve, spec
+// section 6.2), the pelvis root, and structural ancestors pulled
+// into the plan tree.
 enum class FSVRAdapterDomain
 {
     NONE,
@@ -586,6 +589,20 @@ struct FSVRAdapterPlanResult
     // True when the transaction ran (every gate passed), even if
     // the solvers returned no constraints and nothing was written.
     bool applied = false;
+    // P2-07B Fix 1 (CP-F1-1 step 5 [R4]): the head-group
+    // combined-bound selection refused this cycle's candidate
+    // (the base head frame beyond the two head-group locals'
+    // combined reach from the committed parent), and the
+    // transaction was rejected entire: writes is empty, the
+    // resolved arrays report the base composition, and the arm
+    // outcomes' committed claims (pole_valid, wrist_error_valid)
+    // are retracted. applied stays true and first_failing_gate
+    // stays NONE -- the transaction ran; this field names why
+    // it did not commit, in the arm outcomes' diagnostic idiom
+    // (a ran transaction's discarded outcome is named on the
+    // result, not on the gate enum, which names why a
+    // transaction did not run).
+    bool head_group_refusal = false;
     FSVRAdapterGate first_failing_gate = FSVRAdapterGate::NONE;
     bool spine_solver_invoked = false;
     bool arm_solver_invoked_left = false;

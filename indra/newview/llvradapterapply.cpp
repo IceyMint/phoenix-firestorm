@@ -26,6 +26,7 @@
 #include "llvrbonelog.h"
 #include "llvrspinesolver.h"
 
+#include <cmath>
 #include <set>
 
 namespace
@@ -55,6 +56,75 @@ void composeBaseWorlds(const FSVRAdapterPlanInput& input,
         out_rotations[i] = world;
         out_positions[i] = parent_pos + (joint.rest_offset * parent_rot);
     }
+}
+
+// ------------------------------------------------------------------
+// P2-07B Fix 1 (CP-F1-1): head-group reconciliation helpers. All
+// operations are total-angle / quaternion operations; no Euler
+// decomposition appears anywhere in the new code (brief
+// section 7 R-6).
+// ------------------------------------------------------------------
+
+// The head-group local cap: HEAD_ROTATION_CONSTRAINT's value,
+// F_PI_BY_TWO * 0.8f (72 deg), duplicated by value per the
+// llagentcamera.cpp:149 precedent ("match LLHeadRotMotion";
+// the constant itself is at llheadrotmotion.cpp:91). The
+// native 72 deg is a COMBINED bound -- the head's total
+// rotation relative to its basis frame, constrained once at
+// llheadrotmotion.cpp:323 before the lag-share distribution
+// writes the two locals -- and no per-joint local cap exists
+// natively (CP-F1-0 Q4; brief INV-F1-03 [R2]). This constant
+// is the adapter's per-local backstop value for the cascade
+// (the neck stage's cap, and the head stage's constrain under
+// the native operation and value); the combined bound itself
+// is enforced by the selection in CP-F1-1 step 5.
+constexpr F32 kHeadGroupLocalCapRad = F_PI_BY_TWO * 0.8f;
+
+// F32 tolerance on the combined-bound pass test (CP-F1-1
+// step 5): the candidate at or below the bound plus this
+// tolerance is the cascade pair, selected unchanged.
+constexpr F32 kHeadGroupBoundTolRad = 1e-5f;
+
+// Shortest-arc, sign-invariant total angle of a rotation
+// (q and -q measure identically): 2*atan2(|vec|, |w|) over
+// the normalized quaternion. The atan2 form keeps full F32
+// resolution at small angles, where the acos(|w|) form
+// quantizes (CP-F1-1 step 4 [R2] (i)).
+F32 quaternionAngleRad(const LLQuaternion& q_in)
+{
+    LLQuaternion q = q_in;
+    q.normalize();
+    const F32 vlen = std::sqrt(q.mQ[VX] * q.mQ[VX] +
+                               q.mQ[VY] * q.mQ[VY] +
+                               q.mQ[VZ] * q.mQ[VZ]);
+    return 2.f * std::atan2(vlen, std::fabs(q.mQ[VW]));
+}
+
+// The rotation q_in rescaled to the given total angle about
+// its own shortest-arc axis (scale_angle, CP-F1-1 step 5).
+LLQuaternion scaleQuaternionAngle(const LLQuaternion& q_in,
+                                  F32 target_angle_rad)
+{
+    LLQuaternion q = q_in;
+    q.normalize();
+    if (q.mQ[VW] < 0.f)
+    {
+        q = LLQuaternion(-q.mQ[VX], -q.mQ[VY], -q.mQ[VZ],
+                         -q.mQ[VW]);
+    }
+    const F32 vlen = std::sqrt(q.mQ[VX] * q.mQ[VX] +
+                               q.mQ[VY] * q.mQ[VY] +
+                               q.mQ[VZ] * q.mQ[VZ]);
+    if (vlen < 1e-9f)
+    {
+        // No axis to scale about: the rotation is the
+        // identity at F32 resolution, and the only target
+        // the selection forms for it is the identity's own.
+        return LLQuaternion();
+    }
+    const LLVector3 axis(q.mQ[VX] / vlen, q.mQ[VY] / vlen,
+                         q.mQ[VZ] / vlen);
+    return LLQuaternion(target_angle_rad, axis);
 }
 
 bool domainAuthority(const FSVRAdapterJointInput& joint,
@@ -967,6 +1037,301 @@ FSVRAdapterPlanResult FSVRAdapterApply::computePlan(
                 if (in_side)
                 {
                     commitJoint(i, arm_targets, true);
+                }
+            }
+        }
+    }
+
+    // P2-07B Fix 1 (CP-F1-1): head-group orientation
+    // reconciliation. Runs on every applied cycle, after the
+    // arm phase and immediately before finalization, so the
+    // committed write order is spine -> arms -> head-group.
+    // Head-group joints are neither ancestors nor descendants
+    // of any arm joint, so the placement cannot disturb arm
+    // results, and no later phase can invalidate the
+    // reconciliation. The positional solve may move the head
+    // group's worlds through its spine ancestors; it may not
+    // change the head group's orientations (INV-F1-01/02):
+    // the neck and head stage worlds are restored to their
+    // base-composed values by the commit pass's own
+    // target->local formula, under the limit cascade and the
+    // combined-bound selection below. When no spine commit
+    // moved an ancestor of the neck, the correction is the
+    // identity and the epsilon suppression emits nothing
+    // (S1-G5). When the transaction does not apply at all,
+    // computePlan has already returned -- whole-head
+    // switching is preserved structurally, not by a
+    // conditional (checklist 0.5).
+    {
+        S32 neck_index = -1;
+        S32 head_index = -1;
+        for (S32 i = 0; i < count; ++i)
+        {
+            if (input.joints[i].name == "mNeck")
+            {
+                neck_index = i;
+            }
+            else if (input.joints[i].name == "mHead")
+            {
+                head_index = i;
+            }
+        }
+        if (neck_index >= 0 && head_index >= 0)
+        {
+            const LLQuaternion& base_neck_world =
+                base_world_rotations[neck_index];
+            const LLQuaternion& base_head_world =
+                base_world_rotations[head_index];
+            LLQuaternion parent_neck_rot;
+            LLVector3 parent_neck_pos;
+            parentFrame(neck_index, parent_neck_rot,
+                        parent_neck_pos);
+            LLQuaternion parent_neck_norm = parent_neck_rot;
+            parent_neck_norm.normalize();
+
+            // Step 1 (neck stage): the corrected neck local
+            // by the commit pass's own formula (local =
+            // target * ~parent_world) with the target set to
+            // the neck's BASE world, capped at the head-group
+            // local cap (step 3). Recompose the neck world.
+            LLQuaternion cand_neck_local =
+                base_neck_world * ~parent_neck_norm;
+            cand_neck_local.normalize();
+            cand_neck_local.constrain(kHeadGroupLocalCapRad);
+            LLQuaternion cand_neck_world =
+                cand_neck_local * parent_neck_rot;
+            cand_neck_world.normalize();
+
+            // Step 2 (head stage): the corrected head local
+            // against the recomposed neck world, then the
+            // native operation itself -- constrain(
+            // HEAD_ROTATION_CONSTRAINT), the identical call
+            // and value the native path applies
+            // (llheadrotmotion.cpp:321; constant at :91 --
+            // the value is kHeadGroupLocalCapRad). Recompose
+            // the head world. In the uncapped case step 1
+            // restored the neck world to base exactly, so
+            // this returns the head local to its base value:
+            // the correction concentrates at the neck, and
+            // spill reaches the head local only when the
+            // neck cap refuses part of the correction.
+            LLQuaternion cand_head_local =
+                base_head_world * ~cand_neck_world;
+            cand_head_local.normalize();
+            cand_head_local.constrain(kHeadGroupLocalCapRad);
+            LLQuaternion cand_head_world =
+                cand_head_local * cand_neck_world;
+            cand_head_world.normalize();
+
+            // Step 5 [R3/R4]: combined-bound selection. The
+            // cascade bounds the two locals; it does not
+            // bound the quantity Rule 1 states -- the head's
+            // combined rotation relative to its basis. The
+            // basis is located by CP-F1-0 Q4's rule (mTorso,
+            // else mPelvis, else the plan root frame) and
+            // measured against the basis joint's BASE world
+            // -- the frame the native path composed this
+            // cycle's base pose against. The guarantee is
+            // the base-basis statement of INV-F1-03 [R4]
+            // (Q-H): fidelity to the native pre-solve
+            // constraint; no committed-torso bound is
+            // claimed.
+            S32 basis_index = -1;
+            for (S32 i = 0; i < count; ++i)
+            {
+                if (input.joints[i].name == "mTorso")
+                {
+                    basis_index = i;
+                    break;
+                }
+            }
+            if (basis_index < 0)
+            {
+                for (S32 i = 0; i < count; ++i)
+                {
+                    if (input.joints[i].name == "mPelvis")
+                    {
+                        basis_index = i;
+                        break;
+                    }
+                }
+            }
+            const LLQuaternion basis_base_world =
+                basis_index >= 0
+                    ? base_world_rotations[basis_index]
+                    : input.root_world_rotation;
+            LLQuaternion basis_norm = basis_base_world;
+            basis_norm.normalize();
+            const F32 theta_b = quaternionAngleRad(
+                base_head_world * ~basis_norm);
+            const F32 theta_c = quaternionAngleRad(
+                cand_head_world * ~basis_norm);
+
+            LLQuaternion final_neck_local = cand_neck_local;
+            LLQuaternion final_head_local = cand_head_local;
+            bool split_selected = false;
+            if (theta_c >
+                kHeadGroupLocalCapRad + kHeadGroupBoundTolRad)
+            {
+                // Bounded result: W*, the combined-legal
+                // target closest to base on the cascade's
+                // own residual arc, realized by the EVEN
+                // SPLIT -- the native distribution's own
+                // shape (NECK_LAG 0.5, llheadrotmotion.cpp:
+                // 358-359). Under the production convention
+                // (world = local * parent_world) the two
+                // halves must compose the total relative
+                // rotation T = W* * ~P [R4 -- FIX1-R3-01;
+                // the superseded order ~P * W* is a conjugate
+                // and does not recompose to W*].
+                LLQuaternion d =
+                    cand_head_world * ~base_head_world;
+                d.normalize();
+                const F32 rho_max = std::max(
+                    0.f, kHeadGroupLocalCapRad - theta_b);
+                LLQuaternion w_star =
+                    scaleQuaternionAngle(d, rho_max) *
+                    base_head_world;
+                w_star.normalize();
+                LLQuaternion t = w_star * ~parent_neck_norm;
+                t.normalize();
+                const F32 tau = quaternionAngleRad(t);
+                if (tau > 2.f * kHeadGroupLocalCapRad)
+                {
+                    // Refusal [R4 -- FIX1-R3-02]:
+                    // whole-transaction rejection. The
+                    // result returns to its entry state --
+                    // writes cleared entire (spine, arm and
+                    // head-group), the finalization copy
+                    // below does not run, so resolved_*
+                    // report the base composition -- and the
+                    // arm outcomes' committed claims are
+                    // retracted (a pole or wrist error
+                    // computed against a discarded commit
+                    // must not be adopted); the write-through
+                    // boundary's own abort records stand.
+                    // applied stays true and
+                    // first_failing_gate stays NONE: the
+                    // transaction ran. The refusal is named
+                    // by the result's head_group_refusal
+                    // field.
+                    result.writes.clear();
+                    result.arm_outcome_left.pole_valid = false;
+                    result.arm_outcome_left.wrist_error_valid =
+                        false;
+                    result.arm_outcome_right.pole_valid = false;
+                    result.arm_outcome_right.wrist_error_valid =
+                        false;
+                    result.head_group_refusal = true;
+                    return result;
+                }
+                const LLQuaternion half =
+                    scaleQuaternionAngle(t, tau * 0.5f);
+                final_neck_local = half;
+                final_head_local = half;
+                split_selected = true;
+            }
+
+            // Step 4 [R2 (ii)/R3]: epsilon/write evaluation
+            // of the FINAL pair (the cascade pair, or the
+            // selection's split pair), per stage, decided
+            // BEFORE any recomposition. A stage whose
+            // corrected local differs from its committed
+            // local by at least 1e-4 rad appends one write
+            // (neck before head) and updates the committed
+            // arrays; stage 2 forms its candidate against
+            // the post-decision neck world.
+            constexpr F32 kHeadGroupEpsilonRad = 1e-4f;
+            bool neck_emitted = false;
+            {
+                const F32 d_neck = quaternionAngleRad(
+                    final_neck_local *
+                    ~committed_locals[neck_index]);
+                if (d_neck >= kHeadGroupEpsilonRad)
+                {
+                    result.writes.push_back(
+                        {neck_index, final_neck_local});
+                    committed_locals[neck_index] =
+                        final_neck_local;
+                    neck_emitted = true;
+                }
+            }
+            if (!neck_emitted && !split_selected)
+            {
+                // Stage 1 was suppressed: the carried neck
+                // world stands, so the head candidate is
+                // re-formed against it [R2 (ii)] (the two
+                // neck worlds differ by less than the
+                // epsilon, so this is the same candidate at
+                // F32 class; the selection's split pair, by
+                // contrast, is the final pair as selected
+                // [R3] and is never re-formed).
+                LLQuaternion carried_neck_world =
+                    committed_rotations[neck_index];
+                carried_neck_world.normalize();
+                final_head_local =
+                    base_head_world * ~carried_neck_world;
+                final_head_local.normalize();
+                final_head_local.constrain(
+                    kHeadGroupLocalCapRad);
+            }
+            bool head_emitted = false;
+            {
+                const F32 d_head = quaternionAngleRad(
+                    final_head_local *
+                    ~committed_locals[head_index]);
+                if (d_head >= kHeadGroupEpsilonRad)
+                {
+                    result.writes.push_back(
+                        {head_index, final_head_local});
+                    committed_locals[head_index] =
+                        final_head_local;
+                    head_emitted = true;
+                }
+            }
+            if (neck_emitted || head_emitted)
+            {
+                // Recompose the emitted stages and every
+                // plan descendant of theirs, parent-first,
+                // by the commit pass's carry rule (a
+                // descendant's local is unchanged; its
+                // world follows its parent). The neck's own
+                // world position never changes -- its
+                // parent's world is untouched by this step;
+                // the head's world position changes only
+                // through the neck->head rest offset rotating
+                // with the corrected neck world.
+                std::vector<char> recompose(count, 0);
+                for (S32 i = 0; i < count; ++i)
+                {
+                    const bool self =
+                        (i == neck_index && neck_emitted) ||
+                        (i == head_index && head_emitted);
+                    const S32 parent =
+                        input.joints[i].parent_index;
+                    if (!self &&
+                        !(parent >= 0 && recompose[parent]))
+                    {
+                        continue;
+                    }
+                    recompose[i] = 1;
+                    LLQuaternion parent_rot =
+                        input.root_world_rotation;
+                    LLVector3 parent_pos =
+                        input.root_world_position;
+                    if (parent >= 0)
+                    {
+                        parent_rot = committed_rotations[parent];
+                        parent_pos = committed_positions[parent];
+                    }
+                    LLQuaternion world =
+                        committed_locals[i] * parent_rot;
+                    world.normalize();
+                    committed_rotations[i] = world;
+                    committed_positions[i] =
+                        parent_pos +
+                        (input.joints[i].rest_offset *
+                         parent_rot);
                 }
             }
         }

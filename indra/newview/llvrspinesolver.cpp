@@ -127,6 +127,63 @@ S32 findJoint(const FSVRAdapterPlanInput& plan, const char* name)
     return -1;
 }
 
+// ------------------------------------------------------------------
+// P2-07B Fix 1 (CP-F1-2): the model reconstruction's constants
+// and angle helpers -- the same values and formulas as the
+// adapter's (CP-F1-1), duplicated per TU under the
+// llagentcamera.cpp:149 precedent, so the model's selection
+// is the commit's selection by construction. All operations
+// are total-angle / quaternion operations (brief section 7
+// R-6).
+// ------------------------------------------------------------------
+
+// The reconstruction's local cap: HEAD_ROTATION_CONSTRAINT's
+// value, F_PI_BY_TWO * 0.8f (llheadrotmotion.cpp:91) -- the
+// adapter's kHeadGroupLocalCapRad under this TU's name.
+constexpr F32 kReconstructionLocalCapRad = F_PI_BY_TWO * 0.8f;
+
+// F32 tolerance on the combined-bound pass test; the same
+// value as the adapter's kHeadGroupBoundTolRad.
+constexpr F32 kReconstructionBoundTolRad = 1e-5f;
+
+// Shortest-arc, sign-invariant total angle of a rotation:
+// 2*atan2(|vec|, |w|) over the normalized quaternion (the
+// adapter's quaternionAngleRad, same formula).
+F32 quaternionAngleRad(const LLQuaternion& q_in)
+{
+    LLQuaternion q = q_in;
+    q.normalize();
+    const F32 vlen = std::sqrt(q.mQ[VX] * q.mQ[VX] +
+                               q.mQ[VY] * q.mQ[VY] +
+                               q.mQ[VZ] * q.mQ[VZ]);
+    return 2.f * std::atan2(vlen, std::fabs(q.mQ[VW]));
+}
+
+// The rotation q_in rescaled to the given total angle about
+// its own shortest-arc axis (the adapter's
+// scaleQuaternionAngle, same formula).
+LLQuaternion scaleQuaternionAngle(const LLQuaternion& q_in,
+                                  F32 target_angle_rad)
+{
+    LLQuaternion q = q_in;
+    q.normalize();
+    if (q.mQ[VW] < 0.f)
+    {
+        q = LLQuaternion(-q.mQ[VX], -q.mQ[VY], -q.mQ[VZ],
+                         -q.mQ[VW]);
+    }
+    const F32 vlen = std::sqrt(q.mQ[VX] * q.mQ[VX] +
+                               q.mQ[VY] * q.mQ[VY] +
+                               q.mQ[VZ] * q.mQ[VZ]);
+    if (vlen < 1e-9f)
+    {
+        return LLQuaternion();
+    }
+    const LLVector3 axis(q.mQ[VX] / vlen, q.mQ[VY] / vlen,
+                         q.mQ[VZ] / vlen);
+    return LLQuaternion(target_angle_rad, axis);
+}
+
 } // namespace
 
 LLVector3 FSVRSpineSolver::composeHeadTarget(
@@ -136,6 +193,177 @@ LLVector3 FSVRSpineSolver::composeHeadTarget(
 {
     const F32 ratio = force_unit_scale ? 1.f : head_ratio;
     return neutral_cornea_world + hmd_displacement * ratio;
+}
+
+// P2-07B Fix 1 (CP-F1-2): the post-reconciliation cornea
+// model (see the header). The reconstruction is identical in
+// form to CP-F1-1 steps 1-2 and its combined-bound selection
+// (step 5) is applied identically -- same basis rule (the
+// basis joint's world from the base world rotations), same
+// theta_b / theta_c, same W*, same even split with the [R4]
+// corrected relative-rotation order, same refusal -- so the
+// cornea evaluated here is the cornea the adapter commits
+// for the same chain state, in every regime and every
+// selection branch (INV-F1-06).
+LLVector3 FSVRSpineSolver::evaluatePostReconciliationCornea(
+    const FSVRAdapterPlanInput& plan,
+    const std::vector<LLQuaternion>& base_world_rotations,
+    const std::map<S32, LLQuaternion>& domain_local,
+    LLQuaternion* out_model_head_world,
+    LLVector3* out_model_head_pos,
+    LLVector3* out_model_neck_pos)
+{
+    const S32 neck_index = findJoint(plan, "mNeck");
+    const S32 head_index = findJoint(plan, "mHead");
+    const ChainState state = composeChain(plan, &domain_local);
+    if (neck_index < 0 || head_index < 0 ||
+        base_world_rotations.size() != plan.joints.size())
+    {
+        // Absence rule (shared with CP-F1-1): no
+        // reconstruction is possible, so the evaluation is
+        // the pre-Fix-1 chain evaluation.
+        if (out_model_head_world && head_index >= 0)
+        {
+            *out_model_head_world = state.world_rot[head_index];
+        }
+        if (out_model_head_pos && head_index >= 0)
+        {
+            *out_model_head_pos = state.world_pos[head_index];
+        }
+        if (out_model_neck_pos && head_index >= 0)
+        {
+            *out_model_neck_pos = state.world_pos[head_index];
+        }
+        if (head_index < 0)
+        {
+            return LLVector3::zero;
+        }
+        return plan.cornea_offset_head_local *
+                   state.world_rot[head_index] +
+               state.world_pos[head_index];
+    }
+
+    // The reconstruction (CP-F1-1 steps 1-2, in the model's
+    // terms): the neck stage restored against the composed
+    // chain's parent world -- the world the commit will hold
+    // for that parent -- capped at the local cap; the head
+    // stage against the reconstructed neck world, under the
+    // native constrain.
+    const S32 neck_parent = plan.joints[neck_index].parent_index;
+    const LLQuaternion parent_neck_world =
+        neck_parent < 0 ? plan.root_world_rotation
+                        : state.world_rot[neck_parent];
+    LLQuaternion parent_neck_norm = parent_neck_world;
+    parent_neck_norm.normalize();
+
+    LLQuaternion recon_neck_local =
+        base_world_rotations[neck_index] * ~parent_neck_norm;
+    recon_neck_local.normalize();
+    recon_neck_local.constrain(kReconstructionLocalCapRad);
+    LLQuaternion recon_neck_world =
+        recon_neck_local * parent_neck_world;
+    recon_neck_world.normalize();
+
+    LLVector3 model_head_pos =
+        state.world_pos[neck_index] +
+        (plan.joints[head_index].rest_offset * recon_neck_world);
+    LLQuaternion recon_head_local =
+        base_world_rotations[head_index] * ~recon_neck_world;
+    recon_head_local.normalize();
+    recon_head_local.constrain(kReconstructionLocalCapRad);
+    LLQuaternion model_head_world =
+        recon_head_local * recon_neck_world;
+    model_head_world.normalize();
+
+    // The combined-bound selection, identical to CP-F1-1
+    // step 5: pass, bounded result (W* by the even split,
+    // with the model head position recomputed from the
+    // split's neck world -- the head's origin rides the neck
+    // stage's orientation), or refusal (the model evaluates
+    // at the BASE head frame: the pose the adapter's
+    // whole-transaction rejection leaves standing [R4]).
+    S32 basis_index = findJoint(plan, "mTorso");
+    if (basis_index < 0)
+    {
+        basis_index = findJoint(plan, "mPelvis");
+    }
+    const LLQuaternion basis_base_world =
+        basis_index >= 0 ? base_world_rotations[basis_index]
+                         : plan.root_world_rotation;
+    LLQuaternion basis_norm = basis_base_world;
+    basis_norm.normalize();
+    const F32 theta_b = quaternionAngleRad(
+        base_world_rotations[head_index] * ~basis_norm);
+    const F32 theta_c =
+        quaternionAngleRad(model_head_world * ~basis_norm);
+    if (theta_c >
+        kReconstructionLocalCapRad + kReconstructionBoundTolRad)
+    {
+        LLQuaternion d =
+            model_head_world * ~base_world_rotations[head_index];
+        d.normalize();
+        const F32 rho_max = std::max(
+            0.f, kReconstructionLocalCapRad - theta_b);
+        LLQuaternion w_star =
+            scaleQuaternionAngle(d, rho_max) *
+            base_world_rotations[head_index];
+        w_star.normalize();
+        LLQuaternion t = w_star * ~parent_neck_norm;
+        t.normalize();
+        const F32 tau = quaternionAngleRad(t);
+        if (tau > 2.f * kReconstructionLocalCapRad)
+        {
+            // Refusal: the base head frame, composed
+            // seam-internally from the plan's base locals
+            // under the composeBindWorlds rule (no new plan
+            // inputs cross the purity boundary). The
+            // evaluation is q-invariant in this branch: a
+            // refusal-class candidate's POSITIONAL score is
+            // exactly the base outcome. Its swing priors
+            // remain candidate-dependent (CP-F1-2 [R5]), so
+            // the solver may still emit such a candidate
+            // under some histories; the adapter's rejection
+            // is the authoritative backstop, and predicted
+            // and committed cornea agree there as base ==
+            // base.
+            const ChainState base_state =
+                composeChain(plan, nullptr);
+            model_head_world = base_state.world_rot[head_index];
+            model_head_pos = base_state.world_pos[head_index];
+        }
+        else
+        {
+            const LLQuaternion half =
+                scaleQuaternionAngle(t, tau * 0.5f);
+            LLQuaternion split_neck_world =
+                half * parent_neck_world;
+            split_neck_world.normalize();
+            model_head_world = w_star;
+            model_head_pos =
+                state.world_pos[neck_index] +
+                (plan.joints[head_index].rest_offset *
+                 split_neck_world);
+        }
+    }
+
+    if (out_model_head_world)
+    {
+        *out_model_head_world = model_head_world;
+    }
+    if (out_model_head_pos)
+    {
+        *out_model_head_pos = model_head_pos;
+    }
+    if (out_model_neck_pos)
+    {
+        // The composed chain's neck origin: set by the neck's
+        // parent, consumed by the reconstruction but never
+        // produced by it -- the reconstructed cornea's only
+        // swing-dependent point (FIX1-R2-01).
+        *out_model_neck_pos = state.world_pos[neck_index];
+    }
+    return plan.cornea_offset_head_local * model_head_world +
+           model_head_pos;
 }
 
 void FSVRSpineSolver::solveSpine(
@@ -152,6 +380,11 @@ void FSVRSpineSolver::solveSpine(
     {
         return;
     }
+    // P2-07B Fix 1 (CP-F1-2): the neck index, for the
+    // Jacobian's neck-origin moment arm (FIX1-R2-01). Absence
+    // is not an early-out: the seam falls back to the chain
+    // evaluation and the Jacobian to its pre-Fix-1 arm.
+    const S32 neck_index = findJoint(plan, "mNeck");
 
     // Working domain: SPINE joints eligible under the
     // transaction's own predicate, so solver and commit can
@@ -232,7 +465,6 @@ void FSVRSpineSolver::solveSpine(
     }
 
     const LLVector3 target = plan.head_target_world;
-    const LLVector3 cornea_offset = plan.cornea_offset_head_local;
 
     auto composedLocal = [&](S32 joint_index) {
         return FSVRJointLimits::composeSwingTwistZ(swing[joint_index],
@@ -298,9 +530,14 @@ void FSVRSpineSolver::solveSpine(
             locals[i] = FSVRJointLimits::composeSwingTwistZ(
                 sw.at(i), twist[i]);
         }
-        const ChainState state = composeChain(plan, &locals);
-        return cornea_offset * state.world_rot[head_index] +
-               state.world_pos[head_index];
+        // P2-07B Fix 1 (CP-F1-2): the objective's cornea is
+        // the post-reconciliation model's, evaluated through
+        // the production seam -- the cornea the adapter will
+        // commit for this chain state, not the chain-composed
+        // one (INV-F1-06).
+        return evaluatePostReconciliationCornea(
+            plan, context.base_world_rotations, locals, nullptr,
+            nullptr, nullptr);
     };
     // After a step, clamp every working joint's composed local
     // through CP-1 (unless the diagnostic suspends it) and
@@ -372,9 +609,15 @@ void FSVRSpineSolver::solveSpine(
             locals[i] = composedLocal(i);
         }
         const ChainState state = composeChain(plan, &locals);
+        // P2-07B Fix 1 (CP-F1-2): the iteration's cornea is
+        // the same seam evaluation as corneaOfSwings'; it
+        // also yields the model neck position -- the composed
+        // chain's neck origin -- for the Jacobian block below.
+        LLVector3 model_neck_pos = LLVector3::zero;
         const LLVector3 cornea =
-            cornea_offset * state.world_rot[head_index] +
-            state.world_pos[head_index];
+            evaluatePostReconciliationCornea(
+                plan, context.base_world_rotations, locals,
+                nullptr, nullptr, &model_neck_pos);
         const LLVector3 error_vec = target - cornea;
         if (error_vec.length() < kConvergenceM)
         {
@@ -396,7 +639,25 @@ void FSVRSpineSolver::solveSpine(
                 LLVector3(1.f, 0.f, 0.f) * parent_world;
             const LLVector3 axis_y =
                 LLVector3(0.f, 1.f, 0.f) * parent_world;
-            const LLVector3 r = cornea - state.world_pos[i];
+            // P2-07B Fix 1 (CP-F1-2 [R3], FIX1-R2-01):
+            // under the post-reconciliation model both
+            // offset terms are swing-invariant -- the
+            // reconstruction holds the head frame at the
+            // base composition -- so the cornea's only
+            // swing-dependent term is the neck origin, and
+            // the moment arm is the neck origin, not the
+            // cornea point. In the capped / selection
+            // regimes the column stands as this uncapped
+            // form at the reconciled state: a step-direction
+            // approximation, guarded by exact-objective
+            // acceptance and best-iterate emission (Q-F).
+            // (Neck absent -- the seam's fallback regime --
+            // the arm is the evaluated cornea point itself:
+            // the pre-Fix-1 form, exact for the chain
+            // evaluation the fallback performs.)
+            const LLVector3 r =
+                (neck_index >= 0 ? model_neck_pos : cornea) -
+                state.world_pos[i];
             jac[2 * k] = axis_x % r;
             jac[2 * k + 1] = axis_y % r;
         }

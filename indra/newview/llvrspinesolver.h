@@ -25,8 +25,12 @@ public:
     // (Levenberg) iterations in swing space over the eligible
     // working domain, clamping through CP-1 after each accepted
     // step, minimizing the cornea-midpoint objective under the
-    // final head orientation (cross-check R2-04) plus the D3
-    // soft-preference and continuity terms.
+    // final head FRAME -- orientation and position (cross-check
+    // R2-04, by-construction reading per P2-07B Fix 1 CP-F1-2:
+    // the objective's cornea is evaluated at the
+    // post-reconciliation frame the adapter will commit for the
+    // same chain state, via evaluatePostReconciliationCornea)
+    // plus the D3 soft-preference and continuity terms.
     void solveSpine(const FSVRAdapterSolverContext& context,
                     std::map<S32, LLQuaternion>& out_target_worlds)
         override;
@@ -41,6 +45,36 @@ public:
         const LLVector3& neutral_cornea_world,
         const LLVector3& hmd_displacement,
         F32 head_ratio, bool force_unit_scale);
+
+    // P2-07B Fix 1 (CP-F1-2): the post-reconciliation cornea
+    // model. Composes the plan chain from the given
+    // domain-locals map (exactly the map corneaOfSwings builds
+    // from its swings), reconstructs the head frame CP-F1-1
+    // will commit for that chain state -- the neck and head
+    // stage worlds restored to the base composition under the
+    // same limit cascade and the same combined-bound
+    // selection, refusal included -- and evaluates the cornea
+    // under that frame: orientation AND position, so the
+    // cornea the solver optimizes is the cornea that will
+    // exist (INV-F1-06). Pure over (plan, base world
+    // rotations, domain locals); harness-exercised through
+    // this seam (F1S-3 finite-differences it). Returns the
+    // model cornea; the out-parameters (any may be null)
+    // receive the model head world rotation, the model head
+    // world position, and the model neck world position --
+    // the composed chain's neck origin, the reconstructed
+    // cornea's only swing-dependent point, consumed by the
+    // iteration's Jacobian (FIX1-R2-01). If either head-group
+    // name is absent from the plan, the evaluation falls back
+    // to the pre-Fix-1 chain evaluation (the absence rule
+    // shared with CP-F1-1).
+    static LLVector3 evaluatePostReconciliationCornea(
+        const FSVRAdapterPlanInput& plan,
+        const std::vector<LLQuaternion>& base_world_rotations,
+        const std::map<S32, LLQuaternion>& domain_local,
+        LLQuaternion* out_model_head_world,
+        LLVector3* out_model_head_pos,
+        LLVector3* out_model_neck_pos);
 };
 
 #endif // LL_LLVRSPINESOLVER_H
