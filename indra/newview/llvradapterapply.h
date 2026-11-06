@@ -615,6 +615,17 @@ struct FSVRAdapterPlanResult
     std::vector<LLQuaternion> resolved_locals;
     std::vector<LLQuaternion> resolved_world_rotations;
     std::vector<LLVector3> resolved_world_positions;
+    // P2-07B DIAG-1 (D-1, Route A -- settled): the plan's
+    // base composition, retained verbatim on the result.
+    // computePlan composes the base worlds in every outcome
+    // (before any gate) and copies them here before any
+    // committed-state modification; they remain unchanged
+    // on gate failures and on whole-transaction refusal.
+    // Plan-internal outputs, not inputs; the bonelog
+    // recorder reads them from the result it already
+    // receives.
+    std::vector<LLQuaternion> base_world_rotations;
+    std::vector<LLVector3> base_world_positions;
     // Write-through boundary outcomes, per side (zero when the
     // boundary did not run for that side).
     FSVRAdapterArmOutcome arm_outcome_left;

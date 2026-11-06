@@ -36,7 +36,62 @@
 #include "llstring.h"
 
 // ---- Adapter plan structs (real: llvradapterapply.h) ----
-// Only the fields llvrbonelog.cpp reads.
+// Only the fields llvrbonelog.cpp reads. DIAG-1: the gate
+// and domain enums mirror the real ones (same values, same
+// gate-name strings) so the recorder's shared code paths
+// compile and behave identically against the rig.
+enum class FSVRAdapterGate
+{
+    NONE = 0,
+    CYCLE,
+    CONTEXT,
+    FRAME_IDENTITY,
+    VR_SESSION,
+    POSITIONAL_MASTER,
+    NO_SOLVER,
+    TOKEN
+};
+
+enum class FSVRAdapterDomain
+{
+    NONE,
+    SPINE,
+    ARM_LEFT,
+    ARM_RIGHT
+};
+
+struct FSVRAdapterApply
+{
+    static const char* gateName(FSVRAdapterGate gate)
+    {
+        switch (gate)
+        {
+        case FSVRAdapterGate::NONE: return "none";
+        case FSVRAdapterGate::CYCLE: return "cycle";
+        case FSVRAdapterGate::CONTEXT: return "context";
+        case FSVRAdapterGate::FRAME_IDENTITY:
+            return "frame_identity";
+        case FSVRAdapterGate::VR_SESSION: return "vr_session";
+        case FSVRAdapterGate::POSITIONAL_MASTER:
+            return "positional_master";
+        case FSVRAdapterGate::NO_SOLVER: return "no_solver";
+        case FSVRAdapterGate::TOKEN: return "token";
+        }
+        return "unknown";
+    }
+};
+
+struct FSVRAdapterJointInput
+{
+    std::string name;
+    S32 parent_index = -1;
+    LLVector3 rest_offset;
+    LLQuaternion base_local;
+    FSVRAdapterDomain domain = FSVRAdapterDomain::NONE;
+    bool decision_grants_base = false;
+    bool disabled = false;
+};
+
 struct FSVRAdapterPlanInput
 {
     U64 frame_token = 0;
@@ -45,10 +100,21 @@ struct FSVRAdapterPlanInput
     LLVector3 cornea_offset_head_local;
     LLVector3 root_world_position;
     LLQuaternion root_world_rotation;
+    std::vector<FSVRAdapterJointInput> joints;
 };
 
 struct FSVRAdapterPlanResult
 {
+    bool applied = false;
+    FSVRAdapterGate first_failing_gate = FSVRAdapterGate::NONE;
+    bool spine_solver_invoked = false;
+    bool head_group_refusal = false;
+    std::vector<S32> writes;
+    std::vector<LLQuaternion> resolved_locals;
+    std::vector<LLQuaternion> resolved_world_rotations;
+    std::vector<LLVector3> resolved_world_positions;
+    std::vector<LLQuaternion> base_world_rotations;
+    std::vector<LLVector3> base_world_positions;
 };
 
 // ---- LLJoint (real: lljoint.h) ----

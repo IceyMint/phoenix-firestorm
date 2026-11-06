@@ -147,7 +147,41 @@ void sample(FakeSkeleton& skel, U64 token)
         LLQuaternion(0.f, 0.f, 0.f, 1.f);
     FSVRAdapterPlanResult result;
     FSVRBoneLog::sampleCycle(&skel.character, input, result,
-                             false, LLVector3::zero);
+                             false, LLVector3::zero,
+                             nullptr, nullptr);
+}
+
+// DIAG-1 (D1-S1/S2): a sample whose plan joint list is
+// the given names, with a stub result whose arrays match.
+void sampleWithPlan(FakeSkeleton& skel, U64 token,
+                    const std::vector<std::string>& plan_names)
+{
+    FSVRAdapterPlanInput input;
+    input.frame_token = token;
+    input.head_target_valid = false;
+    input.root_world_position = LLVector3::zero;
+    input.root_world_rotation =
+        LLQuaternion(0.f, 0.f, 0.f, 1.f);
+    FSVRAdapterPlanResult result;
+    for (const std::string& name : plan_names)
+    {
+        FSVRAdapterJointInput joint;
+        joint.name = name;
+        joint.base_local = LLQuaternion(0.f, 0.f, 0.f, 1.f);
+        input.joints.push_back(joint);
+        result.base_world_rotations.push_back(
+            LLQuaternion(0.f, 0.f, 0.f, 1.f));
+        result.base_world_positions.push_back(LLVector3::zero);
+        result.resolved_locals.push_back(
+            LLQuaternion(0.f, 0.f, 0.f, 1.f));
+        result.resolved_world_rotations.push_back(
+            LLQuaternion(0.f, 0.f, 0.f, 1.f));
+        result.resolved_world_positions.push_back(LLVector3::zero);
+    }
+    result.applied = true;
+    FSVRBoneLog::sampleCycle(&skel.character, input, result,
+                             false, LLVector3::zero,
+                             nullptr, nullptr);
 }
 
 int summary(const char* mode)
@@ -314,6 +348,107 @@ int runHeaderMode()
     return summary("header");
 }
 
+// DIAG-1 D1-S1/S2: header re-emission on a plan-list
+// change, under the header-pending discipline. The v2
+// header must land before the first sample under the new
+// plan list, and every sample's plan arrays must match
+// the plan list of the header currently in force.
+int runPlanHeaderMode()
+{
+    check(FSVRBoneLog::enabled(),
+          "recorder enabled (FS_VR_BONELOG set by runner)");
+
+    FakeSkeleton skel;
+    skel.build("mRoot", "", "mHead", 1);
+
+    const std::vector<std::string> plan_a = {"mSpine1", "mChest"};
+    const std::vector<std::string> plan_b = {"mSpine1", "mChest",
+                                             "mNeck"};
+    for (U64 token = 1; token <= 3; ++token)
+    {
+        sampleWithPlan(skel, token, plan_a);
+    }
+    for (U64 token = 4; token <= 5; ++token)
+    {
+        sampleWithPlan(skel, token, plan_b);
+    }
+    FSVRBoneLog::shutdown();
+
+    std::ifstream in(kBonelogPath);
+    check(in.good(), "bonelog file exists after shutdown");
+    namespace pt = boost::property_tree;
+    S32 headers = 0;
+    S32 samples = 0;
+    long long current_plan_len = -1;
+    bool first_header_schema2 = false;
+    bool order_ok = true;
+    bool lengths_ok = true;
+    std::string line;
+    while (std::getline(in, line))
+    {
+        if (line.empty())
+        {
+            continue;
+        }
+        pt::ptree tree;
+        bool parsed = true;
+        try
+        {
+            std::istringstream stream(line);
+            pt::read_json(stream, tree);
+        }
+        catch (...)
+        {
+            parsed = false;
+        }
+        check(parsed, "every written line parses as JSON");
+        if (!parsed)
+        {
+            continue;
+        }
+        if (tree.count("header"))
+        {
+            ++headers;
+            if (headers == 1)
+            {
+                first_header_schema2 =
+                    tree.get<S32>("schema", 0) == 2;
+            }
+            current_plan_len = static_cast<long long>(
+                tree.get_child("plan_joints").size());
+        }
+        else if (tree.count("bones"))
+        {
+            ++samples;
+            if (current_plan_len < 0)
+            {
+                order_ok = false;
+            }
+            const pt::ptree& plan = tree.get_child("plan");
+            if (static_cast<long long>(
+                    plan.get_child("base_locals").size()) !=
+                    current_plan_len ||
+                static_cast<long long>(
+                    plan.get_child("domains").size()) !=
+                    current_plan_len)
+            {
+                lengths_ok = false;
+            }
+        }
+    }
+    check(first_header_schema2,
+          "s1: first header is schema 2 with plan_joints");
+    check(headers == 2,
+          "s1: exactly two headers (initial + plan-list change)");
+    check(samples == 5, "s1/s2: all five samples written");
+    check(order_ok,
+          "s2: no sample precedes its header");
+    check(lengths_ok,
+          "s1: every sample's plan arrays match the plan list "
+          "of the header in force");
+    return summary("planheader");
+}
+
 int runWriterFailMode()
 {
     check(FSVRBoneLog::enabled(),
@@ -457,6 +592,10 @@ int main(int argc, char** argv)
     {
         return runHeaderMode();
     }
+    if (mode == "planheader")
+    {
+        return runPlanHeaderMode();
+    }
     if (mode == "writerfail")
     {
         return runWriterFailMode();
@@ -466,7 +605,7 @@ int main(int argc, char** argv)
         return runWriterFailRaceMode();
     }
     std::cout << "usage: bonelog_state_test "
-                 "header|writerfail|writerfailrace"
+                 "header|planheader|writerfail|writerfailrace"
               << std::endl;
     return 2;
 }

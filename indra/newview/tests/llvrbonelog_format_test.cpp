@@ -27,6 +27,7 @@
 #include <boost/property_tree/json_parser.hpp>
 #include <boost/property_tree/ptree.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <fstream>
@@ -168,6 +169,149 @@ int main(int argc, char** argv)
         false, LLVector3::zero, 0.f);
     const std::string null_hmd_line = line;
     lines.push_back(line);
+
+    // 6. DIAG-1 v2 header (D1-F2): schema + plan joints.
+    const std::vector<std::string> plan_names = {
+        "mPelvis", "mSpine1", "mNeck", "mHead"
+    };
+    FSVRBoneLog::buildHeaderRecord(line, joint_names,
+                                   plan_names, 123456796LL);
+    lines.push_back(line);
+
+    // 7. DIAG-1 v2 sample: plan + headrot + blend blocks.
+    FSVRBoneLogPlanData plan;
+    const LLQuaternion qid(0.f, 0.f, 0.f, 1.f);
+    const LLQuaternion qx(0.5f, 0.5f, 0.5f, 0.5f);
+    for (S32 i = 0; i < 4; ++i)
+    {
+        plan.base_locals.push_back(qid);
+        plan.base_world_positions.push_back(
+            LLVector3(0.f, 0.f, static_cast<F32>(i)));
+        plan.base_world_rotations.push_back(qid);
+        plan.resolved_locals.push_back(qx);
+        plan.resolved_world_positions.push_back(
+            LLVector3(1.f, 0.f, static_cast<F32>(i)));
+        plan.resolved_world_rotations.push_back(qx);
+        FSVRBoneLogPlanDomain dom;
+        dom.domain = i == 1 ? 1 : 0; // spine for joint 1
+        dom.decision_grants_base = i != 3;
+        dom.disabled = i == 2;
+        plan.domains.push_back(dom);
+    }
+    plan.applied = true;
+    plan.gate_name = nullptr;
+    plan.spine_solver_invoked = true;
+    plan.head_group_refusal = false;
+    plan.writes_count = 5;
+    FSVRBoneLogHeadRotSample headrot;
+    headrot.neck_state = qx;
+    headrot.head_state = qx;
+    headrot.last_head_rot_before = qid;
+    headrot.last_head_rot_after = qx;
+    headrot.instant = false;
+    headrot.generation = 17;
+    FSVRBoneLogBlendSample blend;
+    blend.neck_present = true;
+    blend.neck.generation = 9;
+    blend.neck.seed_local = qid;
+    {
+        FSVRBoneLogBlendSlot slot;
+        slot.additive = true;
+        slot.priority = 7;
+        slot.weight = 0.5f;
+        slot.rotation = qx;
+        slot.has_rot_sum = false;
+        slot.delta = 0.5f;
+        slot.blended_after = qid;
+        slot.added_after = qx;
+        slot.source_headrot = true;
+        blend.neck.slots.push_back(slot);
+        FSVRBoneLogBlendSlot slot2;
+        slot2.additive = false;
+        slot2.priority = 3;
+        slot2.weight = 1.f;
+        slot2.rotation = qx;
+        slot2.has_rot_sum = true;
+        slot2.rot_sum_after = 1.f;
+        slot2.blended_after = qx;
+        slot2.added_after = qx;
+        slot2.source_headrot = false;
+        blend.neck.slots.push_back(slot2);
+    }
+    blend.neck.rot_weight_sum = 1.f;
+    blend.neck.blended_rot = qx;
+    blend.neck.added_rot = qx;
+    blend.neck.result_local = qx;
+    // CODE-R1-01: this entry's consistency validation
+    // failed; the marker must serialize.
+    blend.neck.source_integrity_failure = true;
+    blend.head_present = false;
+    FSVRBoneLog::buildSampleRecordV2(
+        line, 123456797LL, 4246,
+        true, LLVector3(0.125f, 1.625f, -0.375f),
+        true, LLQuaternion(0.f, 0.f, 0.f, 1.f),
+        LLVector3(10.f, 20.f, 30.f),
+        LLQuaternion(0.f, 0.f, 0.f, 1.f),
+        true, LLVector3(10.5f, 21.5f, 29.5f),
+        LLQuaternion(0.f, 0.f, 0.f, 1.f),
+        bone_pos, bone_rot,
+        true, LLVector3(-0.1f, 0.2f, -0.3f), 0.0125f,
+        &plan, &headrot, &blend);
+    const std::string v2_sample_line = line;
+    lines.push_back(line);
+
+    // 8. DIAG-1 v2 sample with NO headrot/blend captures:
+    // the blocks are absent (never fabricated); the plan
+    // block is present. Also: gate name serializes, and a
+    // non-finite plan value serializes as null.
+    plan.gate_name = "no_solver";
+    plan.base_locals[1] = LLQuaternion(
+        std::numeric_limits<F32>::quiet_NaN(), 0.f, 0.f, 1.f);
+    FSVRBoneLog::buildSampleRecordV2(
+        line, 123456798LL, 4247,
+        false, LLVector3::zero,
+        false, LLQuaternion(),
+        LLVector3::zero, LLQuaternion(),
+        false, LLVector3::zero, LLQuaternion(),
+        bone_pos, bone_rot,
+        false, LLVector3::zero, 0.f,
+        &plan, nullptr, nullptr);
+    const std::string v2_bare_line = line;
+    lines.push_back(line);
+
+    check(v2_sample_line.find("\"source\":\"headrot\"") !=
+              std::string::npos,
+          "v2 sample carries the semantic headrot source marker "
+          "(and no pointer anywhere)");
+    check(v2_sample_line.find(
+              "\"source_integrity\":\"failed\"") !=
+              std::string::npos,
+          "v2 blend entry with a failed consistency validation "
+          "carries the source_integrity failure marker "
+          "(CODE-R1-01)");
+    // The same entry with validation passed (or no slot
+    // attributed) omits the marker entirely.
+    blend.neck.source_integrity_failure = false;
+    FSVRBoneLog::buildSampleRecordV2(
+        line, 123456797LL, 4246,
+        true, LLVector3(0.125f, 1.625f, -0.375f),
+        true, LLQuaternion(0.f, 0.f, 0.f, 1.f),
+        LLVector3(10.f, 20.f, 30.f),
+        LLQuaternion(0.f, 0.f, 0.f, 1.f),
+        true, LLVector3(10.5f, 21.5f, 29.5f),
+        LLQuaternion(0.f, 0.f, 0.f, 1.f),
+        bone_pos, bone_rot,
+        true, LLVector3(-0.1f, 0.2f, -0.3f), 0.0125f,
+        &plan, &headrot, &blend);
+    check(line.find("source_integrity") == std::string::npos,
+          "v2 blend entry whose validation passed omits the "
+          "integrity marker (CODE-R1-01)");
+    check(v2_bare_line.find("\"headrot\"") == std::string::npos &&
+              v2_bare_line.find("\"blend\"") == std::string::npos,
+          "absent captures serialize as absent blocks");
+    check(v2_bare_line.find("\"gate\":\"no_solver\"") !=
+              std::string::npos,
+          "failing gate serializes by name");
 
     // Raw-text assertions for the null shapes (a JSON parser
     // cannot distinguish null from a missing key by value).
@@ -313,6 +457,95 @@ int main(int argc, char** argv)
         auto pit = p.begin();
         check(near(ptreeFloat(pit->second), 0.125f),
               "null-q sample keeps hmd position");
+    }
+
+    // DIAG-1 v2 header assertions (trees[7]).
+    {
+        const pt::ptree& header = trees[7];
+        check(header.get<S32>("schema", 0) == 2,
+              "v2 header carries schema 2");
+        const pt::ptree& pj = header.get_child("plan_joints");
+        check(pj.size() == plan_names.size(),
+              "v2 header plan_joints count");
+        size_t i = 0;
+        for (const pt::ptree::value_type& entry : pj)
+        {
+            check(entry.second.get_value<std::string>() ==
+                      plan_names[i],
+                  "plan joint name " + std::to_string(i) +
+                      " round-trips");
+            ++i;
+        }
+        // Plan-name uniqueness (brief section 2.1).
+        std::vector<std::string> sorted = plan_names;
+        std::sort(sorted.begin(), sorted.end());
+        check(std::adjacent_find(sorted.begin(), sorted.end()) ==
+                  sorted.end(),
+              "plan joint names are unique");
+    }
+
+    // DIAG-1 v2 sample assertions (trees[8]).
+    {
+        const pt::ptree& sample = trees[8];
+        const pt::ptree& plan_t = sample.get_child("plan");
+        check(plan_t.get_child("base_locals").size() ==
+                      plan_names.size() &&
+                  plan_t.get_child("base_worlds").size() ==
+                      plan_names.size() &&
+                  plan_t.get_child("resolved_locals").size() ==
+                      plan_names.size() &&
+                  plan_t.get_child("resolved_worlds").size() ==
+                      plan_names.size() &&
+                  plan_t.get_child("domains").size() ==
+                      plan_names.size(),
+              "v2 plan arrays match the header plan-joint list "
+              "length");
+        check(plan_t.get<bool>("applied", false),
+              "v2 plan applied flag");
+        check(disk_lines[8].find("\"gate\":null") !=
+                  std::string::npos,
+              "v2 plan gate is null when no gate failed");
+        check(plan_t.get<unsigned>("writes", 0) == 5,
+              "v2 plan writes count");
+        auto dit = plan_t.get_child("domains").begin();
+        ++dit; // joint 1: spine
+        check(dit->second.get<std::string>("domain", "") ==
+                  "spine",
+              "v2 plan domain serializes by name");
+        const pt::ptree& hr = sample.get_child("headrot");
+        check(hr.get<unsigned long long>("generation", 0) == 17,
+              "v2 headrot generation");
+        const pt::ptree& bl = sample.get_child("blend");
+        check(bl.count("mNeck") == 1 && bl.count("mHead") == 0,
+              "v2 blend carries only the joints actually blended");
+        const pt::ptree& slots =
+            bl.get_child("mNeck").get_child("slots");
+        check(slots.size() == 2, "v2 blend slot count");
+        auto sit = slots.begin();
+        check(sit->second.get<std::string>("source", "") ==
+                  "headrot",
+              "v2 blend slot 0 is the headrot-attributed slot");
+        ++sit;
+        check(sit->second.count("source") == 0,
+              "v2 blend slot 1 carries no source marker");
+        check(sit->second.get_child_optional("rot_sum_after") &&
+                  !sit->second.get_child_optional("delta"),
+              "v2 non-additive slot carries rot_sum_after, "
+              "not delta");
+    }
+
+    // DIAG-1 bare v2 sample assertions (trees[9]): plan
+    // block present, headrot/blend absent, non-finite plan
+    // value serialized as null.
+    {
+        const pt::ptree& sample = trees[9];
+        check(sample.count("plan") == 1,
+              "bare v2 sample still carries the plan block");
+        check(sample.count("headrot") == 0 &&
+                  sample.count("blend") == 0,
+              "bare v2 sample omits headrot and blend blocks");
+        check(disk_lines[9].find("null") != std::string::npos,
+              "non-finite plan value serialized as null");
     }
 
     if (g_failures == 0)

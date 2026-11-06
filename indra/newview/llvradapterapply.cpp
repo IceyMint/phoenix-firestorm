@@ -503,6 +503,14 @@ FSVRAdapterPlanResult FSVRAdapterApply::computePlan(
     std::vector<LLQuaternion> base_world_rotations;
     std::vector<LLVector3> base_world_positions;
     composeBaseWorlds(input, base_world_rotations, base_world_positions);
+    // P2-07B DIAG-1 (D-1, Route A): retain the base
+    // composition on the result, copied here -- before any
+    // committed-state modification -- so gate failures and
+    // whole-transaction refusal leave it unmodified. One
+    // composition, computed once; no second implementation
+    // exists to drift.
+    result.base_world_rotations = base_world_rotations;
+    result.base_world_positions = base_world_positions;
     result.resolved_locals.resize(count);
     for (S32 i = 0; i < count; ++i)
     {
@@ -1427,8 +1435,10 @@ FSVRAdapterPlanResult FSVRAdapterApplyOnce::apply(
 // ---------------------------------------------------------------------------
 
 #include "llcharacter.h"
+#include "llheadrotmotion.h"
 #include "lljoint.h"
 #include "llopenxrmanager.h"
+#include "llpose.h"
 #include "llopenxrtrace.h"
 #include "llvrarmsolver.h"
 #include "llvrcontinuity.h"
@@ -1469,6 +1479,53 @@ FSVRAdapterDomain domainForAdapterId(const std::string& adapter_id)
         return FSVRAdapterDomain::ARM_RIGHT;
     }
     return FSVRAdapterDomain::NONE;
+}
+
+// ------------------------------------------------------------------
+// P2-07B DIAG-1 (brief sections 2.3 / 2.5 / 3 item 3):
+// the recorder's per-cycle consumer state. The headrot
+// capture and the blend record reach the glue through the
+// character's animation-data slots; the consumers enforce
+// the cycle-validity contract (current generation only,
+// per publishing instance). On a character change both
+// consumers reset, so no accepted generation can carry
+// across characters. The identity comparison itself --
+// consumed slot pointers vs the capture's published state
+// identities, same cycle, both generation-checked --
+// happens here at sample assembly; the raw pointers are
+// consumed here and passed no further.
+// ------------------------------------------------------------------
+LLCharacter* s_diag_consumer_character = nullptr;
+FSVRHeadRotConsumer s_diag_headrot_consumer;
+FSVRBlendObsConsumer s_diag_blend_consumer;
+
+void convertBlendJoint(const FSVRBlendObsJoint& in,
+                       FSVRBoneLogBlendJoint& out)
+{
+    out.generation = in.generation;
+    out.seed_local = in.seed_local;
+    out.rot_weight_sum = in.rot_weight_sum;
+    out.blended_rot = in.blended_rot;
+    out.added_rot = in.added_rot;
+    out.result_local = in.result_local;
+    out.slots.clear();
+    for (S32 i = 0; i < in.slot_count; ++i)
+    {
+        const FSVRBlendObsSlot& slot = in.slots[i];
+        FSVRBoneLogBlendSlot converted;
+        converted.additive = slot.additive;
+        converted.priority = slot.priority;
+        converted.weight = slot.weight;
+        converted.rotation = slot.rotation;
+        converted.has_rot_sum = slot.has_rot_sum;
+        converted.rot_sum_after = slot.rot_sum_after;
+        converted.delta = slot.delta;
+        converted.blended_after = slot.blended_after;
+        converted.added_after = slot.added_after;
+        converted.source_headrot = slot.source_headrot;
+        out.slots.push_back(converted);
+    }
+    out.source_integrity_failure = in.source_integrity_failure;
 }
 
 } // namespace
@@ -2018,6 +2075,112 @@ void FSVRAdapterApplyForCharacter(LLCharacter* character, bool preview_cycle)
     // flag reads.
     FSVRCalibration::stepFromAdapterCycle(character, input, result);
 
+    // P2-07B DIAG-1 (brief section 3 item 3): assemble the
+    // recorder's headrot + blend inputs for this cycle.
+    // Both arrive through the character's animation-data
+    // slots (D-2 R-a publication; the motion controller's
+    // blend-record publication) and are consumed under the
+    // cycle-validity contract: current generation only, per
+    // publishing instance. The identity comparison --
+    // consumed slot pointers vs the capture's published
+    // state identities -- is performed here, on stamped
+    // COPIES of the blend entries; the raw pointers are
+    // consumed here and passed no further (only the
+    // semantic source marker reaches the recorder). No
+    // identity, no attribution: without a valid
+    // current-cycle capture the stamp identity is null and
+    // no slot is marked. All of it is skipped when the
+    // recorder is disabled.
+    const FSVRHeadRotCapture* diag_capture = nullptr;
+    FSVRBoneLogHeadRotSample diag_headrot;
+    FSVRBoneLogBlendSample diag_blend;
+    bool diag_have_headrot = false;
+    bool diag_have_blend = false;
+    if (FSVRBoneLog::enabled())
+    {
+        if (s_diag_consumer_character != character)
+        {
+            s_diag_consumer_character = character;
+            s_diag_headrot_consumer = FSVRHeadRotConsumer();
+            s_diag_blend_consumer = FSVRBlendObsConsumer();
+        }
+        const FSVRHeadRotCapture* published_capture =
+            static_cast<const FSVRHeadRotCapture*>(
+                character->getAnimationData("FSVRHeadRotCapture"));
+        diag_capture =
+            s_diag_headrot_consumer.accept(published_capture);
+        if (diag_capture)
+        {
+            diag_headrot.neck_state = diag_capture->neck_state;
+            diag_headrot.head_state = diag_capture->head_state;
+            diag_headrot.last_head_rot_before =
+                diag_capture->last_head_rot_before;
+            diag_headrot.last_head_rot_after =
+                diag_capture->last_head_rot_after;
+            diag_headrot.instant = diag_capture->instant;
+            diag_headrot.generation = diag_capture->generation;
+            diag_have_headrot = true;
+        }
+        FSVRBlendObsRecord* blend_record =
+            static_cast<FSVRBlendObsRecord*>(
+                character->getAnimationData("FSVRBlendObs"));
+        if (blend_record &&
+            s_diag_blend_consumer.consumePass(blend_record))
+        {
+            for (S32 which = 0; which < 2; ++which)
+            {
+                const FSVRBlendObsJoint* entry =
+                    s_diag_blend_consumer.entryFor(*blend_record,
+                                                   which);
+                if (!entry)
+                {
+                    continue;
+                }
+                FSVRBlendObsJoint stamped = *entry;
+                fsvrStampBlendObsSource(
+                    stamped,
+                    which == 0
+                        ? (diag_capture
+                               ? diag_capture->neck_state_id
+                               : nullptr)
+                        : (diag_capture
+                               ? diag_capture->head_state_id
+                               : nullptr));
+                // CODE-R1-01 (brief section 2.5):
+                // independent consistency validation of
+                // the identity-attributed slots against
+                // this cycle's published ask and the
+                // motion's effective mode captured at
+                // publication. A mismatch flags the
+                // entry's record-integrity failure in the
+                // record; the identity attribution stands,
+                // no slot is re-matched by value, and
+                // nothing is written back.
+                if (diag_capture)
+                {
+                    fsvrValidateBlendObsSource(
+                        stamped,
+                        which == 0
+                            ? diag_capture->neck_state
+                            : diag_capture->head_state,
+                        diag_capture->priority,
+                        diag_capture->additive);
+                }
+                if (which == 0)
+                {
+                    diag_blend.neck_present = true;
+                    convertBlendJoint(stamped, diag_blend.neck);
+                }
+                else
+                {
+                    diag_blend.head_present = true;
+                    convertBlendJoint(stamped, diag_blend.head);
+                }
+                diag_have_blend = true;
+            }
+        }
+    }
+
     // P2-07B feel-regrounding diagnostic: the per-cycle
     // motion sample (FS_VR_BONELOG). Taken here, at the
     // tail, so the skeleton the recorder reads carries
@@ -2026,8 +2189,11 @@ void FSVRAdapterApplyForCharacter(LLCharacter* character, bool preview_cycle)
     // Observation-only: the recorder early-outs on its
     // cached env bool when disabled and writes nothing
     // back, ever.
-    FSVRBoneLog::sampleCycle(character, input, result,
-                             hmd_position_read, hmd_position_local);
+    FSVRBoneLog::sampleCycle(
+        character, input, result,
+        hmd_position_read, hmd_position_local,
+        diag_have_headrot ? &diag_headrot : nullptr,
+        diag_have_blend ? &diag_blend : nullptr);
 }
 
 #endif // FSVR_ADAPTER_PLAN_ONLY

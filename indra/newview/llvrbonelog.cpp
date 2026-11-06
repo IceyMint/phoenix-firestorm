@@ -220,6 +220,205 @@ void appendQuat(std::string& out, const LLQuaternion& q)
     out += ']';
 }
 
+// Forward declaration: defined below with the other
+// serialization primitives; the DIAG-1 block appenders
+// above it use it for the gate/domain name strings.
+void appendJsonString(std::string& out, const std::string& s);
+
+void appendBool(std::string& out, bool value)
+{
+    out += value ? "true" : "false";
+}
+
+// DIAG-1: the plan block's domain names (FSVRAdapterDomain
+// values NONE/SPINE/ARM_LEFT/ARM_RIGHT, in enum order).
+const char* planDomainName(S32 domain)
+{
+    switch (domain)
+    {
+    case 0: return "none";
+    case 1: return "spine";
+    case 2: return "arm_left";
+    case 3: return "arm_right";
+    }
+    return "unknown";
+}
+
+void appendWorldArray(std::string& out,
+                      const std::vector<LLVector3>& positions,
+                      const std::vector<LLQuaternion>& rotations)
+{
+    const size_t count =
+        positions.size() < rotations.size() ? positions.size()
+                                            : rotations.size();
+    out += '[';
+    for (size_t i = 0; i < count; ++i)
+    {
+        if (i > 0)
+        {
+            out += ',';
+        }
+        out += "{\"p\":";
+        appendVec(out, positions[i]);
+        out += ",\"q\":";
+        appendQuat(out, rotations[i]);
+        out += '}';
+    }
+    out += ']';
+}
+
+void appendQuatArray(std::string& out,
+                     const std::vector<LLQuaternion>& quats)
+{
+    out += '[';
+    for (size_t i = 0; i < quats.size(); ++i)
+    {
+        if (i > 0)
+        {
+            out += ',';
+        }
+        appendQuat(out, quats[i]);
+    }
+    out += ']';
+}
+
+// DIAG-1 "plan" block (brief section 2.2): raw quantities
+// only -- derived factors are analysis-side, never
+// recorded.
+void appendPlanBlock(std::string& out,
+                     const FSVRBoneLogPlanData& plan)
+{
+    out += ",\"plan\":{\"base_locals\":";
+    appendQuatArray(out, plan.base_locals);
+    out += ",\"base_worlds\":";
+    appendWorldArray(out, plan.base_world_positions,
+                     plan.base_world_rotations);
+    out += ",\"resolved_locals\":";
+    appendQuatArray(out, plan.resolved_locals);
+    out += ",\"resolved_worlds\":";
+    appendWorldArray(out, plan.resolved_world_positions,
+                     plan.resolved_world_rotations);
+    out += ",\"domains\":[";
+    for (size_t i = 0; i < plan.domains.size(); ++i)
+    {
+        if (i > 0)
+        {
+            out += ',';
+        }
+        out += "{\"domain\":";
+        appendJsonString(out, planDomainName(plan.domains[i].domain));
+        out += ",\"grants_base\":";
+        appendBool(out, plan.domains[i].decision_grants_base);
+        out += ",\"disabled\":";
+        appendBool(out, plan.domains[i].disabled);
+        out += '}';
+    }
+    out += "],\"applied\":";
+    appendBool(out, plan.applied);
+    out += ",\"gate\":";
+    if (plan.gate_name)
+    {
+        appendJsonString(out, plan.gate_name);
+    }
+    else
+    {
+        out += "null";
+    }
+    out += ",\"spine_solver_invoked\":";
+    appendBool(out, plan.spine_solver_invoked);
+    out += ",\"head_group_refusal\":";
+    appendBool(out, plan.head_group_refusal);
+    out += ",\"writes\":";
+    out += std::to_string(plan.writes_count);
+    out += '}';
+}
+
+// DIAG-1 "headrot" block (brief section 2.3): the motion's
+// ask for this cycle. Values only -- the capture's state
+// identities never appear here or anywhere in the file.
+void appendHeadRotBlock(std::string& out,
+                        const FSVRBoneLogHeadRotSample& headrot)
+{
+    out += ",\"headrot\":{\"neck_state\":";
+    appendQuat(out, headrot.neck_state);
+    out += ",\"head_state\":";
+    appendQuat(out, headrot.head_state);
+    out += ",\"last_head_rot_before\":";
+    appendQuat(out, headrot.last_head_rot_before);
+    out += ",\"last_head_rot_after\":";
+    appendQuat(out, headrot.last_head_rot_after);
+    out += ",\"instant\":";
+    appendBool(out, headrot.instant);
+    out += ",\"generation\":";
+    out += std::to_string(
+        static_cast<unsigned long long>(headrot.generation));
+    out += '}';
+}
+
+// DIAG-1 blend entry for one joint (brief section 2.5).
+void appendBlendJoint(std::string& out,
+                      const FSVRBoneLogBlendJoint& joint)
+{
+    out += "{\"generation\":";
+    out += std::to_string(
+        static_cast<unsigned long long>(joint.generation));
+    out += ",\"seed_local\":";
+    appendQuat(out, joint.seed_local);
+    out += ",\"slots\":[";
+    for (size_t i = 0; i < joint.slots.size(); ++i)
+    {
+        const FSVRBoneLogBlendSlot& slot = joint.slots[i];
+        if (i > 0)
+        {
+            out += ',';
+        }
+        out += "{\"additive\":";
+        appendBool(out, slot.additive);
+        out += ",\"priority\":";
+        out += std::to_string(slot.priority);
+        out += ",\"weight\":";
+        appendFloat(out, slot.weight);
+        out += ",\"rotation\":";
+        appendQuat(out, slot.rotation);
+        if (slot.has_rot_sum)
+        {
+            out += ",\"rot_sum_after\":";
+            appendFloat(out, slot.rot_sum_after);
+        }
+        else
+        {
+            out += ",\"delta\":";
+            appendFloat(out, slot.delta);
+        }
+        out += ",\"blended_after\":";
+        appendQuat(out, slot.blended_after);
+        out += ",\"added_after\":";
+        appendQuat(out, slot.added_after);
+        if (slot.source_headrot)
+        {
+            out += ",\"source\":\"headrot\"";
+        }
+        out += '}';
+    }
+    out += "],\"rot_weight_sum\":";
+    appendFloat(out, joint.rot_weight_sum);
+    out += ",\"blended_rot\":";
+    appendQuat(out, joint.blended_rot);
+    out += ",\"added_rot\":";
+    appendQuat(out, joint.added_rot);
+    out += ",\"result_local\":";
+    appendQuat(out, joint.result_local);
+    if (joint.source_integrity_failure)
+    {
+        // CODE-R1-01: explicit record-integrity failure
+        // indication (brief section 2.5: a mismatch "is a
+        // record-integrity failure"). The attributed
+        // slot's source marker above still stands.
+        out += ",\"source_integrity\":\"failed\"";
+    }
+    out += '}';
+}
+
 // Complete JSON string escaping: quote, backslash, the
 // named control escapes, and \u00XX for every other byte
 // below U+0020. Bytes >= 0x80 pass through raw (the emitted
@@ -289,6 +488,41 @@ void FSVRBoneLog::buildHeaderRecord(
 }
 
 // static
+void FSVRBoneLog::buildHeaderRecord(
+    std::string& out,
+    const std::vector<std::string>& joint_names,
+    const std::vector<std::string>& plan_joint_names,
+    long long t_ms)
+{
+    out.clear();
+    out += "{\"header\":true,\"schema\":2,\"t_ms\":";
+    out += std::to_string(t_ms);
+    out += ",\"joints\":[";
+    bool first = true;
+    for (const std::string& name : joint_names)
+    {
+        if (!first)
+        {
+            out += ',';
+        }
+        first = false;
+        appendJsonString(out, name);
+    }
+    out += "],\"plan_joints\":[";
+    first = true;
+    for (const std::string& name : plan_joint_names)
+    {
+        if (!first)
+        {
+            out += ',';
+        }
+        first = false;
+        appendJsonString(out, name);
+    }
+    out += "]}\n";
+}
+
+// static
 void FSVRBoneLog::buildCalibrateRequestedRecord(std::string& out,
                                                 long long t_ms)
 {
@@ -342,7 +576,7 @@ void FSVRBoneLog::buildDropsRecord(std::string& out,
 }
 
 // static
-void FSVRBoneLog::buildSampleRecord(
+void FSVRBoneLog::buildSampleRecordV2(
     std::string& out,
     long long t_ms,
     U64 cycle,
@@ -359,7 +593,10 @@ void FSVRBoneLog::buildSampleRecord(
     const std::vector<LLQuaternion>& bone_rotations,
     bool target_valid,
     const LLVector3& target_cornea_root,
-    F32 target_vs_observed_err_m)
+    F32 target_vs_observed_err_m,
+    const FSVRBoneLogPlanData* plan,
+    const FSVRBoneLogHeadRotSample* headrot,
+    const FSVRBoneLogBlendSample* blend)
 {
     out.clear();
     out += "{\"t_ms\":";
@@ -450,7 +687,71 @@ void FSVRBoneLog::buildSampleRecord(
         out += '}';
     }
 
+    // --- DIAG-1 blocks (brief sections 2.2 / 2.3 / 2.5):
+    // new keys only; every v1 field above is unchanged in
+    // name, type and nullability.
+    if (plan)
+    {
+        appendPlanBlock(out, *plan);
+    }
+    if (headrot)
+    {
+        appendHeadRotBlock(out, *headrot);
+    }
+    if (blend && (blend->neck_present || blend->head_present))
+    {
+        out += ",\"blend\":{";
+        bool first_entry = true;
+        if (blend->neck_present)
+        {
+            out += "\"mNeck\":";
+            appendBlendJoint(out, blend->neck);
+            first_entry = false;
+        }
+        if (blend->head_present)
+        {
+            if (!first_entry)
+            {
+                out += ',';
+            }
+            out += "\"mHead\":";
+            appendBlendJoint(out, blend->head);
+        }
+        out += '}';
+    }
+
     out += "}\n";
+}
+
+// static
+void FSVRBoneLog::buildSampleRecord(
+    std::string& out,
+    long long t_ms,
+    U64 cycle,
+    bool hmd_valid,
+    const LLVector3& hmd_position,
+    bool hmd_q_valid,
+    const LLQuaternion& hmd_q,
+    const LLVector3& root_position,
+    const LLQuaternion& root_rotation,
+    bool camera_valid,
+    const LLVector3& camera_position,
+    const LLQuaternion& camera_rotation,
+    const std::vector<LLVector3>& bone_positions,
+    const std::vector<LLQuaternion>& bone_rotations,
+    bool target_valid,
+    const LLVector3& target_cornea_root,
+    F32 target_vs_observed_err_m)
+{
+    buildSampleRecordV2(out, t_ms, cycle,
+                        hmd_valid, hmd_position,
+                        hmd_q_valid, hmd_q,
+                        root_position, root_rotation,
+                        camera_valid, camera_position, camera_rotation,
+                        bone_positions, bone_rotations,
+                        target_valid, target_cornea_root,
+                        target_vs_observed_err_m,
+                        nullptr, nullptr, nullptr);
 }
 
 #ifndef FSVR_BONELOG_SERIALIZE_ONLY
@@ -549,12 +850,21 @@ struct BoneLogState
     std::vector<std::string> joint_names;
     S32 head_index = -1;
 
+    // DIAG-1: the last PUBLISHED plan joint list. A cycle
+    // whose plan list differs pends a v2 header re-emission
+    // under the same discipline as a skeleton change
+    // (brief section 2.1, Q-3 settled: header re-emission
+    // is the mechanism).
+    std::vector<std::string> plan_names;
+    bool plan_pending = false;
+
     // Producer scratch (main thread only): reused across
     // samples; capacity persists, so steady-state samples
     // allocate nothing.
     std::string scratch;
     std::vector<LLVector3> bone_positions;
     std::vector<LLQuaternion> bone_rotations;
+    FSVRBoneLogPlanData plan_scratch;
 
     // Bounded producer/consumer ring. The mutex is held
     // only for O(1) index/swap operations -- never across
@@ -986,8 +1296,11 @@ bool refreshSkeleton(LLCharacter* character)
 
 void sampleCycleImpl(LLCharacter* character,
                      const FSVRAdapterPlanInput& input,
+                     const FSVRAdapterPlanResult& result,
                      bool hmd_position_valid,
-                     const LLVector3& hmd_position_local)
+                     const LLVector3& hmd_position_local,
+                     const FSVRBoneLogHeadRotSample* headrot,
+                     const FSVRBoneLogBlendSample* blend)
 {
     BoneLogState& state = bonelogState();
     if (state.writer_failed.load())
@@ -1003,14 +1316,44 @@ void sampleCycleImpl(LLCharacter* character,
         // -R2-02). The cache advancing is not publication.
         state.header_pending = true;
     }
-    if (state.header_pending)
+    // DIAG-1: a changed plan joint list pends a v2 header
+    // re-emission under the same discipline (section 2.1).
     {
+        bool plan_changed =
+            input.joints.size() != state.plan_names.size();
+        if (!plan_changed)
+        {
+            for (size_t i = 0; i < input.joints.size(); ++i)
+            {
+                if (input.joints[i].name != state.plan_names[i])
+                {
+                    plan_changed = true;
+                    break;
+                }
+            }
+        }
+        if (plan_changed)
+        {
+            state.plan_pending = true;
+        }
+    }
+    if (state.header_pending || state.plan_pending)
+    {
+        std::vector<std::string> current_plan_names;
+        current_plan_names.reserve(input.joints.size());
+        for (const FSVRAdapterJointInput& joint : input.joints)
+        {
+            current_plan_names.push_back(joint.name);
+        }
         FSVRBoneLog::buildHeaderRecord(state.scratch,
                                        state.joint_names,
+                                       current_plan_names,
                                        nowMs());
         if (enqueueLine(state.scratch))
         {
             state.header_pending = false;
+            state.plan_pending = false;
+            state.plan_names = current_plan_names;
         }
         else
         {
@@ -1088,14 +1431,49 @@ void sampleCycleImpl(LLCharacter* character,
         target_valid = true;
     }
 
-    FSVRBoneLog::buildSampleRecord(
+    // --- DIAG-1 plan block (brief section 2.2): the
+    // cycle's base and resolved poses in plan index space,
+    // from the input and the plan result the recorder
+    // already receives. Base locals are the input's own;
+    // base worlds are the result's Route-A retention.
+    FSVRBoneLogPlanData& plan = state.plan_scratch;
+    plan.base_locals.clear();
+    plan.domains.clear();
+    plan.base_locals.reserve(input.joints.size());
+    plan.domains.reserve(input.joints.size());
+    for (const FSVRAdapterJointInput& joint : input.joints)
+    {
+        plan.base_locals.push_back(joint.base_local);
+        FSVRBoneLogPlanDomain domain;
+        domain.domain = static_cast<S32>(joint.domain);
+        domain.decision_grants_base = joint.decision_grants_base;
+        domain.disabled = joint.disabled;
+        plan.domains.push_back(domain);
+    }
+    plan.base_world_positions = result.base_world_positions;
+    plan.base_world_rotations = result.base_world_rotations;
+    plan.resolved_locals = result.resolved_locals;
+    plan.resolved_world_positions = result.resolved_world_positions;
+    plan.resolved_world_rotations = result.resolved_world_rotations;
+    plan.applied = result.applied;
+    plan.gate_name =
+        result.first_failing_gate == FSVRAdapterGate::NONE
+            ? nullptr
+            : FSVRAdapterApply::gateName(result.first_failing_gate);
+    plan.spine_solver_invoked = result.spine_solver_invoked;
+    plan.head_group_refusal = result.head_group_refusal;
+    plan.writes_count =
+        static_cast<U32>(result.writes.size());
+
+    FSVRBoneLog::buildSampleRecordV2(
         state.scratch, nowMs(), input.frame_token,
         hmd_position_valid, hmd_position_local,
         hmd_q_valid, hmd_q,
         input.root_world_position, input.root_world_rotation,
         camera_valid, camera_pos, camera_q,
         state.bone_positions, state.bone_rotations,
-        target_valid, target_root, observed_err);
+        target_valid, target_root, observed_err,
+        &plan, headrot, blend);
     enqueueLine(state.scratch);
 }
 
@@ -1122,9 +1500,11 @@ bool FSVRBoneLog::enabled()
 // static
 void FSVRBoneLog::sampleCycle(LLCharacter* character,
                               const FSVRAdapterPlanInput& input,
-                              const FSVRAdapterPlanResult& /*result*/,
+                              const FSVRAdapterPlanResult& result,
                               bool hmd_position_valid,
-                              const LLVector3& hmd_position_local)
+                              const LLVector3& hmd_position_local,
+                              const FSVRBoneLogHeadRotSample* headrot,
+                              const FSVRBoneLogBlendSample* blend)
 {
     if (!enabled() || !character || s_hard_disabled.load())
     {
@@ -1132,8 +1512,9 @@ void FSVRBoneLog::sampleCycle(LLCharacter* character,
     }
     try
     {
-        sampleCycleImpl(character, input, hmd_position_valid,
-                        hmd_position_local);
+        sampleCycleImpl(character, input, result,
+                        hmd_position_valid, hmd_position_local,
+                        headrot, blend);
     }
     catch (...)
     {

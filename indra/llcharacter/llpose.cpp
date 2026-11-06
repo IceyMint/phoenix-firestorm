@@ -268,6 +268,19 @@ void LLJointStateBlender::blendJointStates(bool apply_now)
     sum_weights[ROT_WEIGHT] = 0.f;
     sum_weights[SCALE_WEIGHT] = 0.f;
 
+    // P2-07B DIAG-1 observation (brief section 2.5): apply
+    // passes only -- the quantum blendAndCache path is out
+    // of observation scope by construction. When no sink is
+    // installed the only added cost is this check; when one
+    // is, the code below copies values it already holds and
+    // touches nothing else.
+    const bool obs_active = apply_now && mObsSink != nullptr;
+    if (obs_active)
+    {
+        mObsSink->seed_local = blended_rot;
+        mObsSink->slot_count = 0;
+    }
+
     for(S32 joint_state_index = 0;
         joint_state_index < JSB_NUM_JOINT_STATES && mJointStates[joint_state_index].notNull();
         joint_state_index++)
@@ -279,6 +292,21 @@ void LLJointStateBlender::blendJointStates(bool apply_now)
         if (current_weight == 0.f)
         {
             continue;
+        }
+
+        // DIAG-1: pending record for this slot, completed
+        // by its ROT step below (weight-0 skips above are
+        // not consumed and are never recorded).
+        FSVRBlendObsSlot obs_slot;
+        bool obs_pending = false;
+        if (obs_active && (current_usage & LLJointState::ROT))
+        {
+            obs_slot.state = jsp;
+            obs_slot.additive = mAdditiveBlends[joint_state_index];
+            obs_slot.priority = mPriorities[joint_state_index];
+            obs_slot.weight = current_weight;
+            obs_slot.rotation = jsp->getRotation();
+            obs_pending = true;
         }
 
         if (mAdditiveBlends[joint_state_index])
@@ -305,6 +333,17 @@ void LLJointStateBlender::blendJointStates(bool apply_now)
 
                 // add in rotation for this jointstate modulated by weight
                 added_rot = nlerp((new_weight_sum - sum_weights[ROT_WEIGHT]), added_rot, jsp->getRotation()) * added_rot;
+
+                // DIAG-1: additive steps never advance
+                // sum_weights; the step's contribution is
+                // delta and the post-step accumulators.
+                if (obs_pending)
+                {
+                    obs_slot.delta =
+                        new_weight_sum - sum_weights[ROT_WEIGHT];
+                    obs_slot.blended_after = blended_rot;
+                    obs_slot.added_after = added_rot;
+                }
             }
         }
         else
@@ -366,10 +405,28 @@ void LLJointStateBlender::blendJointStates(bool apply_now)
                     blended_rot = jsp->getRotation();
                     sum_weights[ROT_WEIGHT] = current_weight;
                 }
+
+                // DIAG-1: post-step accumulators for this
+                // slot's record.
+                if (obs_pending)
+                {
+                    obs_slot.has_rot_sum = true;
+                    obs_slot.rot_sum_after = sum_weights[ROT_WEIGHT];
+                    obs_slot.blended_after = blended_rot;
+                    obs_slot.added_after = added_rot;
+                }
             }
 
             // update resulting usage mask
             sum_usage = sum_usage | current_usage;
+        }
+
+        // DIAG-1: the slot's record is complete once its
+        // ROT step has run.
+        if (obs_pending &&
+            mObsSink->slot_count < JSB_NUM_JOINT_STATES)
+        {
+            mObsSink->slots[mObsSink->slot_count++] = obs_slot;
         }
     }
 
@@ -381,6 +438,19 @@ void LLJointStateBlender::blendJointStates(bool apply_now)
     if (!blended_scale.isFinite())
     {
         blended_scale.setVec(1,1,1);
+    }
+
+    // DIAG-1: final accumulators and the written result,
+    // copied pre-write from the same values the write below
+    // applies.
+    if (obs_active)
+    {
+        mObsSink->rot_weight_sum = sum_weights[ROT_WEIGHT];
+        mObsSink->blended_rot = blended_rot;
+        mObsSink->added_rot = added_rot;
+        mObsSink->result_local = added_rot * blended_rot;
+        mObsSink->generation = mObsGeneration;
+        mObsSink->written = true;
     }
 
     // apply transforms
@@ -511,6 +581,40 @@ bool LLPoseBlender::addMotion(LLMotion* motion)
 //-----------------------------------------------------------------------------
 void LLPoseBlender::blendAndApply()
 {
+    // P2-07B DIAG-1 (brief section 2.5): stamp this pass's
+    // generation, reset the observed joints' written flags
+    // (a joint skipped this pass must not present last
+    // pass's record as current), and install the sinks for
+    // the two observed joints on their blenders.
+    ++mBlendObsGeneration;
+    mBlendObs.generation = mBlendObsGeneration;
+    mBlendObs.neck.written = false;
+    mBlendObs.neck.slot_count = 0;
+    mBlendObs.neck.source_integrity_failure = false;
+    mBlendObs.head.written = false;
+    mBlendObs.head.slot_count = 0;
+    mBlendObs.head.source_integrity_failure = false;
+    for (blender_list_t::iterator iter = mActiveBlenders.begin();
+         iter != mActiveBlenders.end(); ++iter)
+    {
+        LLJointStateBlender* jsbp = *iter;
+        FSVRBlendObsJoint* sink = nullptr;
+        const LLJoint* joint = jsbp->targetJoint();
+        if (joint)
+        {
+            const std::string& name = joint->getName();
+            if (name == "mNeck")
+            {
+                sink = &mBlendObs.neck;
+            }
+            else if (name == "mHead")
+            {
+                sink = &mBlendObs.head;
+            }
+        }
+        jsbp->setObsSink(sink, mBlendObsGeneration);
+    }
+
     for (blender_list_t::iterator iter = mActiveBlenders.begin();
          iter != mActiveBlenders.end(); )
     {

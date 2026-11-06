@@ -79,6 +79,88 @@ class LLCharacter;
 struct FSVRAdapterPlanInput;
 struct FSVRAdapterPlanResult;
 
+// ---- P2-07B DIAG-1 recorded-data structs ----------------
+// Serialization-side views of the DIAG-1 additions (brief
+// sections 2.2 / 2.3 / 2.5). They carry values only: no
+// state pointer, address, or identity token ever appears
+// in them -- the blend slots' source_headrot flag is the
+// semantic marker the glue's identity comparison produced,
+// and it is the only identity-derived datum in the file.
+
+struct FSVRBoneLogPlanDomain
+{
+    S32 domain = 0; // FSVRAdapterDomain value, serialized by name
+    bool decision_grants_base = false;
+    bool disabled = false;
+};
+
+struct FSVRBoneLogPlanData
+{
+    std::vector<LLQuaternion> base_locals;
+    std::vector<LLVector3> base_world_positions;
+    std::vector<LLQuaternion> base_world_rotations;
+    std::vector<LLQuaternion> resolved_locals;
+    std::vector<LLVector3> resolved_world_positions;
+    std::vector<LLQuaternion> resolved_world_rotations;
+    std::vector<FSVRBoneLogPlanDomain> domains;
+    bool applied = false;
+    const char* gate_name = nullptr; // nullptr serializes as null
+    bool spine_solver_invoked = false;
+    bool head_group_refusal = false;
+    U32 writes_count = 0;
+};
+
+struct FSVRBoneLogHeadRotSample
+{
+    LLQuaternion neck_state;
+    LLQuaternion head_state;
+    LLQuaternion last_head_rot_before;
+    LLQuaternion last_head_rot_after;
+    bool instant = false;
+    U64 generation = 0;
+};
+
+struct FSVRBoneLogBlendSlot
+{
+    bool additive = false;
+    S32 priority = 0;
+    F32 weight = 0.f;
+    LLQuaternion rotation;
+    bool has_rot_sum = false;
+    F32 rot_sum_after = 0.f;
+    F32 delta = 0.f;
+    LLQuaternion blended_after;
+    LLQuaternion added_after;
+    bool source_headrot = false;
+};
+
+struct FSVRBoneLogBlendJoint
+{
+    U64 generation = 0;
+    LLQuaternion seed_local;
+    std::vector<FSVRBoneLogBlendSlot> slots;
+    F32 rot_weight_sum = 0.f;
+    LLQuaternion blended_rot;
+    LLQuaternion added_rot;
+    LLQuaternion result_local;
+    // CODE-R1-01: the glue's consistency validation
+    // (llpose.h fsvrValidateBlendObsSource) found an
+    // identity-attributed slot whose recorded values
+    // disagree with the published ask / effective mode.
+    // Serialized as "source_integrity":"failed" on this
+    // joint's blend entry; absent when validation passed
+    // or no slot was attributed.
+    bool source_integrity_failure = false;
+};
+
+struct FSVRBoneLogBlendSample
+{
+    bool neck_present = false;
+    FSVRBoneLogBlendJoint neck;
+    bool head_present = false;
+    FSVRBoneLogBlendJoint head;
+};
+
 class FSVRBoneLog
 {
 public:
@@ -104,11 +186,18 @@ public:
     // equivalent to that locate's orientation within
     // floating-point tolerance -- it is not claimed
     // bit-identical).
+    // DIAG-1: headrot/blend are the glue-assembled,
+    // generation-checked captures for this cycle (nullptr
+    // when no valid current-cycle capture exists -- the
+    // corresponding block is then absent from the sample,
+    // never fabricated or stale).
     static void sampleCycle(LLCharacter* character,
                             const FSVRAdapterPlanInput& input,
                             const FSVRAdapterPlanResult& result,
                             bool hmd_position_valid,
-                            const LLVector3& hmd_position_local);
+                            const LLVector3& hmd_position_local,
+                            const FSVRBoneLogHeadRotSample* headrot,
+                            const FSVRBoneLogBlendSample* blend);
 
     // Event records. calibrate_requested is emitted at the
     // entry of FSVRCalibration::requestCalibration (every
@@ -154,6 +243,17 @@ public:
     static void buildHeaderRecord(std::string& out,
                                   const std::vector<std::string>& joint_names,
                                   long long t_ms);
+    // DIAG-1 header v2: adds "schema":2 and the plan joint
+    // names (plan index space for the sample's "plan"
+    // block). Emitted at recorder start and re-emitted
+    // whenever either the skeleton generation or the plan
+    // joint list changes, under the same header-pending
+    // discipline. v1 parsers read v2 files by ignoring the
+    // new keys; absence of "schema" in a header means 1.
+    static void buildHeaderRecord(std::string& out,
+                                  const std::vector<std::string>& joint_names,
+                                  const std::vector<std::string>& plan_joint_names,
+                                  long long t_ms);
     static void buildCalibrateRequestedRecord(std::string& out,
                                               long long t_ms);
     static void buildSyncExecutedRecord(
@@ -189,6 +289,34 @@ public:
         bool target_valid,
         const LLVector3& target_cornea_root,
         F32 target_vs_observed_err_m);
+    // DIAG-1 sample: the v1 fields verbatim, plus the
+    // "plan" block (present iff plan != nullptr; the
+    // producer passes it on every v2 sample), the
+    // "headrot" block (present iff headrot != nullptr) and
+    // the "blend" block (present iff blend != nullptr;
+    // per-joint entries present per its *_present flags,
+    // keyed by joint name).
+    static void buildSampleRecordV2(
+        std::string& out,
+        long long t_ms,
+        U64 cycle,
+        bool hmd_valid,
+        const LLVector3& hmd_position,
+        bool hmd_q_valid,
+        const LLQuaternion& hmd_q,
+        const LLVector3& root_position,
+        const LLQuaternion& root_rotation,
+        bool camera_valid,
+        const LLVector3& camera_position,
+        const LLQuaternion& camera_rotation,
+        const std::vector<LLVector3>& bone_positions,
+        const std::vector<LLQuaternion>& bone_rotations,
+        bool target_valid,
+        const LLVector3& target_cornea_root,
+        F32 target_vs_observed_err_m,
+        const FSVRBoneLogPlanData* plan,
+        const FSVRBoneLogHeadRotSample* headrot,
+        const FSVRBoneLogBlendSample* blend);
 
 #ifdef FSVR_BONELOG_TEST_HOOKS
     // ---- Test-only hooks --------------------------------
