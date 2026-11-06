@@ -218,6 +218,7 @@ set(viewer_SOURCE_FILES
     llagentcamera.cpp
     llvradapterapply.cpp
     llvrarmsolver.cpp
+    llvrbonelog.cpp
     llvrboneregistry.cpp
     llvrcalibration.cpp
     llvrcontinuity.cpp
@@ -1078,6 +1079,7 @@ set(viewer_HEADER_FILES
     llagentcamera.h
     llvradapterapply.h
     llvrarmsolver.h
+    llvrbonelog.h
     llvrboneregistry.h
     llvrcalibration.h
     llvrcontinuity.h

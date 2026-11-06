@@ -1801,6 +1801,7 @@ void FSVRSessionNeutral::step(const FSVRSessionStepInputs& inputs)
 #include "llavatarappearancedefines.h"
 #include "llcharacter.h"
 #include "llopenxrmanager.h"
+#include "llvrbonelog.h"
 #include "llvoavatar.h"
 #include "llvoavatarself.h"
 
@@ -2031,6 +2032,12 @@ void executeSync(const FSVRAdapterPlanInput& input,
         FSVRCalibrationRecordValidation{},
         hmd_position, stage2YawOfForward(hmd_forward), offset,
         neutral_root, FSVRScaleSource::PROVISIONAL_SYNC);
+    // P2-07B feel-regrounding diagnostic: the install is
+    // the sync_executed event; record the installed pair
+    // beside the tree's only success report.
+    FSVRBoneLog::eventSyncExecuted(
+        input.frame_token, hmd_position,
+        stage2YawOfForward(hmd_forward), offset, neutral_root);
     FSCommon::report_to_nearby_chat("calibration synced");
 }
 
@@ -2039,6 +2046,10 @@ void executeSync(const FSVRAdapterPlanInput& input,
 // static
 void FSVRCalibration::requestCalibration()
 {
+    // P2-07B feel-regrounding diagnostic: every /xr
+    // calibrate invocation is a bonelog event, refused
+    // ones included (no-op when FS_VR_BONELOG is unset).
+    FSVRBoneLog::eventCalibrateRequested();
     // P2-07B Stage 1 (CP-S1-2): the sync request. CP-1's
     // entry point, rerouted: it raises a pending sync and
     // the next stepped adapter cycle's hook executes it.

@@ -74,6 +74,7 @@
 #include "llviewerdisplay.h"
 #include "llopenxrmanager.h"
 #include "llopenxrtrace.h"
+#include "llvrbonelog.h"
 #include "llviewermedia.h"
 #include "llviewerparcelaskplay.h"
 #include "llviewerparcelmedia.h"
@@ -2539,6 +2540,12 @@ bool LLAppViewer::cleanup()
 
     sTextureFetch->shutDownTextureCacheThread() ;
     LLLFSThread::sLocal->shutdown();
+
+    // P2-07B bonelog: stop the motion recorder's writer
+    // thread with the other workers (drains its queue,
+    // writes its final drop record, joins). No-op unless
+    // FS_VR_BONELOG recording actually started.
+    FSVRBoneLog::shutdown();
 
     LL_INFOS() << "Shutting down OpenGL" << LL_ENDL;
 

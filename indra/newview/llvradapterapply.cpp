@@ -23,6 +23,7 @@
 #include "llvradapterapply.h"
 
 #include "llvrcalibration.h"
+#include "llvrbonelog.h"
 #include "llvrspinesolver.h"
 
 #include <set>
@@ -1651,6 +1652,17 @@ void FSVRAdapterApplyForCharacter(LLCharacter* character, bool preview_cycle)
     // shell). When neither machine has work the hook is two
     // flag reads.
     FSVRCalibration::stepFromAdapterCycle(character, input, result);
+
+    // P2-07B feel-regrounding diagnostic: the per-cycle
+    // motion sample (FS_VR_BONELOG). Taken here, at the
+    // tail, so the skeleton the recorder reads carries
+    // this cycle's committed writes and the step hook --
+    // including any sync it executed -- has already run.
+    // Observation-only: the recorder early-outs on its
+    // cached env bool when disabled and writes nothing
+    // back, ever.
+    FSVRBoneLog::sampleCycle(character, input, result,
+                             hmd_position_read, hmd_position_local);
 }
 
 #endif // FSVR_ADAPTER_PLAN_ONLY
