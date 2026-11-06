@@ -908,6 +908,44 @@ LLVector3 FSVRCalibration::deriveCorneaOffsetHeadLocal(
 }
 
 // static
+LLVector3 FSVRCalibration::deriveNeutralCorneaRootFromBasePose(
+    const FSVRAdapterPlanInput& plan, S32 head_index,
+    const LLVector3& cornea_offset_head_local)
+{
+    // P2-07B Stage 1 pitch fix (CP-PF-1): compose the
+    // cycle's post-blend base pose root-relative -- the
+    // measured recipe's identity-root idiom
+    // (neutralCorneaRootRelative, above) factors the root
+    // frame out by construction, so no separate
+    // re-expression step exists. The locals are the plan
+    // input's base locals -- the arbitrated animation pose
+    // computePlan seeds its base composition from -- NOT
+    // identity: the actual animation locals matter
+    // (PF-R1-01), and no solver output is read anywhere in
+    // this derivation.
+    FSVRAdapterPlanInput root_frame = plan;
+    root_frame.root_world_position = LLVector3::zero;
+    root_frame.root_world_rotation = LLQuaternion();
+    const S32 count = static_cast<S32>(root_frame.joints.size());
+    std::vector<LLQuaternion> base_locals(count);
+    for (S32 i = 0; i < count; ++i)
+    {
+        base_locals[i] = root_frame.joints[i].base_local;
+    }
+    std::vector<LLQuaternion> base_rotations;
+    std::vector<LLVector3> base_positions;
+    FSVRCalibration::composeBindWorlds(root_frame, base_locals,
+                                       base_rotations, base_positions);
+    // The base pose's cornea, in the solver's own form
+    // (llvrspinesolver.cpp): offset * rot[head] + pos[head]
+    // -- over the BASE head transform, so the value is the
+    // cornea the held pose has before any positional
+    // correction is spent on it.
+    return base_positions[head_index] +
+           (cornea_offset_head_local * base_rotations[head_index]);
+}
+
+// static
 bool FSVRCalibration::corneaReconstructionStable(
     const std::vector<LLVector3>& offsets_over_window, F64 tolerance_m)
 {
@@ -1941,10 +1979,17 @@ void executeSync(const FSVRAdapterPlanInput& input,
             "calibration failed: eye reference unavailable");
         return;
     }
-    // Step 4: derive the coherent pair's second half from
-    // this cycle's composed head transform (the section 4.6
-    // lookup shape). Absent mHead, or a non-finite
-    // derivation, refuses with the eye-reference reason.
+    // Step 4: derive the coherent pair's second half (the
+    // section 4.6 lookup shape). The neutral is derived
+    // from this cycle's post-blend base pose, so the
+    // anchor and the neutral describe the same held pose:
+    // pitch and roll cancel in the displacement by
+    // construction (Rule 11) rather than being factored
+    // out of the neutral alone, and no correction the
+    // solver spent under a previous neutral can enter the
+    // new reference (PF-R1-01). Absent mHead, or a
+    // non-finite derivation, refuses with the
+    // eye-reference reason.
     S32 head_index = -1;
     for (S32 i = 0; i < static_cast<S32>(input.joints.size()); ++i)
     {
@@ -1968,7 +2013,8 @@ void executeSync(const FSVRAdapterPlanInput& input,
             result.resolved_world_positions[head_index],
             result.resolved_world_rotations[head_index]);
     const LLVector3 neutral_root =
-        neutralCorneaRootRelative(input, head_index, offset);
+        FSVRCalibration::deriveNeutralCorneaRootFromBasePose(
+            input, head_index, offset);
     if (!finiteVec(offset) || !finiteVec(neutral_root))
     {
         FSCommon::report_to_nearby_chat(

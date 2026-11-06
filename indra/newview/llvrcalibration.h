@@ -704,6 +704,25 @@ public:
         const LLVector3& cornea_midpoint_world,
         const LLVector3& head_world_position,
         const LLQuaternion& head_world_rotation);
+    // P2-07B Stage 1 pitch fix (CP-PF-1): the provisional
+    // sync's neutral cornea, derived from the sync cycle's
+    // post-blend BASE pose -- the plan input's own base
+    // locals composed over an identity root frame, in the
+    // measured recipe's root-relative idiom -- instead of
+    // the bind composition. The anchor and the neutral then
+    // describe the same held pose: whatever pitch or roll
+    // the pose carries appears on both sides of the
+    // reference pair and cancels in the displacement
+    // (Rule 11 by cancellation, never by factoring one
+    // side). The base locals are read BEFORE any positional
+    // correction is spent, so a Resync taken under an
+    // active correction cannot install that correction as
+    // the new reference (PF-R1-01). No solver output and no
+    // stored pose is read. Pure over its arguments; H5
+    // group G fixtures this exact function.
+    static LLVector3 deriveNeutralCorneaRootFromBasePose(
+        const FSVRAdapterPlanInput& plan, S32 head_index,
+        const LLVector3& cornea_offset_head_local);
     // Section 4.6 check (iii): repeated reconstructions
     // over the window agree within the section 3.2
     // recomposition-derived tolerance.
