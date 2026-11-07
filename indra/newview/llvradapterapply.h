@@ -626,6 +626,17 @@ struct FSVRAdapterPlanResult
     // receives.
     std::vector<LLQuaternion> base_world_rotations;
     std::vector<LLVector3> base_world_positions;
+    // P2-07B Fix 4 (CP-F4-3, instrumentation only): the
+    // spine solver's returned target worlds, retained
+    // verbatim -- assigned in computePlan immediately after
+    // solveSpine returns, before any clamping or
+    // commit-local conversion -- so the recorder can carry
+    // them (the bonelog's optional solver_targets array).
+    // Empty whenever the solver was not invoked (gate
+    // failures, the hold branch, no spine authority).
+    // Nothing in the plan reads this field; retaining it
+    // changes no behaviour (F4-Z1 A/B).
+    std::map<S32, LLQuaternion> solver_target_worlds;
     // Write-through boundary outcomes, per side (zero when the
     // boundary did not run for that side).
     FSVRAdapterArmOutcome arm_outcome_left;
@@ -675,6 +686,107 @@ bool composeHeadTargetBlock(
     F32 lean_gain,
     LLVector3& out_head_target_world,
     LLVector3& out_cornea_offset_head_local);
+
+// ---------------------------------------------------------------------------
+// P2-07B Fix 4 (brief sections 2.2/2.3/2.5): base
+// provenance -- the pure seam the glue drives so the plan
+// is presented a base that excludes the adapter's own
+// prior commits (INV-F4-01). Per tracked joint the store
+// keeps three distinct facts, never conflated:
+//   anim_local:          the joint's animation-attributed
+//                        local -- the value presented as
+//                        the base. Initially the joint's
+//                        rest/current local (seeded before
+//                        its first adapter write, F4-S6).
+//   commit_local:        the adapter's most recent write.
+//                        Authorship history only: read by
+//                        nothing but diagnostics.
+//   expected_live_local: the live skeleton's expected
+//                        local as of the last classified
+//                        blend result or applied write --
+//                        the LINEAGE live locals are
+//                        compared against. It is the only
+//                        comparison reference; it is never
+//                        the last commit after a blend has
+//                        intervened [R2].
+// Classification of a joint's cycle comes from the blend
+// path's own observation (the generalized DIAG-1 sink),
+// never from comparing quaternions for equality: equality
+// cannot distinguish "the animation stack produced the
+// commit's value afresh" from "nothing overwrote the
+// commit" [R1].
+// ---------------------------------------------------------------------------
+enum class FSVRBaseBlendClass
+{
+    NO_WRITE,       // the blend did not write the joint
+    SEED_DISCARDED, // a seed-discarding write: the live
+                    // local is animation output entire
+    SEED_PRESERVED  // an additive-only write: the live
+                    // local factors as added_rot * seed
+};
+
+// One joint's blend outcome for one cycle, as the glue
+// reads it from the generation-validated blend record.
+// present is false when the record carries no current
+// entry for the joint (not written this pass -- which the
+// caller must not confuse with a classified NO_WRITE for
+// a joint the store already tracks; see
+// provenanceAssembly's fail-closed rule).
+struct FSVRBaseBlendFact
+{
+    bool present = false;
+    FSVRBaseBlendClass blend_class = FSVRBaseBlendClass::NO_WRITE;
+    LLQuaternion seed_local;
+    LLQuaternion added_rot;
+    LLQuaternion result_local;
+};
+
+struct FSVRBaseProvenanceEntry
+{
+    bool has_commit = false;
+    LLQuaternion anim_local;
+    LLQuaternion commit_local;
+    LLQuaternion expected_live_local;
+};
+
+// Keyed by joint name (as the bonelog header's plan-joint
+// list is keyed): a plan-list index shift between cycles
+// can never misattribute provenance.
+struct FSVRBaseProvenanceStore
+{
+    std::map<std::string, FSVRBaseProvenanceEntry> entries;
+    // Provenance of joints temporarily absent from the
+    // presented set, preserved under the same character /
+    // skeleton ownership [FIX4-CODE-R1-02]: excluded from
+    // active processing while absent, restored verbatim
+    // on re-entry, and cleared wholesale with the store
+    // on an ownership reset (provenanceReset). Bounded
+    // by the set of names ever presented under this
+    // ownership.
+    std::map<std::string, FSVRBaseProvenanceEntry> dormant;
+};
+
+enum class FSVRBaseProvenanceEventKind
+{
+    RESET,
+    UNCLASSIFIED
+};
+
+// A provenance event the glue surfaces on the bonelog.
+// joint_name empty names the whole store (a wholesale
+// reset). reason carries the lifecycle cause for RESET
+// ("character_change", "skeleton_reinit", "membership",
+// "record_unavailable", "record_inconsistent");
+// divergence_deg carries the seed-gate divergence for
+// UNCLASSIFIED.
+struct FSVRBaseProvenanceEvent
+{
+    FSVRBaseProvenanceEventKind kind =
+        FSVRBaseProvenanceEventKind::RESET;
+    std::string joint_name;
+    std::string reason;
+    F32 divergence_deg = 0.f;
+};
 
 class FSVRAdapterApply
 {
@@ -732,6 +844,73 @@ public:
                                   U64 previous_continuity_epoch,
                                   U64 install_generation,
                                   U64 previous_install_generation);
+
+    // P2-07B Fix 4 (CP-F4-1): the pure base-provenance
+    // seam. Defined above the plan-only line beside
+    // continuityCarries; the glue owns the store and the
+    // lifecycle detection, these functions own the rules.
+    //
+    // provenanceReset clears the store (active and
+    // dormant entries alike) and seeds every
+    // listed joint from its base_local (at reset time the
+    // joint's current local, read by the caller before any
+    // adapter write of the new ownership), emitting ONE
+    // wholesale RESET event (empty joint name).
+    static void provenanceReset(
+        FSVRBaseProvenanceStore& store,
+        const std::vector<FSVRAdapterJointInput>& joints,
+        const char* reason,
+        std::vector<FSVRBaseProvenanceEvent>& events);
+    //
+    // provenanceAssembly runs one cycle's classification.
+    // On entry each joint's base_local is its LIVE local
+    // (the glue's population read); on exit, a tracked
+    // joint's base_local is its animation-attributed local
+    // (the presented base) and an untracked joint's is its
+    // live local, adopted as its tracked value from this
+    // cycle. facts is parallel to joints. Membership is
+    // reconciled first: a stored joint absent from the
+    // list leaves the active set with a per-joint RESET
+    // event ("membership") and its provenance moves to
+    // the store's dormant map, preserved under the same
+    // ownership [FIX4-CODE-R1-02]; a listed joint with a
+    // dormant entry is restored from it, never re-seeded
+    // from a live local that may still be an old commit;
+    // a listed joint with no entry at all is seeded
+    // silently from its live local (sound only because
+    // first sight under an ownership precedes any adapter
+    // write to it, F4-S6). A TRACKED joint
+    // whose fact is unavailable (record_valid false, or
+    // the entry for it absent) fails closed WITHOUT
+    // losing provenance [FIX4-CODE-R1-01]: the RESET
+    // event ("record_unavailable" /
+    // "record_inconsistent") is emitted, the trusted
+    // animation local is presented, and the commit
+    // history and live lineage are retained untouched --
+    // a stale or absent observation is never silently
+    // read as NO_WRITE [R3 verdict safeguard], and it
+    // never re-seeds from a live local that may be the
+    // adapter's own commit.
+    static void provenanceAssembly(
+        FSVRBaseProvenanceStore& store,
+        std::vector<FSVRAdapterJointInput>& joints,
+        const std::vector<FSVRBaseBlendFact>& facts,
+        bool record_valid,
+        std::vector<FSVRBaseProvenanceEvent>& events);
+    //
+    // provenanceCommitWrites refreshes the store for the
+    // writes a plan result actually applied (the caller
+    // passes result.writes verbatim, after applying them):
+    // per written joint, has_commit is set and both
+    // commit_local and expected_live_local take the write
+    // value, in write order (last wins, as the skeleton
+    // applies them). Gate-failed, token-suppressed and
+    // refused results carry empty writes and refresh
+    // nothing -- exactly the brief's rule.
+    static void provenanceCommitWrites(
+        FSVRBaseProvenanceStore& store,
+        const std::vector<FSVRAdapterJointInput>& joints,
+        const std::vector<FSVRAdapterWrite>& writes);
 
     // The pure plan (brief section 4). No globals, no cross-cycle
     // pose state: identical inputs give identical outputs.

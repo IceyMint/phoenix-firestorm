@@ -306,6 +306,134 @@ int main(int argc, char** argv)
     check(line.find("source_integrity") == std::string::npos,
           "v2 blend entry whose validation passed omits the "
           "integrity marker (CODE-R1-01)");
+
+    // 9. Fix 4 (F4-F1/F2): the plan block's optional
+    // solver_targets array, and the two provenance event
+    // records. Built locally (the augmented sample is also
+    // appended as record 11 below so the on-disk file
+    // carries one, for v1/DIAG-1/DIAG-2 parser compat).
+    {
+        FSVRBoneLogPlanData plan_f4 = plan;
+        plan_f4.gate_name = nullptr;
+        plan_f4.base_locals[1] = qid;
+        std::string f4_absent_line;
+        FSVRBoneLog::buildSampleRecordV2(
+            f4_absent_line, 123456797LL, 4246,
+            true, LLVector3(0.125f, 1.625f, -0.375f),
+            true, LLQuaternion(0.f, 0.f, 0.f, 1.f),
+            LLVector3(10.f, 20.f, 30.f),
+            LLQuaternion(0.f, 0.f, 0.f, 1.f),
+            true, LLVector3(10.5f, 21.5f, 29.5f),
+            LLQuaternion(0.f, 0.f, 0.f, 1.f),
+            bone_pos, bone_rot,
+            true, LLVector3(-0.1f, 0.2f, -0.3f), 0.0125f,
+            &plan_f4, &headrot, &blend);
+        check(f4_absent_line.find("solver_targets") ==
+                  std::string::npos,
+              "F4-F1: no retained targets -> the key is "
+              "absent, parse identical to pre-Fix-4");
+
+        plan_f4.solver_targets_present = true;
+        plan_f4.solver_targets = {qx, qid, qx, qid};
+        plan_f4.solver_target_mask = {1, 0, 1, 0};
+        std::string f4_line;
+        FSVRBoneLog::buildSampleRecordV2(
+            f4_line, 123456797LL, 4246,
+            true, LLVector3(0.125f, 1.625f, -0.375f),
+            true, LLQuaternion(0.f, 0.f, 0.f, 1.f),
+            LLVector3(10.f, 20.f, 30.f),
+            LLQuaternion(0.f, 0.f, 0.f, 1.f),
+            true, LLVector3(10.5f, 21.5f, 29.5f),
+            LLQuaternion(0.f, 0.f, 0.f, 1.f),
+            bone_pos, bone_rot,
+            true, LLVector3(-0.1f, 0.2f, -0.3f), 0.0125f,
+            &plan_f4, &headrot, &blend);
+        check(f4_line.find("\"solver_targets\":[[") !=
+                  std::string::npos,
+              "F4-F1: retained targets serialize as the "
+              "solver_targets array");
+        check(f4_line.find("\"target_vs_observed\":{") !=
+                  std::string::npos,
+              "F4-F2: target_vs_observed block present and "
+              "unchanged alongside solver_targets");
+        boost::property_tree::ptree f4_tree;
+        check(parseLine(f4_line, f4_tree),
+              "F4-F1: the augmented sample parses");
+        const boost::property_tree::ptree& f4_plan =
+            f4_tree.get_child("plan");
+        check(f4_plan.count("solver_targets") == 1,
+              "F4-F1: parsed plan carries solver_targets");
+        const boost::property_tree::ptree& f4_targets =
+            f4_plan.get_child("solver_targets");
+        check(f4_targets.size() == plan_names.size(),
+              "F4-F1: solver_targets is parallel to the "
+              "plan joint list");
+        size_t ti = 0;
+        for (const auto& tentry : f4_targets)
+        {
+            if (ti % 2 == 0)
+            {
+                check(tentry.second.size() == 4 &&
+                          near(ptreeFloat(
+                                   tentry.second.front().second),
+                               0.5f),
+                      "F4-F1: targeted joint serializes its "
+                      "world quaternion");
+            }
+            else
+            {
+                check(tentry.second.size() == 0,
+                      "F4-F1: untargeted joint carries no "
+                      "quaternion (null in the raw text, "
+                      "checked below)");
+            }
+            ++ti;
+        }
+        // Nulls are asserted on the raw text (a JSON
+        // parser cannot distinguish null from a missing
+        // key by value -- the house pattern for the gate
+        // null above).
+        check(f4_line.find("],null,[") != std::string::npos &&
+                  f4_line.find(",null]") != std::string::npos,
+              "F4-F1: untargeted joints serialize as null");
+        lines.push_back(f4_line);
+
+        // Provenance event records.
+        std::string ev_line;
+        FSVRBoneLog::buildBaseProvenanceResetRecord(
+            ev_line, 123456799LL, "mSpine2", "membership");
+        boost::property_tree::ptree ev_tree;
+        check(parseLine(ev_line, ev_tree) &&
+                  ev_tree.get<std::string>("event", "") ==
+                      "base_provenance_reset" &&
+                  ev_tree.get<std::string>("joint", "") ==
+                      "mSpine2" &&
+                  ev_tree.get<std::string>("reason", "") ==
+                      "membership",
+              "F4: per-joint provenance reset record "
+              "round-trips");
+        FSVRBoneLog::buildBaseProvenanceResetRecord(
+            ev_line, 123456800LL, nullptr, "character_change");
+        check(ev_line.find("\"joint\":null") !=
+                  std::string::npos &&
+                  ev_line.find("\"reason\":\"character_change\"") !=
+                      std::string::npos,
+              "F4: wholesale reset serializes joint:null "
+              "with its reason");
+        FSVRBoneLog::buildBaseProvenanceUnclassifiedRecord(
+            ev_line, 123456801LL, "mNeck", 12.5f);
+        boost::property_tree::ptree un_tree;
+        check(parseLine(ev_line, un_tree) &&
+                  un_tree.get<std::string>("event", "") ==
+                      "base_provenance_unclassified" &&
+                  un_tree.get<std::string>("joint", "") ==
+                      "mNeck" &&
+                  near(ptreeFloat(un_tree.get_child(
+                           "seed_divergence_deg")),
+                       12.5f),
+              "F4: unclassified record round-trips with its "
+              "divergence");
+    }
     check(v2_bare_line.find("\"headrot\"") == std::string::npos &&
               v2_bare_line.find("\"blend\"") == std::string::npos,
           "absent captures serialize as absent blocks");

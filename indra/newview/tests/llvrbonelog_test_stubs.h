@@ -22,6 +22,7 @@
 #define LL_LLVRBONELOG_TEST_STUBS_H
 
 #include <chrono>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -109,6 +110,9 @@ struct FSVRAdapterPlanResult
     FSVRAdapterGate first_failing_gate = FSVRAdapterGate::NONE;
     bool spine_solver_invoked = false;
     bool head_group_refusal = false;
+    // Fix 4 (CP-F4-3): mirrored because llvrbonelog.cpp
+    // reads it in the plan-block fill.
+    std::map<S32, LLQuaternion> solver_target_worlds;
     std::vector<S32> writes;
     std::vector<LLQuaternion> resolved_locals;
     std::vector<LLQuaternion> resolved_world_rotations;

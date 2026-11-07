@@ -298,6 +298,31 @@ void appendPlanBlock(std::string& out,
     out += ",\"resolved_worlds\":";
     appendWorldArray(out, plan.resolved_world_positions,
                      plan.resolved_world_rotations);
+    // P2-07B Fix 4 (CP-F4-3): the retained solver target
+    // worlds, in plan-joint order, present only when the
+    // plan carried any; untargeted joints serialize as
+    // null. Absent entirely otherwise (F4-F1).
+    if (plan.solver_targets_present)
+    {
+        out += ",\"solver_targets\":[";
+        for (size_t i = 0; i < plan.solver_targets.size(); ++i)
+        {
+            if (i > 0)
+            {
+                out += ',';
+            }
+            if (i < plan.solver_target_mask.size() &&
+                plan.solver_target_mask[i])
+            {
+                appendQuat(out, plan.solver_targets[i]);
+            }
+            else
+            {
+                out += "null";
+            }
+        }
+        out += ']';
+    }
     out += ",\"domains\":[";
     for (size_t i = 0; i < plan.domains.size(); ++i)
     {
@@ -572,6 +597,55 @@ void FSVRBoneLog::buildDropsRecord(std::string& out,
     out += ",\"dropped\":";
     out += std::to_string(
         static_cast<unsigned long long>(dropped_total));
+    out += "}\n";
+}
+
+// static
+void FSVRBoneLog::buildBaseProvenanceResetRecord(
+    std::string& out,
+    long long t_ms,
+    const char* joint_name,
+    const char* reason)
+{
+    out.clear();
+    out += "{\"event\":\"base_provenance_reset\",\"t_ms\":";
+    out += std::to_string(t_ms);
+    out += ",\"joint\":";
+    if (joint_name)
+    {
+        appendJsonString(out, joint_name);
+    }
+    else
+    {
+        out += "null";
+    }
+    out += ",\"reason\":";
+    appendJsonString(out, reason ? reason : "");
+    out += "}\n";
+}
+
+// static
+void FSVRBoneLog::buildBaseProvenanceUnclassifiedRecord(
+    std::string& out,
+    long long t_ms,
+    const char* joint_name,
+    F32 divergence_deg)
+{
+    out.clear();
+    out += "{\"event\":\"base_provenance_unclassified\","
+           "\"t_ms\":";
+    out += std::to_string(t_ms);
+    out += ",\"joint\":";
+    if (joint_name)
+    {
+        appendJsonString(out, joint_name);
+    }
+    else
+    {
+        out += "null";
+    }
+    out += ",\"seed_divergence_deg\":";
+    appendFloat(out, divergence_deg);
     out += "}\n";
 }
 
@@ -1464,6 +1538,37 @@ void sampleCycleImpl(LLCharacter* character,
     plan.head_group_refusal = result.head_group_refusal;
     plan.writes_count =
         static_cast<U32>(result.writes.size());
+    // P2-07B Fix 4 (CP-F4-3): the result's retained solver
+    // target worlds, re-expressed in plan-joint order;
+    // joints the solver did not target serialize as null.
+    // An empty retention (the solver never ran, or
+    // returned no targets) leaves the array absent
+    // entirely (F4-F1). The scratch is reused across
+    // cycles, so the vectors are rebuilt every cycle.
+    plan.solver_targets_present =
+        !result.solver_target_worlds.empty();
+    plan.solver_targets.clear();
+    plan.solver_target_mask.clear();
+    if (plan.solver_targets_present)
+    {
+        plan.solver_targets.reserve(input.joints.size());
+        plan.solver_target_mask.reserve(input.joints.size());
+        for (S32 i = 0;
+             i < static_cast<S32>(input.joints.size()); ++i)
+        {
+            auto it = result.solver_target_worlds.find(i);
+            if (it != result.solver_target_worlds.end())
+            {
+                plan.solver_targets.push_back(it->second);
+                plan.solver_target_mask.push_back(1);
+            }
+            else
+            {
+                plan.solver_targets.push_back(LLQuaternion());
+                plan.solver_target_mask.push_back(0);
+            }
+        }
+    }
 
     FSVRBoneLog::buildSampleRecordV2(
         state.scratch, nowMs(), input.frame_token,
@@ -1570,6 +1675,56 @@ void FSVRBoneLog::eventSyncExecuted(
                                 anchor_forward_yaw_rad,
                                 cornea_offset_head_local,
                                 neutral_cornea_root);
+        enqueueLine(state.scratch);
+    }
+    catch (...)
+    {
+        s_hard_disabled.store(true);
+    }
+}
+
+// static
+void FSVRBoneLog::eventBaseProvenanceReset(const char* joint_name,
+                                           const char* reason)
+{
+    if (!enabled() || s_hard_disabled.load())
+    {
+        return;
+    }
+    try
+    {
+        BoneLogState& state = bonelogState();
+        if (state.writer_failed.load())
+        {
+            return;
+        }
+        buildBaseProvenanceResetRecord(state.scratch, nowMs(),
+                                       joint_name, reason);
+        enqueueLine(state.scratch);
+    }
+    catch (...)
+    {
+        s_hard_disabled.store(true);
+    }
+}
+
+// static
+void FSVRBoneLog::eventBaseProvenanceUnclassified(
+    const char* joint_name, F32 divergence_deg)
+{
+    if (!enabled() || s_hard_disabled.load())
+    {
+        return;
+    }
+    try
+    {
+        BoneLogState& state = bonelogState();
+        if (state.writer_failed.load())
+        {
+            return;
+        }
+        buildBaseProvenanceUnclassifiedRecord(
+            state.scratch, nowMs(), joint_name, divergence_deg);
         enqueueLine(state.scratch);
     }
     catch (...)

@@ -584,8 +584,10 @@ void LLPoseBlender::blendAndApply()
     // P2-07B DIAG-1 (brief section 2.5): stamp this pass's
     // generation, reset the observed joints' written flags
     // (a joint skipped this pass must not present last
-    // pass's record as current), and install the sinks for
-    // the two observed joints on their blenders.
+    // pass's record as current), and install the sinks on
+    // their blenders. Fix 4 generalizes "the observed
+    // joints" from neck/head to the 16 adapter-written
+    // joints.
     ++mBlendObsGeneration;
     mBlendObs.generation = mBlendObsGeneration;
     mBlendObs.neck.written = false;
@@ -594,6 +596,16 @@ void LLPoseBlender::blendAndApply()
     mBlendObs.head.written = false;
     mBlendObs.head.slot_count = 0;
     mBlendObs.head.source_integrity_failure = false;
+    // Fix 4: the reset and the sink install cover all 16
+    // observed joints, resolved by name through the one
+    // mapping (llpose.h). A joint skipped this pass
+    // presents no record for any of the 16.
+    for (S32 i = 0; i < 14; ++i)
+    {
+        mBlendObs.others[i].written = false;
+        mBlendObs.others[i].slot_count = 0;
+        mBlendObs.others[i].source_integrity_failure = false;
+    }
     for (blender_list_t::iterator iter = mActiveBlenders.begin();
          iter != mActiveBlenders.end(); ++iter)
     {
@@ -602,15 +614,8 @@ void LLPoseBlender::blendAndApply()
         const LLJoint* joint = jsbp->targetJoint();
         if (joint)
         {
-            const std::string& name = joint->getName();
-            if (name == "mNeck")
-            {
-                sink = &mBlendObs.neck;
-            }
-            else if (name == "mHead")
-            {
-                sink = &mBlendObs.head;
-            }
+            sink = fsvrBlendObsEntry(mBlendObs,
+                                     joint->getName());
         }
         jsbp->setObsSink(sink, mBlendObsGeneration);
     }

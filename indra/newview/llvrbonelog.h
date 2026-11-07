@@ -108,6 +108,17 @@ struct FSVRBoneLogPlanData
     bool spine_solver_invoked = false;
     bool head_group_refusal = false;
     U32 writes_count = 0;
+    // P2-07B Fix 4 (CP-F4-3): the plan result's retained
+    // solver target worlds, parallel to the plan joint
+    // list. Serialized only when solver_targets_present
+    // (the solver ran and returned at least one target);
+    // entries whose mask is 0 serialize as null. Absent
+    // entirely otherwise, so pre-Fix-4 parses of the plan
+    // block are unchanged (F4-F1) and target_vs_observed
+    // is untouched (F4-F2).
+    bool solver_targets_present = false;
+    std::vector<LLQuaternion> solver_targets;
+    std::vector<char> solver_target_mask;
 };
 
 struct FSVRBoneLogHeadRotSample
@@ -224,6 +235,21 @@ public:
         const LLVector3& cornea_offset_head_local,
         const LLVector3& neutral_cornea_root);
 
+    // P2-07B Fix 4 (brief section 2.5): base-provenance
+    // lifecycle events, emitted by the adapter glue when
+    // the provenance seam reports them. A reset with
+    // joint_name nullptr is a wholesale reset (character
+    // change, skeleton reinit); a named reset is a
+    // per-joint invalidation (membership loss, unavailable
+    // or inconsistent blend record). Unclassified carries
+    // the seed-gate divergence that dropped an additive
+    // contribution. No silent fallbacks: every provenance
+    // discontinuity the seam detects lands here.
+    static void eventBaseProvenanceReset(const char* joint_name,
+                                         const char* reason);
+    static void eventBaseProvenanceUnclassified(
+        const char* joint_name, F32 divergence_deg);
+
     // Orderly stop at viewer exit: signals the writer thread
     // to drain the queue, emit its final drop record, close
     // the file and exit, then joins it. Called from
@@ -267,6 +293,18 @@ public:
     static void buildDropsRecord(std::string& out,
                                  long long t_ms,
                                  U64 dropped_total);
+    // Fix 4 provenance events (see eventBaseProvenance*).
+    // joint_name nullptr serializes "joint":null.
+    static void buildBaseProvenanceResetRecord(
+        std::string& out,
+        long long t_ms,
+        const char* joint_name,
+        const char* reason);
+    static void buildBaseProvenanceUnclassifiedRecord(
+        std::string& out,
+        long long t_ms,
+        const char* joint_name,
+        F32 divergence_deg);
     // hmd_q_valid false serializes "q":null (position kept);
     // hmd_valid false serializes the whole "hmd" as null.
     // camera_valid false serializes "camera":null.

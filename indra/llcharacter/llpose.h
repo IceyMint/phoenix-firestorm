@@ -134,7 +134,81 @@ struct FSVRBlendObsRecord
     U64             generation = 0;
     FSVRBlendObsJoint neck;
     FSVRBlendObsJoint head;
+    // P2-07B Fix 4 (brief section 4): the observation
+    // generalizes from neck/head to all 16 adapter-written
+    // joints. The dedicated neck/head fields are retained
+    // (the DIAG-1 recorder serializes the blend block from
+    // them, and the headrot seed path reads them); others[]
+    // carries the remaining 14 in fsvrBlendObsJointNames()
+    // order. Observation-only under the same D1-Z standard:
+    // the sinks copy values the blend already computed and
+    // feed nothing back, for every joint alike.
+    FSVRBlendObsJoint others[14];
 };
+
+// Fix 4: the observed joint set -- the adapter's written
+// set (the calibration hold list). neck/head resolve to
+// the dedicated record fields; the remaining names index
+// into others[] in this order.
+inline const char* const* fsvrBlendObsJointNames()
+{
+    static const char* const names[16] = {
+        "mNeck", "mHead",
+        "mSpine1", "mSpine2", "mTorso", "mSpine3", "mSpine4",
+        "mChest", "mCollarLeft", "mShoulderLeft",
+        "mElbowLeft", "mWristLeft", "mCollarRight",
+        "mShoulderRight", "mElbowRight", "mWristRight"};
+    return names;
+}
+
+const S32 FSVR_BLEND_OBS_JOINT_COUNT = 16;
+
+// Name -> record entry, or nullptr for an unobserved
+// name. The recorder and the Fix 4 provenance
+// classification both resolve through this one mapping.
+inline FSVRBlendObsJoint* fsvrBlendObsEntry(
+    FSVRBlendObsRecord& record, const std::string& name)
+{
+    if (name == "mNeck")
+    {
+        return &record.neck;
+    }
+    if (name == "mHead")
+    {
+        return &record.head;
+    }
+    const char* const* names = fsvrBlendObsJointNames();
+    for (S32 i = 2; i < FSVR_BLEND_OBS_JOINT_COUNT; ++i)
+    {
+        if (name == names[i])
+        {
+            return &record.others[i - 2];
+        }
+    }
+    return nullptr;
+}
+
+inline const FSVRBlendObsJoint* fsvrBlendObsEntry(
+    const FSVRBlendObsRecord& record, const std::string& name)
+{
+    if (name == "mNeck")
+    {
+        return &record.neck;
+    }
+    if (name == "mHead")
+    {
+        return &record.head;
+    }
+    const char* const* names = fsvrBlendObsJointNames();
+    for (S32 i = 2; i < FSVR_BLEND_OBS_JOINT_COUNT; ++i)
+    {
+        if (name == names[i])
+        {
+            return &record.others[i - 2];
+        }
+    }
+    return nullptr;
+}
 
 // Assembly-time attribution (brief section 2.5): a slot is
 // stamped iff its consumed state pointer IS the published
@@ -255,6 +329,23 @@ struct FSVRBlendObsConsumer
             return nullptr;
         }
         return &entry;
+    }
+
+    // Fix 4: name-resolved entry under the same freshness
+    // contract (written this pass, with the record's own
+    // generation); nullptr for unobserved names and for
+    // stale or unwritten entries.
+    const FSVRBlendObsJoint* entryFor(const FSVRBlendObsRecord& record,
+                                      const std::string& name) const
+    {
+        const FSVRBlendObsJoint* entry =
+            fsvrBlendObsEntry(record, name);
+        if (!entry || !entry->written ||
+            entry->generation != record.generation)
+        {
+            return nullptr;
+        }
+        return entry;
     }
 };
 
