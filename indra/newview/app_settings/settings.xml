@@ -161,6 +161,28 @@
       <key>Value</key>
       <boolean>false</boolean>
     </map>
+    <key>FSVRTeleportDetectorProven</key>
+    <map>
+      <key>Comment</key>
+      <string>P2-07B Fix 3 R5 [FIX3-R5-CODE-02]: the positional teleport detector's measured-band gate. False (default): the legitimate-movement and teleport displacement bands have not yet been measured and proven separable, so live root-follow stays OFF (fail closed) while the detector records band evidence. Set true only after the band measurement is recorded in the bonelog and judged separable.</string>
+      <key>Persist</key>
+      <integer>1</integer>
+      <key>Type</key>
+      <string>Boolean</string>
+      <key>Value</key>
+      <boolean>false</boolean>
+    </map>
+    <key>FSVRShowPostureIndicator</key>
+    <map>
+      <key>Comment</key>
+      <string>P2-07B Fix 3 R5 (brief 8.2): show the persistent in-world avatar-state indicator (AVATAR / BEHAVIOUR / ROOT lines) above the avatar during VR sessions. On during validation; toggleable for ordinary use.</string>
+      <key>Persist</key>
+      <integer>1</integer>
+      <key>Type</key>
+      <string>Boolean</string>
+      <key>Value</key>
+      <boolean>true</boolean>
+    </map>
     <key>FSVRRootResponseGain</key>
     <map>
       <key>Comment</key>

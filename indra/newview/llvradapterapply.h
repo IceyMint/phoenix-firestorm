@@ -99,6 +99,613 @@ FSVRPostureBehaviour fsvrEffectivePostureBehaviour(
 const char* fsvrPostureName(FSVRPosture posture);
 const char* fsvrPostureBehaviourName(FSVRPostureBehaviour behaviour);
 
+// ---------------------------------------------------------------------------
+// P2-07B Fix 3 R5 (brief sections 2.1-2.3): the avatar-state
+// vocabulary. R5 supersedes the sync-declared posture as the
+// behaviour authority: the avatar's CURRENT in-world state,
+// sampled by the glue from live avatar facts, classifies into
+// one of these logical states, and behaviour selection (P2)
+// consumes the classification -- never the sync's flavour
+// stamp (which remains a calibration record only) and never
+// the user's physical posture.
+// ---------------------------------------------------------------------------
+
+// The avatar's ground-sit motion evidence for one sample, as
+// the classifier needs it (brief section 2.2): the stock
+// ground-sit loading-motion guard makes an ACTIVE ground
+// state incompatible with a settled ground sit; a loading or
+// otherwise unavailable motion read is its own value, never
+// folded into ACTIVE or INACTIVE.
+enum class FSVRGroundMotion : U8
+{
+    INACTIVE = 0,   // ANIM_AGENT_SIT_GROUND_CONSTRAINED inactive
+    ACTIVE   = 1,   // ANIM_AGENT_SIT_GROUND_CONSTRAINED active
+    UNKNOWN  = 2,   // loading / motion state unavailable
+};
+
+// One raw sample of the avatar facts the classifier reads,
+// assembled by the glue from the live avatar at the apply
+// point (after updateCharacter's parent reconciliation for
+// the same frame). Pure data; the classifier below is the
+// only interpretation of these facts.
+struct FSVRAvatarStateSample
+{
+    bool avatar_valid = false;      // the self avatar exists
+    bool sitting_flag = false;      // LLVOAvatar::isSitting()
+    bool parent_present = false;    // getParent() non-null
+    // The parent is the avatar's root prim (an object sit).
+    // False with parent_present true means the parent could
+    // not be resolved as an object sit this sample.
+    bool parent_is_object = false;
+    FSVRGroundMotion ground_motion = FSVRGroundMotion::UNKNOWN;
+};
+
+// The classified logical avatar state for one sample (brief
+// section 2.1). SITTING_SUBTYPE_UNKNOWN is a SITTING state
+// for every behaviour purpose (brief section 2.3: sitting is
+// sitting); the subtype is a diagnostic label only.
+enum class FSVRAvatarPostureState : U8
+{
+    INVALID                 = 0,   // no self avatar to sample
+    UNKNOWN                 = 1,   // facts contradictory/unreadable
+    STANDING                = 2,
+    SITTING_OBJECT          = 3,
+    SITTING_GROUND          = 4,
+    SITTING_SUBTYPE_UNKNOWN = 5,
+};
+
+// The classification truth table (brief section 2.2, with
+// the plan's extension rows), a pure function of the sample:
+//   avatar invalid                              -> INVALID
+//   sitting, parent present, parent is object   -> SITTING_OBJECT
+//   sitting, no parent, ground ACTIVE           -> SITTING_GROUND
+//     (the ground-sit motion IS the ground sit: its
+//     start/stop drives sitDown(true/false) in the stock
+//     animation-state path, and updateCharacter's
+//     reconciliation preserves an unparented sit exactly
+//     while that motion is active)
+//   sitting, no parent, ground INACTIVE         -> UNKNOWN
+//     (the flag says sitting but the motion that would
+//     hold the sit is neither active nor loading: the
+//     stock reconciliation retires such a sit the same
+//     frame -- contradictory, never guessed)
+//   sitting, no parent, ground UNKNOWN          -> SITTING_SUBTYPE_UNKNOWN
+//   sitting, parent present, parent unresolved  -> SITTING_SUBTYPE_UNKNOWN
+//   not sitting, no parent, ground INACTIVE     -> STANDING
+//   not sitting, no parent, ground ACTIVE       -> UNKNOWN
+//   not sitting, no parent, ground UNKNOWN      -> UNKNOWN
+//   not sitting, parent present (any ground)    -> UNKNOWN
+//     (a parented avatar whose sitting flag is clear
+//     contradicts the stock setParent contract)
+// No row consults head height, HMD pose, eye height,
+// calibration state or history: the classification is a
+// function of this sample alone (brief sections 2.2, 7).
+FSVRAvatarPostureState fsvrClassifyAvatarState(
+    const FSVRAvatarStateSample& sample);
+
+// Record/display names for the R5 states (the gateName
+// idiom): stable strings the bonelog and the in-world
+// diagnostic use, produced in one place.
+const char* fsvrAvatarPostureStateName(FSVRAvatarPostureState state);
+const char* fsvrGroundMotionName(FSVRGroundMotion motion);
+
+// True for every state whose behaviour is the sitting
+// behaviour (brief section 2.3): the two resolved subtypes
+// and the subtype-unknown state alike.
+bool fsvrAvatarStateIsSitting(FSVRAvatarPostureState state);
+
+// [FIX3-R5-CODE-03] The glue's lifecycle identity: the
+// character object, its skeleton-rebuild generation and
+// the posture install generation. A home base, a watch
+// expectation or a tracked posture belongs to ONE
+// lifecycle; any change of identity retires all three
+// before another root-follow write, so a reconstructed
+// or replaced avatar can never inherit the previous
+// avatar's home base through a STANDING -> STANDING
+// non-transition.
+struct FSVRGlueLifecycleKey
+{
+    const void* character = nullptr;
+    U64 skeleton_generation = 0;
+    U32 install_generation = 0;
+
+    bool operator==(const FSVRGlueLifecycleKey& other) const
+    {
+        return character == other.character &&
+               skeleton_generation == other.skeleton_generation &&
+               install_generation == other.install_generation;
+    }
+    bool operator!=(const FSVRGlueLifecycleKey& other) const
+    {
+        return !(*this == other);
+    }
+};
+
+// The persistent in-world indicator's three lines
+// (brief section 8.2), a pure function of the facts the
+// cycle actually consumed -- the indicator never infers
+// posture on its own. Line 1 names the sampled state,
+// line 2 the effective behaviour, line 3 the root
+// channel's status. Root precedence: suspension first;
+// a non-standing behaviour is never root-eligible; an
+// unproven detector or the Head Position toggle
+// suppresses; an out-of-force boundary reports
+// BOUNDARY; writes flowing report ACTIVE; anything
+// else is NOT ELIGIBLE.
+struct FSVRIndicatorFacts
+{
+    FSVRAvatarPostureState avatar_state = FSVRAvatarPostureState::UNKNOWN;
+    FSVRPostureBehaviour behaviour = FSVRPostureBehaviour::NONE;
+    bool session_established = false;
+    bool root_follow_suspended = false;
+    bool detector_proven = false;
+    bool head_position_on = true;
+    bool root_follow_bound_valid = false;
+    bool root_writes_eligible = false;
+};
+
+struct FSVRIndicatorLines
+{
+    std::string avatar_line;
+    std::string behaviour_line;
+    std::string root_line;
+};
+
+FSVRIndicatorLines fsvrFormatIndicatorLines(
+    const FSVRIndicatorFacts& facts);
+
+// The R5 behaviour selector (brief section 2.3): a pure
+// function of the classified avatar state. STANDING runs
+// the standing behaviour (root-follow, no lean); every
+// sitting state runs the sitting behaviour (lean, never
+// root-moved); UNKNOWN and INVALID run NEITHER posture
+// behaviour (brief section 2.4). The Head Position toggle
+// is deliberately NOT an input: its shipped gate sites
+// (plan gate 4's spine authority, the root step's zero,
+// the glue's write eligibility) already implement the
+// toggle matrix's OFF column exactly, and the F3-G5 golden
+// pins that extraction.
+FSVRPostureBehaviour fsvrSelectPostureBehaviour(
+    FSVRAvatarPostureState state);
+
+// Per-cycle avatar-state tracking for the glue: the current
+// logical state, the frame it was sampled in, and whether
+// the last update changed it. Transitions (sitting->standing
+// above all) drive the home-base lifecycle (brief section
+// 3.1); the frame stamp is the P1 freshness contract -- a
+// sample is usable only in the frame it was taken.
+struct FSVRAvatarStateTracker
+{
+    FSVRAvatarPostureState current = FSVRAvatarPostureState::UNKNOWN;
+    bool has_sample = false;
+    U64 sample_frame = 0;
+    // Record a fresh sample; returns the previous state.
+    FSVRAvatarPostureState update(FSVRAvatarPostureState state, U64 frame)
+    {
+        const FSVRAvatarPostureState prev = current;
+        current = state;
+        has_sample = true;
+        sample_frame = frame;
+        return prev;
+    }
+    bool fresh(U64 frame) const
+    {
+        return has_sample && sample_frame == frame;
+    }
+    void reset()
+    {
+        current = FSVRAvatarPostureState::UNKNOWN;
+        has_sample = false;
+        sample_frame = 0;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// P2-07B Fix 3 R5 (brief section 4.3; implementation plan P3
+// rev. 5): the positional-discontinuity (teleport) watch.
+// Pure over the positions the glue feeds it; the glue owns
+// the sampling, the home-base store and the suspension's
+// effect on the root write. Contract (plan P3, [FIX3-PLAN-
+// R2/R3/R4]): comparison at cycle start against P_expected;
+// own writes update P_expected atomically; P_expected_prev
+// is eligible for the single comparison window immediately
+// following the write that created it and is consumed by
+// that window whether or not it matches (R4-01); a region
+// change is a discontinuity by definition; on discontinuity
+// the watch latches suspended and only reset() (a fresh
+// sync / session end, at the glue) clears it.
+// ---------------------------------------------------------------------------
+
+enum class FSVRWatchVerdict : U8
+{
+    CONTINUITY    = 0,
+    DISCONTINUITY = 1,
+};
+
+// The provisional discontinuity threshold, in metres of
+// per-cycle agent displacement. PROVISIONAL (plan R3-01):
+// the measured legitimate/teleport bands have not yet been
+// recorded, so this value is a conservative placeholder,
+// never to be tuned silently; the detector's enablement
+// for live root-follow is gated on the recorded bands
+// being shown separable (plan P3 criterion 4).
+constexpr F32 FSVR_TELEPORT_PROVISIONAL_EPSILON_M = 10.f;
+
+// Why the watch latched [FIX3-R5-CODE-R3-2B]: a
+// positional discontinuity and a region change both
+// suspend root-follow and invalidate the home base,
+// but they are different events and the record must
+// not confuse them -- a region crossing on foot is not
+// a suspected teleport.
+enum class FSVRWatchCause : U8
+{
+    NONE       = 0,
+    POSITIONAL = 1,
+    REGION     = 2,
+};
+
+struct FSVRTeleportWatch
+{
+    bool expected_valid = false;
+    LLVector3 p_expected = LLVector3::zero;
+    bool prev_valid = false;
+    LLVector3 p_expected_prev = LLVector3::zero;
+    bool region_valid = false;
+    U64 region_id = 0;
+    bool suspended = false;
+    FSVRWatchCause last_cause = FSVRWatchCause::NONE;
+    // Band evidence for the R3-01 measurement
+    // [FIX3-R5-CODE-02 / CODE-R2-02]: the populations are
+    // labeled by an INDEPENDENT source -- the viewer's
+    // own teleport state, passed in as known_teleport --
+    // never by the watch's own verdict, so the evidence
+    // is not circular. max_continuity_m is the largest
+    // step observed with no teleport in progress (the
+    // legitimate band); teleport_step_max_m the largest
+    // step observed during a known teleport;
+    // teleport_min_m / teleport_count the labeled
+    // teleport discontinuities (a region change with a
+    // beyond-epsilon step is one by construction);
+    // unexplained_* the discontinuities no label covers
+    // (the ambiguous population); last_discontinuity_m
+    // the most recent discontinuity of any kind (-1
+    // until one occurs).
+    F32 max_continuity_m = 0.f;
+    F32 teleport_step_max_m = 0.f;
+    F32 teleport_min_m = -1.f;
+    U32 teleport_count = 0;
+    U32 unexplained_count = 0;
+    F32 unexplained_max_m = 0.f;
+    F32 last_discontinuity_m = -1.f;
+
+    // Cycle start: compare the freshly sampled agent
+    // position against the expected state. Consumes the
+    // P_expected_prev window (R4-01) on every call.
+    // known_teleport labels the cycle's evidence only;
+    // it never changes a verdict.
+    FSVRWatchVerdict observe(const LLVector3& p_now, U64 region,
+                           F32 epsilon_m,
+                           bool known_teleport = false)
+    {
+        if (suspended)
+        {
+            return FSVRWatchVerdict::DISCONTINUITY;
+        }
+        if (region_valid && region != region_id)
+        {
+            // A region change is a discontinuity by
+            // definition (plan P3 contract point 3). For
+            // the evidence: a within-epsilon step across
+            // the border is a crossing on foot (legitimate
+            // band, or the teleport-context band when a
+            // teleport is in progress); a beyond-epsilon
+            // step is a labeled teleport.
+            if (expected_valid)
+            {
+                const F32 step_m = (p_now - p_expected).length();
+                if (step_m <= epsilon_m)
+                {
+                    recordContinuityStep(step_m, known_teleport);
+                }
+                else
+                {
+                    recordTeleport(step_m);
+                }
+                last_discontinuity_m = step_m;
+            }
+            latchSuspended(FSVRWatchCause::REGION);
+            return FSVRWatchVerdict::DISCONTINUITY;
+        }
+        region_id = region;
+        region_valid = true;
+        if (!expected_valid)
+        {
+            // First sample of a watch: establishes the
+            // expectation, judges nothing.
+            p_expected = p_now;
+            expected_valid = true;
+            prev_valid = false;
+            return FSVRWatchVerdict::CONTINUITY;
+        }
+        const bool prev_window = prev_valid;
+        const LLVector3 prev = p_expected_prev;
+        prev_valid = false;   // consumed by this window (R4-01)
+        const F32 step_m = (p_now - p_expected).length();
+        if (step_m <= epsilon_m)
+        {
+            recordContinuityStep(step_m, known_teleport);
+            return FSVRWatchVerdict::CONTINUITY;
+        }
+        if (prev_window && (p_now - prev).length() <= epsilon_m)
+        {
+            // A not-yet-reflected own write (read-back lag),
+            // inside its single permitted window. The
+            // evidence records the step from the pre-write
+            // position -- the avatar's actual motion --
+            // not the inflated distance from the written
+            // expectation.
+            recordContinuityStep((p_now - prev).length(),
+                                 known_teleport);
+            return FSVRWatchVerdict::CONTINUITY;
+        }
+        last_discontinuity_m = step_m;
+        if (known_teleport)
+        {
+            recordTeleport(step_m);
+        }
+        else
+        {
+            ++unexplained_count;
+            if (step_m > unexplained_max_m)
+            {
+                unexplained_max_m = step_m;
+            }
+        }
+        latchSuspended();
+        return FSVRWatchVerdict::DISCONTINUITY;
+    }
+
+    void recordContinuityStep(F32 step_m, bool known_teleport)
+    {
+        if (known_teleport)
+        {
+            if (step_m > teleport_step_max_m)
+            {
+                teleport_step_max_m = step_m;
+            }
+        }
+        else if (step_m > max_continuity_m)
+        {
+            max_continuity_m = step_m;
+        }
+    }
+
+    void recordTeleport(F32 step_m)
+    {
+        ++teleport_count;
+        if (teleport_min_m < 0.f || step_m < teleport_min_m)
+        {
+            teleport_min_m = step_m;
+        }
+        last_discontinuity_m = step_m;
+    }
+
+    // The glue's own root write: updates P_expected
+    // atomically with the write and retains the displaced
+    // value as P_expected_prev for one window (R4-01).
+    void noteWrite(const LLVector3& target)
+    {
+        if (expected_valid)
+        {
+            p_expected_prev = p_expected;
+            prev_valid = true;
+        }
+        p_expected = target;
+        expected_valid = true;
+    }
+
+    // End of a cycle in which the adapter wrote nothing:
+    // the expectation becomes the position sampled at the
+    // end of the previous cycle (plan P3 contract point 1).
+    // A no-write cycle also retires any unconsumed prev
+    // window: prev never survives an intervening sampled
+    // cycle (R4-01).
+    void noteNoWrite(const LLVector3& p_end)
+    {
+        if (!suspended)
+        {
+            p_expected = p_end;
+            expected_valid = true;
+            prev_valid = false;
+        }
+    }
+
+    void latchSuspended(FSVRWatchCause cause =
+                            FSVRWatchCause::POSITIONAL)
+    {
+        suspended = true;
+        expected_valid = false;
+        prev_valid = false;
+        last_cause = cause;
+    }
+
+    // Fresh sync / session end (glue's call): the watch
+    // starts over; the next observe() re-establishes.
+    void reset()
+    {
+        expected_valid = false;
+        prev_valid = false;
+        region_valid = false;
+        suspended = false;
+        max_continuity_m = 0.f;
+        teleport_step_max_m = 0.f;
+        teleport_min_m = -1.f;
+        teleport_count = 0;
+        unexplained_count = 0;
+        unexplained_max_m = 0.f;
+        last_discontinuity_m = -1.f;
+        last_cause = FSVRWatchCause::NONE;
+    }
+};
+
+// Complete teleport events [FIX3-R5-CODE-R3-2A]: the
+// per-frame statistics cannot express a teleport that
+// arrives as several small updates, nor one that never
+// exceeds the per-frame epsilon. This tracker measures
+// whole events from the independent teleport-state
+// transitions the glue feeds it: the position at the
+// last quiet cycle before the event, and the position
+// once the event has ended and the avatar has settled
+// (a cycle whose step is within the settle threshold,
+// or the settle bound, whichever comes first). An
+// event still open when the tracker is reset counts
+// as incomplete and contributes no displacement.
+struct FSVRTeleportEventTracker
+{
+    static constexpr F32 SETTLE_STEP_M = 0.02f;
+    static constexpr U32 SETTLE_MAX_CYCLES = 90;
+
+    bool in_event = false;
+    bool settling = false;
+    U32 settle_cycles = 0;
+    LLVector3 start_position = LLVector3::zero;
+    // Whether start_position is a real pre-event
+    // baseline [FIX3-R5-CODE-R4-1A]: an event first
+    // observed already in progress has none, and no
+    // displacement may be published for it -- a partial
+    // measurement presented as whole is worse than an
+    // explicit unmeasurable.
+    bool start_valid = false;
+    LLVector3 last_position = LLVector3::zero;
+    bool last_position_valid = false;
+
+    F32 event_min_m = -1.f;
+    F32 event_max_m = 0.f;
+    U32 events_completed = 0;
+    // Events retired without a measurement (unanchored).
+    U32 events_incomplete = 0;
+
+    // An event still open when its generation ends is
+    // also an incomplete observation of that generation.
+    U32 incompleteAtEnd() const { return in_event ? 1 : 0; }
+
+    // Returns true (and sets net_out) on the cycle an
+    // event completes.
+    bool observe(bool teleport_active, const LLVector3& p_now,
+                 F32& net_out)
+    {
+        net_out = 0.f;
+        if (teleport_active)
+        {
+            if (!in_event)
+            {
+                in_event = true;
+                settling = false;
+                settle_cycles = 0;
+                // The baseline is the last quiet position
+                // -- when one was ever observed. A teleport
+                // already in progress at the first
+                // observation has no baseline: the event
+                // is tracked but unanchored, and will be
+                // retired as incomplete, never measured.
+                start_valid = last_position_valid;
+                if (start_valid)
+                {
+                    start_position = last_position;
+                }
+            }
+            else if (settling)
+            {
+                // A new event began while the previous
+                // one was settling: the previous event's
+                // displacement is final at the position
+                // where this one starts. (complete()
+                // reports whether it was measurable.)
+                const bool measured = complete(p_now, net_out);
+                in_event = true;
+                settling = false;
+                settle_cycles = 0;
+                // The handover position was observed
+                // during the inactive settling cycles:
+                // a real baseline for the new event.
+                start_position = p_now;
+                start_valid = true;
+                last_position = p_now;
+                last_position_valid = true;
+                return measured;
+            }
+            last_position = p_now;
+            last_position_valid = true;
+            return false;
+        }
+        if (in_event && !settling)
+        {
+            settling = true;
+            settle_cycles = 0;
+        }
+        if (settling)
+        {
+            ++settle_cycles;
+            const F32 step = last_position_valid
+                ? (p_now - last_position).length() : 0.f;
+            last_position = p_now;
+            last_position_valid = true;
+            if (step <= SETTLE_STEP_M ||
+                settle_cycles >= SETTLE_MAX_CYCLES)
+            {
+                const bool measured = complete(p_now, net_out);
+                in_event = false;
+                settling = false;
+                return measured;
+            }
+            return false;
+        }
+        last_position = p_now;
+        last_position_valid = true;
+        return false;
+    }
+
+    // Returns true when a displacement was measured.
+    // An unanchored event retires as incomplete and
+    // publishes nothing.
+    bool complete(const LLVector3& end_position, F32& net_out)
+    {
+        if (!start_valid)
+        {
+            ++events_incomplete;
+            net_out = 0.f;
+            return false;
+        }
+        net_out = (end_position - start_position).length();
+        ++events_completed;
+        if (event_min_m < 0.f || net_out < event_min_m)
+        {
+            event_min_m = net_out;
+        }
+        if (net_out > event_max_m)
+        {
+            event_max_m = net_out;
+        }
+        return true;
+    }
+
+    // Fresh sync / session end (the glue reads the
+    // aggregates, including incompleteAtEnd(), before
+    // calling this).
+    void reset()
+    {
+        in_event = false;
+        settling = false;
+        settle_cycles = 0;
+        start_valid = false;
+        last_position_valid = false;
+        event_min_m = -1.f;
+        event_max_m = 0.f;
+        events_completed = 0;
+        events_incomplete = 0;
+    }
+};
+
 // The two scale contracts, per channel (brief section
 // 2.4). PROPORTIONAL is in force only when the channel's
 // factor rests on landmark-matched endpoints (the
@@ -438,6 +1045,22 @@ struct FSVRAdapterPlanInput
     bool posture_behaviour_present = false;
     bool root_offset_present = false;
     LLVector3 root_offset = LLVector3::zero;
+    // P2-07B Fix 3 R5 (brief section 8.1): the cycle's
+    // recorder facts for the sampled avatar state, the
+    // root-follow suspension and the home base. Like the
+    // posture behaviour above, they are carried to the
+    // result for the record; the plan reads none of them.
+    FSVRAvatarPostureState avatar_state = FSVRAvatarPostureState::UNKNOWN;
+    bool avatar_state_present = false;
+    bool root_follow_suspended = false;
+    bool home_base_valid = false;
+    U32 home_base_generation = 0;
+    // FSVRPostureSwap's configured value, recorded so the
+    // bonelog distinguishes it from its (inert, under R5)
+    // effect: posture_swap_inert is true exactly when the
+    // cycle's behaviour came from the sampled avatar state.
+    bool posture_swap_configured = false;
+    bool posture_swap_inert = false;
 };
 
 // Read-only view handed to the solvers: the plan input plus the
@@ -770,6 +1393,15 @@ struct FSVRAdapterPlanResult
     bool posture_behaviour_present = false;
     bool root_offset_present = false;
     LLVector3 root_offset = LLVector3::zero;
+    // P2-07B Fix 3 R5 (brief section 8.1): the plan input's
+    // R5 recorder facts, retained verbatim (see the input).
+    FSVRAvatarPostureState avatar_state = FSVRAvatarPostureState::UNKNOWN;
+    bool avatar_state_present = false;
+    bool root_follow_suspended = false;
+    bool home_base_valid = false;
+    U32 home_base_generation = 0;
+    bool posture_swap_configured = false;
+    bool posture_swap_inert = false;
     // Write-through boundary outcomes, per side (zero when the
     // boundary did not run for that side).
     FSVRAdapterArmOutcome arm_outcome_left;
@@ -819,6 +1451,19 @@ bool decideSpineSampleValid(const FSVRSpineSampleInputs& in);
 // brief; the seam is where a future source lands).
 struct FSVRFix3CycleInputs
 {
+    // P2-07B Fix 3 R5 (brief sections 2.1-2.3): the cycle's
+    // sampled avatar state, classified by the glue from the
+    // live avatar at the apply point. avatar_state_present
+    // is the staged-contract flag (the posture_behaviour_
+    // present idiom): production glue always sets it; when
+    // it is false the cycle's behaviour derives from the
+    // session's sync stamp and the swap exactly as R3
+    // shipped (the Package B / Fix 4 contract, untouched).
+    // The default-constructed state is UNKNOWN, the
+    // fail-closed one.
+    FSVRAvatarPostureState avatar_state =
+        FSVRAvatarPostureState::UNKNOWN;
+    bool avatar_state_present = false;
     bool posture_swap = false;          // FSVRPostureSwap
     bool head_position_enabled = false; // FSVRTrackHeadPosition
     bool lean_gain_valid = true;        // FSVRLeanResponseGain
@@ -845,6 +1490,27 @@ struct FSVRFix3CycleInputs
     // set (no policy) is the fail-closed one.
     F32  root_follow_bound_m = 0.f;
     bool root_follow_bound_valid = false;
+    // P2-07B Fix 3 R5 (brief section 4.3): root-follow is
+    // suspended (a teleport discontinuity latched the
+    // watch). Suspension withholds the WRITE and the
+    // composition's standing suppression, exactly as the
+    // boundary policy not being in force does
+    // [FIX3-CODE-R2-01]: the offset is still computed and
+    // recorded, and the shipped lean continues -- a gate
+    // withholds the write; it does not authorize
+    // suppressing the existing positional response while
+    // the avatar cannot move.
+    bool root_follow_suspended = false;
+    // P2-07B Fix 3 R5 [FIX3-R5-CODE-02]: the teleport
+    // detector's measured-band readiness. Consulted ONLY
+    // when avatar_state_present (the R5 path): while
+    // false, live root-follow stays off -- the step is
+    // not live and the composition falls through exactly
+    // as bound-gated -- because the legitimate/teleport
+    // displacement bands have not yet been measured and
+    // proven separable. The legacy path never consults
+    // it and keeps the R3 contract bit-for-bit.
+    bool detector_proven = false;
 };
 
 // What the Fix 3 composition determined for the cycle,
@@ -963,6 +1629,19 @@ struct FSVRStandingRootStep
     bool bound_clamped = false;
     bool live = false;
 };
+
+// The one derivation of a cycle's effective posture
+// behaviour, consumed by both Fix 3 seams (the standing
+// root step and the head-target composition) so they can
+// never disagree: with the R5 sampled state present, the
+// R5 selector over that state; otherwise the R3 derivation
+// from the session's sync stamp and the swap, verbatim.
+// FSVRPostureSwap is recorded-but-inert on the R5 path
+// (implementation plan P4): it is read for the record and
+// changes no behaviour.
+FSVRPostureBehaviour fsvrCycleBehaviour(
+    const FSVRSessionNeutralView& session,
+    const FSVRFix3CycleInputs& inputs);
 
 FSVRStandingRootStep fsvrComputeStandingRootStep(
     const FSVRSessionNeutralView& session,

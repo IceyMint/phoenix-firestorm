@@ -370,6 +370,34 @@ void appendPlanBlock(std::string& out,
         out += ",\"root_offset\":";
         appendVec(out, plan.root_offset);
     }
+    // P2-07B Fix 3 R5 (brief section 8.1): the sampled
+    // avatar state, the suspension fact and the home
+    // base's validity/generation -- each present only
+    // when the cycle carried it.
+    if (plan.avatar_state)
+    {
+        out += ",\"avatar_state\":";
+        appendJsonString(out, plan.avatar_state);
+    }
+    if (plan.root_follow_suspended_present)
+    {
+        out += ",\"root_follow_suspended\":";
+        appendBool(out, plan.root_follow_suspended);
+    }
+    if (plan.home_base_present)
+    {
+        out += ",\"home_base_valid\":";
+        appendBool(out, plan.home_base_valid);
+        out += ",\"home_base_generation\":";
+        out += std::to_string(plan.home_base_generation);
+    }
+    if (plan.root_follow_suspended_present)
+    {
+        out += ",\"posture_swap_configured\":";
+        appendBool(out, plan.posture_swap_configured);
+        out += ",\"posture_swap_inert\":";
+        appendBool(out, plan.posture_swap_inert);
+    }
     out += '}';
 }
 
@@ -681,6 +709,225 @@ void FSVRBoneLog::buildRootFollowBoundInvalidRecord(
     out.clear();
     out += "{\"event\":\"root_follow_bound_invalid\",\"t_ms\":";
     out += std::to_string(t_ms);
+    out += "}\n";
+}
+
+// static
+void FSVRBoneLog::buildAvatarStateChangedRecord(
+    std::string& out, long long t_ms,
+    const char* from_state, const char* to_state)
+{
+    out.clear();
+    out += "{\"event\":\"avatar_state_changed\",\"t_ms\":";
+    out += std::to_string(t_ms);
+    out += ",\"from\":";
+    if (from_state)
+    {
+        appendJsonString(out, from_state);
+    }
+    else
+    {
+        out += "null";
+    }
+    out += ",\"to\":";
+    if (to_state)
+    {
+        appendJsonString(out, to_state);
+    }
+    else
+    {
+        out += "null";
+    }
+    out += "}\n";
+}
+
+// static
+void FSVRBoneLog::buildHomeBaseEstablishedRecord(
+    std::string& out, long long t_ms, U32 generation)
+{
+    out.clear();
+    out += "{\"event\":\"home_base_established\",\"t_ms\":";
+    out += std::to_string(t_ms);
+    out += ",\"generation\":";
+    out += std::to_string(generation);
+    out += "}\n";
+}
+
+// static
+void FSVRBoneLog::buildHomeBaseInvalidatedRecord(
+    std::string& out, long long t_ms, const char* reason)
+{
+    out.clear();
+    out += "{\"event\":\"home_base_invalidated\",\"t_ms\":";
+    out += std::to_string(t_ms);
+    out += ",\"reason\":";
+    if (reason)
+    {
+        appendJsonString(out, reason);
+    }
+    else
+    {
+        out += "null";
+    }
+    out += "}\n";
+}
+
+// static
+void FSVRBoneLog::buildTeleportSuspectedRecord(
+    std::string& out, long long t_ms, F32 distance_m)
+{
+    out.clear();
+    out += "{\"event\":\"teleport_suspected\",\"t_ms\":";
+    out += std::to_string(t_ms);
+    // Teleport-band evidence [FIX3-R5-CODE-02]: the size
+    // of the positional jump that latched the suspension.
+    // A negative value (a region change carries no
+    // positional magnitude) serializes as null.
+    out += ",\"distance_m\":";
+    if (distance_m >= 0.f && std::isfinite(distance_m))
+    {
+        appendFloat(out, distance_m);
+    }
+    else
+    {
+        out += "null";
+    }
+    out += "}\n";
+}
+
+// static
+void FSVRBoneLog::buildRootFollowDetectorUnprovenRecord(
+    std::string& out, long long t_ms)
+{
+    out.clear();
+    out += "{\"event\":\"root_follow_detector_unproven\",\"t_ms\":";
+    out += std::to_string(t_ms);
+    out += "}\n";
+}
+
+// static
+void FSVRBoneLog::buildDetectorBandObservationRecord(
+    std::string& out, long long t_ms, F32 max_continuity_m,
+    F32 teleport_step_max_m, F32 teleport_min_m,
+    U32 teleport_count, U32 unexplained_count,
+    F32 unexplained_max_m, F32 teleport_event_min_m,
+    F32 teleport_event_max_m, U32 teleport_events_completed,
+    U32 teleport_events_incomplete)
+{
+    out.clear();
+    out += "{\"event\":\"detector_band_observation\",\"t_ms\":";
+    out += std::to_string(t_ms);
+    // The labeled band evidence [FIX3-R5-CODE-R2-02]:
+    // populations separated by the viewer's own teleport
+    // state, never by the watch's verdicts. Legitimate
+    // band: steps with no teleport in progress. Teleport
+    // band: steps during known teleports and labeled
+    // teleport discontinuities (teleport_min_m is null
+    // until one is measured). Unexplained: discontinuities
+    // no label covered -- the ambiguous population.
+    // Event band [FIX3-R5-CODE-R3-2A]: whole teleport
+    // events measured start-to-settled (event min null
+    // until one completes).
+    out += ",\"max_continuity_m\":";
+    appendFloat(out, max_continuity_m);
+    out += ",\"teleport_step_max_m\":";
+    appendFloat(out, teleport_step_max_m);
+    out += ",\"teleport_min_m\":";
+    if (teleport_min_m >= 0.f)
+    {
+        appendFloat(out, teleport_min_m);
+    }
+    else
+    {
+        out += "null";
+    }
+    out += ",\"teleport_count\":";
+    out += std::to_string(teleport_count);
+    out += ",\"unexplained_count\":";
+    out += std::to_string(unexplained_count);
+    out += ",\"unexplained_max_m\":";
+    appendFloat(out, unexplained_max_m);
+    out += ",\"teleport_event_min_m\":";
+    if (teleport_event_min_m >= 0.f)
+    {
+        appendFloat(out, teleport_event_min_m);
+    }
+    else
+    {
+        out += "null";
+    }
+    out += ",\"teleport_event_max_m\":";
+    appendFloat(out, teleport_event_max_m);
+    out += ",\"teleport_events_completed\":";
+    out += std::to_string(teleport_events_completed);
+    out += ",\"teleport_events_incomplete\":";
+    out += std::to_string(teleport_events_incomplete);
+    out += "}\n";
+}
+
+// static
+void FSVRBoneLog::buildRegionDiscontinuityRecord(
+    std::string& out, long long t_ms, F32 distance_m)
+{
+    out.clear();
+    out += "{\"event\":\"region_discontinuity\",\"t_ms\":";
+    out += std::to_string(t_ms);
+    // [FIX3-R5-CODE-R3-2B]: a region change is its own
+    // cause, never reported as a suspected teleport. The
+    // measured step across the border (null when no
+    // expectation existed to measure against).
+    out += ",\"distance_m\":";
+    if (distance_m >= 0.f && std::isfinite(distance_m))
+    {
+        appendFloat(out, distance_m);
+    }
+    else
+    {
+        out += "null";
+    }
+    out += "}\n";
+}
+
+// static
+void FSVRBoneLog::buildTeleportEventMeasuredRecord(
+    std::string& out, long long t_ms, F32 net_m)
+{
+    out.clear();
+    out += "{\"event\":\"teleport_event_measured\",\"t_ms\":";
+    out += std::to_string(t_ms);
+    // [FIX3-R5-CODE-R3-2A]: one completed teleport
+    // event's net displacement, start to settled.
+    out += ",\"net_m\":";
+    appendFloat(out, net_m);
+    out += "}\n";
+}
+
+// static
+void FSVRBoneLog::buildAvatarStateStaleSampleRecord(
+    std::string& out, long long t_ms)
+{
+    out.clear();
+    out += "{\"event\":\"avatar_state_stale_sample\",\"t_ms\":";
+    out += std::to_string(t_ms);
+    out += "}\n";
+}
+
+// static
+void FSVRBoneLog::buildRootFollowSuspendedRecord(
+    std::string& out, long long t_ms, const char* reason)
+{
+    out.clear();
+    out += "{\"event\":\"root_follow_suspended\",\"t_ms\":";
+    out += std::to_string(t_ms);
+    out += ",\"reason\":";
+    if (reason)
+    {
+        appendJsonString(out, reason);
+    }
+    else
+    {
+        out += "null";
+    }
     out += "}\n";
 }
 
@@ -1678,6 +1925,21 @@ void sampleCycleImpl(LLCharacter* character,
             : nullptr;
     plan.root_offset_present = result.root_offset_present;
     plan.root_offset = result.root_offset;
+    // P2-07B Fix 3 R5 (brief section 8.1): the sampled
+    // avatar state, the suspension fact and the home
+    // base's validity/generation, copied under the same
+    // absent-stays-absent discipline.
+    plan.avatar_state =
+        result.avatar_state_present
+            ? fsvrAvatarPostureStateName(result.avatar_state)
+            : nullptr;
+    plan.root_follow_suspended_present = result.avatar_state_present;
+    plan.root_follow_suspended = result.root_follow_suspended;
+    plan.home_base_present = result.avatar_state_present;
+    plan.home_base_valid = result.home_base_valid;
+    plan.home_base_generation = result.home_base_generation;
+    plan.posture_swap_configured = result.posture_swap_configured;
+    plan.posture_swap_inert = result.posture_swap_inert;
 
     FSVRBoneLog::buildSampleRecordV2(
         state.scratch, nowMs(), input.frame_token,
@@ -1914,6 +2176,255 @@ void FSVRBoneLog::eventRootFollowBoundInvalid()
             return;
         }
         buildRootFollowBoundInvalidRecord(state.scratch, nowMs());
+        enqueueLine(state.scratch);
+    }
+    catch (...)
+    {
+        s_hard_disabled.store(true);
+    }
+}
+
+// static
+void FSVRBoneLog::eventAvatarStateChanged(const char* from_state,
+                                          const char* to_state)
+{
+    if (!enabled() || s_hard_disabled.load())
+    {
+        return;
+    }
+    try
+    {
+        BoneLogState& state = bonelogState();
+        if (state.writer_failed.load())
+        {
+            return;
+        }
+        buildAvatarStateChangedRecord(state.scratch, nowMs(),
+                                      from_state, to_state);
+        enqueueLine(state.scratch);
+    }
+    catch (...)
+    {
+        s_hard_disabled.store(true);
+    }
+}
+
+// static
+void FSVRBoneLog::eventHomeBaseEstablished(U32 generation)
+{
+    if (!enabled() || s_hard_disabled.load())
+    {
+        return;
+    }
+    try
+    {
+        BoneLogState& state = bonelogState();
+        if (state.writer_failed.load())
+        {
+            return;
+        }
+        buildHomeBaseEstablishedRecord(state.scratch, nowMs(),
+                                       generation);
+        enqueueLine(state.scratch);
+    }
+    catch (...)
+    {
+        s_hard_disabled.store(true);
+    }
+}
+
+// static
+void FSVRBoneLog::eventHomeBaseInvalidated(const char* reason)
+{
+    if (!enabled() || s_hard_disabled.load())
+    {
+        return;
+    }
+    try
+    {
+        BoneLogState& state = bonelogState();
+        if (state.writer_failed.load())
+        {
+            return;
+        }
+        buildHomeBaseInvalidatedRecord(state.scratch, nowMs(), reason);
+        enqueueLine(state.scratch);
+    }
+    catch (...)
+    {
+        s_hard_disabled.store(true);
+    }
+}
+
+// static
+void FSVRBoneLog::eventTeleportSuspected(F32 distance_m)
+{
+    if (!enabled() || s_hard_disabled.load())
+    {
+        return;
+    }
+    try
+    {
+        BoneLogState& state = bonelogState();
+        if (state.writer_failed.load())
+        {
+            return;
+        }
+        buildTeleportSuspectedRecord(state.scratch, nowMs(),
+                                     distance_m);
+        enqueueLine(state.scratch);
+    }
+    catch (...)
+    {
+        s_hard_disabled.store(true);
+    }
+}
+
+// static
+void FSVRBoneLog::eventRootFollowDetectorUnproven()
+{
+    if (!enabled() || s_hard_disabled.load())
+    {
+        return;
+    }
+    try
+    {
+        BoneLogState& state = bonelogState();
+        if (state.writer_failed.load())
+        {
+            return;
+        }
+        buildRootFollowDetectorUnprovenRecord(state.scratch,
+                                              nowMs());
+        enqueueLine(state.scratch);
+    }
+    catch (...)
+    {
+        s_hard_disabled.store(true);
+    }
+}
+
+// static
+void FSVRBoneLog::eventDetectorBandObservation(
+    F32 max_continuity_m, F32 teleport_step_max_m,
+    F32 teleport_min_m, U32 teleport_count,
+    U32 unexplained_count, F32 unexplained_max_m,
+    F32 teleport_event_min_m, F32 teleport_event_max_m,
+    U32 teleport_events_completed,
+    U32 teleport_events_incomplete)
+{
+    if (!enabled() || s_hard_disabled.load())
+    {
+        return;
+    }
+    try
+    {
+        BoneLogState& state = bonelogState();
+        if (state.writer_failed.load())
+        {
+            return;
+        }
+        buildDetectorBandObservationRecord(
+            state.scratch, nowMs(), max_continuity_m,
+            teleport_step_max_m, teleport_min_m, teleport_count,
+            unexplained_count, unexplained_max_m,
+            teleport_event_min_m, teleport_event_max_m,
+            teleport_events_completed,
+            teleport_events_incomplete);
+        enqueueLine(state.scratch);
+    }
+    catch (...)
+    {
+        s_hard_disabled.store(true);
+    }
+}
+
+// static
+void FSVRBoneLog::eventRegionDiscontinuity(F32 distance_m)
+{
+    if (!enabled() || s_hard_disabled.load())
+    {
+        return;
+    }
+    try
+    {
+        BoneLogState& state = bonelogState();
+        if (state.writer_failed.load())
+        {
+            return;
+        }
+        buildRegionDiscontinuityRecord(state.scratch, nowMs(),
+                                       distance_m);
+        enqueueLine(state.scratch);
+    }
+    catch (...)
+    {
+        s_hard_disabled.store(true);
+    }
+}
+
+// static
+void FSVRBoneLog::eventTeleportEventMeasured(F32 net_m)
+{
+    if (!enabled() || s_hard_disabled.load())
+    {
+        return;
+    }
+    try
+    {
+        BoneLogState& state = bonelogState();
+        if (state.writer_failed.load())
+        {
+            return;
+        }
+        buildTeleportEventMeasuredRecord(state.scratch, nowMs(),
+                                         net_m);
+        enqueueLine(state.scratch);
+    }
+    catch (...)
+    {
+        s_hard_disabled.store(true);
+    }
+}
+
+// static
+void FSVRBoneLog::eventAvatarStateStaleSample()
+{
+    if (!enabled() || s_hard_disabled.load())
+    {
+        return;
+    }
+    try
+    {
+        BoneLogState& state = bonelogState();
+        if (state.writer_failed.load())
+        {
+            return;
+        }
+        buildAvatarStateStaleSampleRecord(state.scratch, nowMs());
+        enqueueLine(state.scratch);
+    }
+    catch (...)
+    {
+        s_hard_disabled.store(true);
+    }
+}
+
+// static
+void FSVRBoneLog::eventRootFollowSuspended(const char* reason)
+{
+    if (!enabled() || s_hard_disabled.load())
+    {
+        return;
+    }
+    try
+    {
+        BoneLogState& state = bonelogState();
+        if (state.writer_failed.load())
+        {
+            return;
+        }
+        buildRootFollowSuspendedRecord(state.scratch, nowMs(), reason);
         enqueueLine(state.scratch);
     }
     catch (...)

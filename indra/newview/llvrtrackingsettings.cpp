@@ -33,6 +33,8 @@ const char* const FSVRTrackingSettings::SETTING_STANDING_EYE_HEIGHT_CM = "FSVRSt
 const char* const FSVRTrackingSettings::SETTING_MANUAL_LEAN_RATIO = "FSVRManualLeanRatio";
 const char* const FSVRTrackingSettings::SETTING_MANUAL_ROOT_RATIO = "FSVRManualRootRatio";
 const char* const FSVRTrackingSettings::SETTING_ROOT_FOLLOW_BOUND_METERS = "FSVRRootFollowBoundMeters";
+const char* const FSVRTrackingSettings::SETTING_TELEPORT_DETECTOR_PROVEN = "FSVRTeleportDetectorProven";
+const char* const FSVRTrackingSettings::SETTING_SHOW_POSTURE_INDICATOR = "FSVRShowPostureIndicator";
 
 // P2-07B C6-E Gate-1 authorization (CP-5 part 1a). NONE in every
 // ordinary build. Advanced ONLY by a dedicated authorization
@@ -471,6 +473,14 @@ const FSVRTrackingSettingsSnapshot& FSVRTrackingSettings::captureForFrame()
     // value is 0 whenever it is not set.
     const bool posture_swap =
         gSavedSettings.getBOOL(SETTING_POSTURE_SWAP);
+    // P2-07B Fix 3 R5 [FIX3-R5-CODE-02/04]: plain reads;
+    // neither rides the change tuple -- the detector
+    // gate and the indicator toggle take effect on the
+    // next cycle without retiring continuity history.
+    const bool teleport_detector_proven =
+        gSavedSettings.getBOOL(SETTING_TELEPORT_DETECTOR_PROVEN);
+    const bool show_posture_indicator =
+        gSavedSettings.getBOOL(SETTING_SHOW_POSTURE_INDICATOR);
     const F32 root_gain_raw =
         gSavedSettings.getF32(SETTING_ROOT_RESPONSE_GAIN);
     const bool root_gain_valid = std::isfinite(root_gain_raw) &&
@@ -679,6 +689,8 @@ const FSVRTrackingSettingsSnapshot& FSVRTrackingSettings::captureForFrame()
     // retires continuity history through the existing
     // term, exactly as a gain change does.
     next.posture_swap = posture_swap;
+    next.teleport_detector_proven = teleport_detector_proven;
+    next.show_posture_indicator = show_posture_indicator;
     next.root_gain_valid = root_gain_valid;
     next.root_gain = root_gain;
     next.standing_eye_height_cm = eye_height_cm;

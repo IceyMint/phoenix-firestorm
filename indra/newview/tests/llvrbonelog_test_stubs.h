@@ -125,6 +125,38 @@ inline const char* fsvrPostureBehaviourName(FSVRPostureBehaviour behaviour)
     }
 }
 
+// Fix 3 R5: mirrored for the same reason -- the enum
+// values and the name strings mirror the real ones in
+// llvradapterapply.h.
+enum class FSVRAvatarPostureState
+{
+    INVALID                 = 0,
+    UNKNOWN                 = 1,
+    STANDING                = 2,
+    SITTING_OBJECT          = 3,
+    SITTING_GROUND          = 4,
+    SITTING_SUBTYPE_UNKNOWN = 5
+};
+
+inline const char* fsvrAvatarPostureStateName(FSVRAvatarPostureState state)
+{
+    switch (state)
+    {
+    case FSVRAvatarPostureState::STANDING:
+        return "standing";
+    case FSVRAvatarPostureState::SITTING_OBJECT:
+        return "sitting_object";
+    case FSVRAvatarPostureState::SITTING_GROUND:
+        return "sitting_ground";
+    case FSVRAvatarPostureState::SITTING_SUBTYPE_UNKNOWN:
+        return "sitting_subtype_unknown";
+    case FSVRAvatarPostureState::INVALID:
+        return "invalid";
+    default:
+        return "unknown";
+    }
+}
+
 struct FSVRAdapterPlanResult
 {
     bool applied = false;
@@ -139,6 +171,14 @@ struct FSVRAdapterPlanResult
     bool posture_behaviour_present = false;
     bool root_offset_present = false;
     LLVector3 root_offset;
+    // Fix 3 R5: mirrored for the same reason.
+    FSVRAvatarPostureState avatar_state = FSVRAvatarPostureState::UNKNOWN;
+    bool avatar_state_present = false;
+    bool root_follow_suspended = false;
+    bool home_base_valid = false;
+    U32 home_base_generation = 0;
+    bool posture_swap_configured = false;
+    bool posture_swap_inert = false;
     std::vector<S32> writes;
     std::vector<LLQuaternion> resolved_locals;
     std::vector<LLQuaternion> resolved_world_rotations;

@@ -132,6 +132,26 @@ struct FSVRBoneLogPlanData
     bool root_offset_present = false;
     LLVector3 root_offset = LLVector3::zero;
     const char* posture_behaviour = nullptr;
+    // P2-07B Fix 3 R5 (brief section 8.1): the cycle's
+    // sampled avatar state (a fsvrAvatarPostureStateName
+    // string; the subtype rides in the name), the
+    // root-follow suspension fact, and the home base's
+    // validity and generation. Each serializes only when
+    // its *_present companion is set (avatar_state: when
+    // non-null), so plan blocks from cycles that carried
+    // none of the R5 facts parse identically (the F4-F1
+    // standard).
+    const char* avatar_state = nullptr;
+    bool root_follow_suspended_present = false;
+    bool root_follow_suspended = false;
+    bool home_base_present = false;
+    bool home_base_valid = false;
+    U32 home_base_generation = 0;
+    // FSVRPostureSwap: the configured value and its inert
+    // status, present under the same companion discipline
+    // (root_follow_suspended_present gates the R5 group).
+    bool posture_swap_configured = false;
+    bool posture_swap_inert = false;
 };
 
 struct FSVRBoneLogHeadRotSample
@@ -293,6 +313,30 @@ public:
     // establishment alongside it, edge-latched the same
     // way.
     static void eventRootFollowBoundInvalid();
+    // P2-07B Fix 3 R5 (brief sections 8.1-8.2): the avatar
+    // state's transitions and the home-base / suspension
+    // lifecycle, emitted by the adapter glue on the
+    // transition edges only (never per cycle). from/to are
+    // fsvrAvatarPostureStateName strings; reason is a
+    // stable short string ("teleport", "sitting",
+    // "session", "region").
+    static void eventAvatarStateChanged(const char* from_state,
+                                        const char* to_state);
+    static void eventHomeBaseEstablished(U32 generation);
+    static void eventHomeBaseInvalidated(const char* reason);
+    static void eventTeleportSuspected(F32 distance_m);
+    static void eventRootFollowDetectorUnproven();
+    static void eventDetectorBandObservation(
+        F32 max_continuity_m, F32 teleport_step_max_m,
+        F32 teleport_min_m, U32 teleport_count,
+        U32 unexplained_count, F32 unexplained_max_m,
+        F32 teleport_event_min_m, F32 teleport_event_max_m,
+        U32 teleport_events_completed,
+        U32 teleport_events_incomplete);
+    static void eventAvatarStateStaleSample();
+    static void eventRegionDiscontinuity(F32 distance_m);
+    static void eventTeleportEventMeasured(F32 net_m);
+    static void eventRootFollowSuspended(const char* reason);
 
     // P2-07B Fix 4 (brief section 2.5): base-provenance
     // lifecycle events, emitted by the adapter glue when
@@ -373,6 +417,39 @@ public:
                                            long long t_ms);
     static void buildRootFollowBoundInvalidRecord(std::string& out,
                                                   long long t_ms);
+    // P2-07B Fix 3 R5 event records (see the event*
+    // declarations). A null name/reason serializes as null.
+    static void buildAvatarStateChangedRecord(std::string& out,
+                                              long long t_ms,
+                                              const char* from_state,
+                                              const char* to_state);
+    static void buildHomeBaseEstablishedRecord(std::string& out,
+                                               long long t_ms,
+                                               U32 generation);
+    static void buildHomeBaseInvalidatedRecord(std::string& out,
+                                               long long t_ms,
+                                               const char* reason);
+    static void buildTeleportSuspectedRecord(std::string& out,
+                                             long long t_ms,
+                                             F32 distance_m);
+    static void buildRootFollowDetectorUnprovenRecord(
+        std::string& out, long long t_ms);
+    static void buildDetectorBandObservationRecord(
+        std::string& out, long long t_ms, F32 max_continuity_m,
+        F32 teleport_step_max_m, F32 teleport_min_m,
+        U32 teleport_count, U32 unexplained_count,
+        F32 unexplained_max_m, F32 teleport_event_min_m,
+        F32 teleport_event_max_m, U32 teleport_events_completed,
+        U32 teleport_events_incomplete);
+    static void buildAvatarStateStaleSampleRecord(
+        std::string& out, long long t_ms);
+    static void buildRegionDiscontinuityRecord(
+        std::string& out, long long t_ms, F32 distance_m);
+    static void buildTeleportEventMeasuredRecord(
+        std::string& out, long long t_ms, F32 net_m);
+    static void buildRootFollowSuspendedRecord(std::string& out,
+                                               long long t_ms,
+                                               const char* reason);
     static void buildDropsRecord(std::string& out,
                                  long long t_ms,
                                  U64 dropped_total);

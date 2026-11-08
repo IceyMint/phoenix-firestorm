@@ -129,6 +129,15 @@ struct FSVRTrackingSettingsSnapshot
     // snapshot never carries a non-finite or negative
     // F32 downstream.
     bool posture_swap = false;            // FSVRPostureSwap
+    // P2-07B Fix 3 R5 [FIX3-R5-CODE-02]: the teleport
+    // detector's measured-band readiness. False until
+    // the legitimate/teleport bands are measured and
+    // proven separable; while false, live root-follow
+    // stays off on the R5 path (fail closed).
+    bool teleport_detector_proven = false; // FSVRTeleportDetectorProven
+    // P2-07B Fix 3 R5 (brief 8.2): the persistent
+    // in-world posture indicator toggle.
+    bool show_posture_indicator = true;    // FSVRShowPostureIndicator
     F32  root_gain = 1.f;                 // FSVRRootResponseGain
     bool root_gain_valid = true;
     F32  standing_eye_height_cm = 0.f;    // FSVRStandingEyeHeightCm
@@ -318,6 +327,8 @@ public:
     static const char* const SETTING_MANUAL_LEAN_RATIO;
     static const char* const SETTING_MANUAL_ROOT_RATIO;
     static const char* const SETTING_ROOT_FOLLOW_BOUND_METERS;
+    static const char* const SETTING_TELEPORT_DETECTOR_PROVEN;
+    static const char* const SETTING_SHOW_POSTURE_INDICATOR;
 };
 
 #endif // LL_LLVRTRACKINGSETTINGS_H

@@ -686,6 +686,221 @@ const char* fsvrPostureBehaviourName(FSVRPostureBehaviour behaviour)
     }
 }
 
+FSVRAvatarPostureState fsvrClassifyAvatarState(
+    const FSVRAvatarStateSample& sample)
+{
+    // R5 brief section 2.2's truth table, row for row (see
+    // the declaration in llvradapterapply.h). The order of
+    // the checks is the table's: avatar validity first, then
+    // the sitting flag's two families. No measured quantity
+    // and no history is consulted -- the classification is
+    // this sample alone.
+    if (!sample.avatar_valid)
+    {
+        return FSVRAvatarPostureState::INVALID;
+    }
+    if (sample.sitting_flag)
+    {
+        if (sample.parent_present)
+        {
+            // An object sit when the parent resolves as the
+            // avatar's root prim; an unresolvable parent
+            // leaves the subtype unknown -- still sitting
+            // (brief section 2.3).
+            return sample.parent_is_object
+                ? FSVRAvatarPostureState::SITTING_OBJECT
+                : FSVRAvatarPostureState::SITTING_SUBTYPE_UNKNOWN;
+        }
+        switch (sample.ground_motion)
+        {
+        case FSVRGroundMotion::ACTIVE:
+            // The ground-sit motion is the ground sit: its
+            // start/stop drives sitDown(true/false) in the
+            // stock animation-state path, and the per-frame
+            // reconciliation preserves an unparented sit
+            // exactly while the motion is active.
+            return FSVRAvatarPostureState::SITTING_GROUND;
+        case FSVRGroundMotion::INACTIVE:
+            // The flag says sitting but the motion that
+            // would hold the sit is neither active nor
+            // loading (the sampler reads loading as
+            // UNKNOWN, below): the stock reconciliation
+            // retires such a sit the same frame.
+            // Contradictory evidence, classified UNKNOWN,
+            // never resolved by guessing (brief 2.2).
+            return FSVRAvatarPostureState::UNKNOWN;
+        case FSVRGroundMotion::UNKNOWN:
+        default:
+            return FSVRAvatarPostureState::SITTING_SUBTYPE_UNKNOWN;
+        }
+    }
+    // Sitting flag clear.
+    if (sample.parent_present)
+    {
+        // A parented avatar whose sitting flag is clear
+        // contradicts the stock setParent contract
+        // (setParent drives sitOnObject/getOffObject
+        // synchronously): contradictory, never guessed.
+        return FSVRAvatarPostureState::UNKNOWN;
+    }
+    switch (sample.ground_motion)
+    {
+    case FSVRGroundMotion::INACTIVE:
+        return FSVRAvatarPostureState::STANDING;
+    case FSVRGroundMotion::ACTIVE:
+    case FSVRGroundMotion::UNKNOWN:
+    default:
+        return FSVRAvatarPostureState::UNKNOWN;
+    }
+}
+
+const char* fsvrAvatarPostureStateName(FSVRAvatarPostureState state)
+{
+    switch (state)
+    {
+    case FSVRAvatarPostureState::STANDING:
+        return "standing";
+    case FSVRAvatarPostureState::SITTING_OBJECT:
+        return "sitting_object";
+    case FSVRAvatarPostureState::SITTING_GROUND:
+        return "sitting_ground";
+    case FSVRAvatarPostureState::SITTING_SUBTYPE_UNKNOWN:
+        return "sitting_subtype_unknown";
+    case FSVRAvatarPostureState::INVALID:
+        return "invalid";
+    case FSVRAvatarPostureState::UNKNOWN:
+    default:
+        return "unknown";
+    }
+}
+
+const char* fsvrGroundMotionName(FSVRGroundMotion motion)
+{
+    switch (motion)
+    {
+    case FSVRGroundMotion::INACTIVE: return "inactive";
+    case FSVRGroundMotion::ACTIVE:   return "active";
+    case FSVRGroundMotion::UNKNOWN:
+    default:                          return "unknown";
+    }
+}
+
+bool fsvrAvatarStateIsSitting(FSVRAvatarPostureState state)
+{
+    // Brief section 2.3: sitting is sitting -- the resolved
+    // subtypes and the subtype-unknown state all run the
+    // sitting behaviour; only the label differs.
+    return state == FSVRAvatarPostureState::SITTING_OBJECT ||
+           state == FSVRAvatarPostureState::SITTING_GROUND ||
+           state == FSVRAvatarPostureState::SITTING_SUBTYPE_UNKNOWN;
+}
+
+FSVRPostureBehaviour fsvrSelectPostureBehaviour(
+    FSVRAvatarPostureState state)
+{
+    // R5 brief section 2.3's behaviour table, and section
+    // 2.4's fail-closed row: UNKNOWN and INVALID run
+    // neither posture behaviour. Sitting is sitting: every
+    // sitting state, subtype unknown included, selects the
+    // sitting behaviour.
+    if (state == FSVRAvatarPostureState::STANDING)
+    {
+        return FSVRPostureBehaviour::STANDING;
+    }
+    if (fsvrAvatarStateIsSitting(state))
+    {
+        return FSVRPostureBehaviour::SITTING;
+    }
+    return FSVRPostureBehaviour::NONE;
+}
+
+FSVRPostureBehaviour fsvrCycleBehaviour(
+    const FSVRSessionNeutralView& session,
+    const FSVRFix3CycleInputs& inputs)
+{
+    // The one behaviour derivation (see the declaration):
+    // the R5 sampled state when the cycle carries one, the
+    // R3 stamp-and-swap derivation otherwise. On the R5
+    // path FSVRPostureSwap is recorded-but-inert (plan P4):
+    // inputs.posture_swap is not consulted here.
+    if (inputs.avatar_state_present)
+    {
+        return fsvrSelectPostureBehaviour(inputs.avatar_state);
+    }
+    return fsvrEffectivePostureBehaviour(
+        session.posture, inputs.posture_swap);
+}
+
+FSVRIndicatorLines fsvrFormatIndicatorLines(
+    const FSVRIndicatorFacts& facts)
+{
+    // Brief section 8.2's exact presentations. The em
+    // dashes are part of the specified strings.
+    FSVRIndicatorLines lines;
+    switch (facts.avatar_state)
+    {
+    case FSVRAvatarPostureState::STANDING:
+        lines.avatar_line = "AVATAR: STANDING";
+        break;
+    case FSVRAvatarPostureState::SITTING_OBJECT:
+        lines.avatar_line = "AVATAR: SITTING \xe2\x80\x94 OBJECT";
+        break;
+    case FSVRAvatarPostureState::SITTING_GROUND:
+        lines.avatar_line = "AVATAR: SITTING \xe2\x80\x94 GROUND";
+        break;
+    case FSVRAvatarPostureState::SITTING_SUBTYPE_UNKNOWN:
+        lines.avatar_line = "AVATAR: SITTING \xe2\x80\x94 SUBTYPE UNKNOWN";
+        break;
+    case FSVRAvatarPostureState::INVALID:
+        lines.avatar_line = "AVATAR: INVALID";
+        break;
+    case FSVRAvatarPostureState::UNKNOWN:
+    default:
+        lines.avatar_line = "AVATAR: UNKNOWN";
+        break;
+    }
+    switch (facts.behaviour)
+    {
+    case FSVRPostureBehaviour::STANDING:
+        lines.behaviour_line = "BEHAVIOUR: ROOT FOLLOW";
+        break;
+    case FSVRPostureBehaviour::SITTING:
+        lines.behaviour_line = "BEHAVIOUR: SPINE LEAN";
+        break;
+    case FSVRPostureBehaviour::NONE:
+    default:
+        lines.behaviour_line =
+            "BEHAVIOUR: DISABLED \xe2\x80\x94 UNKNOWN STATE";
+        break;
+    }
+    if (facts.root_follow_suspended)
+    {
+        lines.root_line = "ROOT: SUSPENDED \xe2\x80\x94 SYNC REQUIRED";
+    }
+    else if (facts.behaviour != FSVRPostureBehaviour::STANDING ||
+             !facts.session_established)
+    {
+        lines.root_line = "ROOT: NOT ELIGIBLE";
+    }
+    else if (!facts.detector_proven || !facts.head_position_on)
+    {
+        lines.root_line = "ROOT: SUPPRESSED";
+    }
+    else if (!facts.root_follow_bound_valid)
+    {
+        lines.root_line = "ROOT: BOUNDARY";
+    }
+    else if (facts.root_writes_eligible)
+    {
+        lines.root_line = "ROOT: ACTIVE";
+    }
+    else
+    {
+        lines.root_line = "ROOT: NOT ELIGIBLE";
+    }
+    return lines;
+}
+
 const char* fsvrScaleContractName(FSVRScaleContract contract)
 {
     switch (contract)
@@ -876,8 +1091,7 @@ FSVRStandingRootStep fsvrComputeStandingRootStep(
     const FSVRFix3CycleInputs& inputs)
 {
     FSVRStandingRootStep step;
-    step.behaviour = fsvrEffectivePostureBehaviour(
-        session.posture, inputs.posture_swap);
+    step.behaviour = fsvrCycleBehaviour(session, inputs);
     if (step.behaviour != FSVRPostureBehaviour::STANDING ||
         !inputs.head_position_enabled)
     {
@@ -959,8 +1173,14 @@ FSVRStandingRootStep fsvrComputeStandingRootStep(
     // writes only a live step; while the policy is not
     // in force the step is computed and recorded but the
     // agent does not move and the composition does not
-    // suppress [FIX3-CODE-R2-01].
-    step.live = inputs.root_follow_bound_valid;
+    // suppress [FIX3-CODE-R2-01]. On the R5 path the
+    // teleport detector must also be proven
+    // [FIX3-R5-CODE-02]; the legacy path never consults
+    // the detector fact and keeps the R3 contract.
+    step.live = inputs.root_follow_bound_valid &&
+                !inputs.root_follow_suspended &&
+                (!inputs.avatar_state_present ||
+                 inputs.detector_proven);
     return step;
 }
 
@@ -984,8 +1204,7 @@ bool composeHeadTargetBlock(
     const FSVRFix3CycleInputs inputs =
         fix3_inputs ? *fix3_inputs : FSVRFix3CycleInputs();
     FSVRFix3CompositionResult fix3;
-    fix3.behaviour = fsvrEffectivePostureBehaviour(
-        session.posture, inputs.posture_swap);
+    fix3.behaviour = fsvrCycleBehaviour(session, inputs);
     if (!session.established)
     {
         if (fix3_result)
@@ -1026,6 +1245,28 @@ bool composeHeadTargetBlock(
         fix3.root_scale_invalid =
             fsvrRootChannelFactor(inputs).invalid;
     }
+    if (inputs.avatar_state_present &&
+        (inputs.avatar_state == FSVRAvatarPostureState::UNKNOWN ||
+         inputs.avatar_state == FSVRAvatarPostureState::INVALID))
+    {
+        // P2-07B Fix 3 R5 (brief section 2.4): a genuinely
+        // unknown or invalid avatar state runs neither
+        // posture behaviour -- in particular the shipped
+        // lean does NOT fall through for it (the R3
+        // undetermined profile is superseded on the R5
+        // path, and only there: cycles without a sampled
+        // state keep the R3 contract verbatim). No head
+        // target is published this cycle; the determinations
+        // recorded above (behaviour NONE; both channels'
+        // invalidity facts) stand for the record, and the
+        // state itself is announced by the glue's diagnostic
+        // (plan P5).
+        if (fix3_result)
+        {
+            *fix3_result = fix3;
+        }
+        return false;
+    }
     // Step 3: the neutral cornea, fixed root-relative at
     // establishment (PB-R1-03), re-expressed in the CURRENT
     // root frame -- the composition's only per-cycle
@@ -1040,7 +1281,9 @@ bool composeHeadTargetBlock(
         session.neutral_cornea_root * root_world_rotation +
         root_world_position;
     if (fix3.behaviour == FSVRPostureBehaviour::STANDING &&
-        inputs.root_follow_bound_valid)
+        inputs.root_follow_bound_valid &&
+        !inputs.root_follow_suspended &&
+        (!inputs.avatar_state_present || inputs.detector_proven))
     {
         // The root channel consumes the scaled, clamped
         // displacement entire: the solver's translational
@@ -1092,7 +1335,9 @@ bool composeHeadTargetBlock(
     // Sitting behaviour, the undetermined state's
     // shipped profile (brief sections 2.3/2.5), and --
     // since [FIX3-CODE-R2-01] -- the standing behaviour
-    // while OQ-2's boundary policy is not in force: the
+    // while OQ-2's boundary policy is not in force, and
+    // (R5) while root-follow is suspended by the teleport
+    // watch: the
     // lean channel composes the target, under the
     // scaling contract of brief section 2.4. For the
     // gated standing user this IS the shipped behaviour:
@@ -1225,6 +1470,15 @@ FSVRAdapterPlanResult FSVRAdapterApply::computePlan(
         input.posture_behaviour_present;
     result.root_offset_present = input.root_offset_present;
     result.root_offset = input.root_offset;
+    // P2-07B Fix 3 R5: the R5 recorder facts ride beside
+    // them, copied at the same point for the same reason.
+    result.avatar_state = input.avatar_state;
+    result.avatar_state_present = input.avatar_state_present;
+    result.root_follow_suspended = input.root_follow_suspended;
+    result.home_base_valid = input.home_base_valid;
+    result.home_base_generation = input.home_base_generation;
+    result.posture_swap_configured = input.posture_swap_configured;
+    result.posture_swap_inert = input.posture_swap_inert;
     result.resolved_locals.resize(count);
     for (S32 i = 0; i < count; ++i)
     {
@@ -2170,6 +2424,11 @@ FSVRAdapterPlanResult FSVRAdapterApplyOnce::apply(
 #include "llvrtrackingsettings.h"
 #include "llvoavatarself.h"
 #include "llagent.h"
+#include "llanimationstates.h"
+#include "llhudnametag.h"
+#include "llhudobject.h"
+#include "llviewerregion.h"
+#include "fscommon.h"
 
 #include <algorithm>
 #include <map>
@@ -2706,6 +2965,156 @@ void FSVRAdapterApplyForCharacter(LLCharacter* character, bool preview_cycle)
         }
     }
 
+    // P2-07B Fix 3 R5 (brief sections 2.1-2.2; plan P1):
+    // the cycle's avatar state, sampled from the live self
+    // avatar at this apply point -- after updateCharacter's
+    // parent reconciliation for the same frame (plan
+    // section 1.3), so the facts read here are the frame's
+    // reconciled facts. The classification is the pure
+    // fsvrClassifyAvatarState; this block only gathers its
+    // inputs. An UNKNOWN classification earns exactly one
+    // bounded re-read (plan P1): a transient mid-update
+    // read is the only ambiguity a re-read can settle, and
+    // a still-unknown second read stands. The state --
+    // never the sync's flavour stamp -- is what behaviour
+    // selection consumes from here on.
+    static FSVRAvatarStateTracker s_avatar_state_tracker;
+    // The frame the sample belongs to, captured BEFORE
+    // the first avatar-state read [FIX3-R5-CODE-R2-01]:
+    // the freshness guard below compares against this
+    // stamp, so a frame boundary crossed DURING sampling
+    // is detected, not just one after it.
+    const U64 sample_frame = LLFrameTimer::getFrameCount();
+    // The lifecycle identity [FIX3-R5-CODE-03]: a home
+    // base, a watch expectation and a tracked posture
+    // belong to one avatar lifecycle. A character change,
+    // a skeleton rebuild or a fresh install retires the
+    // tracked posture here (before it is read) and the
+    // watch + home base at their blocks below, so a
+    // reconstructed avatar standing in the same posture
+    // as its predecessor can never inherit its home base
+    // through a STANDING -> STANDING non-transition.
+    static FSVRGlueLifecycleKey s_lifecycle_key;
+    static bool s_lifecycle_known = false;
+    bool lifecycle_changed = false;
+    {
+        FSVRGlueLifecycleKey key_now;
+        key_now.character = character;
+        key_now.skeleton_generation =
+            gAgentAvatarp.notNull()
+                ? gAgentAvatarp->getSkeletonRebuildGeneration()
+                : 0;
+        key_now.install_generation = session_view.install_generation;
+        if (!s_lifecycle_known)
+        {
+            s_lifecycle_key = key_now;
+            s_lifecycle_known = true;
+        }
+        else if (key_now != s_lifecycle_key)
+        {
+            s_lifecycle_key = key_now;
+            lifecycle_changed = true;
+            s_avatar_state_tracker.reset();
+        }
+    }
+    FSVRAvatarPostureState avatar_state =
+        FSVRAvatarPostureState::UNKNOWN;
+    {
+        auto sample_avatar_state = []() {
+            FSVRAvatarStateSample s;
+            if (gAgentAvatarp.notNull() && gAgentAvatarp->isValid())
+            {
+                s.avatar_valid = true;
+                s.sitting_flag = gAgentAvatarp->isSitting();
+                // getParent() is the xform parent; the
+                // viewer's own reconciliation casts it to
+                // the object (llvoavatar.cpp's sitOnObject
+                // call), and so does the sampler.
+                LLViewerObject* parent =
+                    (LLViewerObject*)gAgentAvatarp->getParent();
+                s.parent_present = (parent != nullptr);
+                s.parent_is_object = parent && parent->isRoot();
+                LLMotion* ground_motion =
+                    gAgentAvatarp->getMotionController().findMotion(
+                        ANIM_AGENT_SIT_GROUND_CONSTRAINED);
+                if (!ground_motion ||
+                    gAgentAvatarp->getMotionController()
+                        .isMotionLoading(ground_motion))
+                {
+                    // No motion yet, or the motion is still
+                    // loading: the stock guard's own
+                    // distinction (llvoavatar.cpp's
+                    // reconciliation), read as UNKNOWN --
+                    // never folded into ACTIVE or INACTIVE.
+                    s.ground_motion = FSVRGroundMotion::UNKNOWN;
+                }
+                else
+                {
+                    s.ground_motion =
+                        gAgentAvatarp->isMotionActive(
+                            ANIM_AGENT_SIT_GROUND_CONSTRAINED)
+                            ? FSVRGroundMotion::ACTIVE
+                            : FSVRGroundMotion::INACTIVE;
+                }
+            }
+            return fsvrClassifyAvatarState(s);
+        };
+        avatar_state = sample_avatar_state();
+        if (avatar_state == FSVRAvatarPostureState::UNKNOWN)
+        {
+            avatar_state = sample_avatar_state();
+        }
+    }
+    const FSVRAvatarPostureState avatar_state_prev =
+        s_avatar_state_tracker.update(avatar_state, sample_frame);
+    // The stale-sample contract (plan P1; [FIX3-R5-CODE-05],
+    // ordering corrected [FIX3-R5-CODE-R2-01]): the tracker
+    // is stamped with the frame captured BEFORE sampling
+    // began, and the guard re-reads the frame after
+    // classification (including the bounded re-read). A
+    // frame boundary crossed at any point during sampling
+    // or classification makes the sample describe a frame
+    // other than the one being applied to: it is rejected,
+    // the state becomes UNKNOWN (fail closed, neither
+    // behaviour authorized), the rejection is recorded,
+    // and the tracker records it too.
+    if (!s_avatar_state_tracker.fresh(
+            LLFrameTimer::getFrameCount()))
+    {
+        FSVRBoneLog::eventAvatarStateStaleSample();
+        avatar_state = FSVRAvatarPostureState::UNKNOWN;
+        s_avatar_state_tracker.update(
+            avatar_state, LLFrameTimer::getFrameCount());
+    }
+    // The transition record and the in-world diagnostic
+    // (plan P5; brief sections 8.1-8.2): on the edge only,
+    // and only inside an established VR session -- the
+    // tracker itself runs unconditionally, but its record
+    // is a VR diagnostic. The chat line is the validation
+    // label: the current avatar state, announced as it
+    // changes; an UNKNOWN entry announces the fail-closed
+    // consequence with it (fail loud, section 2.4).
+    if (session_view.established &&
+        avatar_state_prev != avatar_state)
+    {
+        FSVRBoneLog::eventAvatarStateChanged(
+            fsvrAvatarPostureStateName(avatar_state_prev),
+            fsvrAvatarPostureStateName(avatar_state));
+        if (avatar_state == FSVRAvatarPostureState::UNKNOWN ||
+            avatar_state == FSVRAvatarPostureState::INVALID)
+        {
+            FSCommon::report_to_nearby_chat(llformat(
+                "VR: avatar state %s -- posture behaviours off",
+                fsvrAvatarPostureStateName(avatar_state)));
+        }
+        else
+        {
+            FSCommon::report_to_nearby_chat(llformat(
+                "VR: avatar state %s",
+                fsvrAvatarPostureStateName(avatar_state)));
+        }
+    }
+
     // P2-07B Fix 3 (brief sections 2.2/2.5/2.6): the
     // cycle's Fix 3 facts and the standing root
     // application. The behaviour is determined here, from
@@ -2747,9 +3156,28 @@ void FSVRAdapterApplyForCharacter(LLCharacter* character, bool preview_cycle)
     fix3_inputs.root_follow_bound_m = snapshot.root_follow_bound_m;
     fix3_inputs.root_follow_bound_valid =
         snapshot.root_follow_bound_valid;
-    input.posture_behaviour = fsvrEffectivePostureBehaviour(
-        session_view.posture, snapshot.posture_swap);
+    // P2-07B Fix 3 R5: the sampled avatar state rides the
+    // inputs (present, always, in production), and the
+    // plan's recorded behaviour derives through the one
+    // cycle-behaviour function the seams use, so the
+    // record can never disagree with the composition.
+    fix3_inputs.avatar_state = avatar_state;
+    fix3_inputs.avatar_state_present = true;
+    // The detector's measured-band readiness
+    // [FIX3-R5-CODE-02], from the settings snapshot.
+    fix3_inputs.detector_proven = snapshot.teleport_detector_proven;
+    input.posture_behaviour =
+        fsvrCycleBehaviour(session_view, fix3_inputs);
     input.posture_behaviour_present = true;
+    // The sampled state also rides the plan input to the
+    // record (brief section 8.1); the plan reads it not.
+    input.avatar_state = avatar_state;
+    input.avatar_state_present = true;
+    // FSVRPostureSwap's configured value is recorded with
+    // its inert status under R5 (plan P4): configured from
+    // the snapshot, effective nowhere.
+    input.posture_swap_configured = snapshot.posture_swap;
+    input.posture_swap_inert = true;
 
     // The standing root application (brief section 2.2
     // item 4; OQ-5 as ruled by Leah 2026-11-07: TRUE
@@ -2800,21 +3228,222 @@ void FSVRAdapterApplyForCharacter(LLCharacter* character, bool preview_cycle)
     // is closed, so the establishment that eventually
     // opens it anchors from the agent's position at that
     // time, not from a position the gated cycles read.
+    // P2-07B Fix 3 R5 (brief sections 3.1/4.3; plan P3):
+    // the teleport watch and the home-base lifecycle. The
+    // watch is fed every glue cycle -- before the root
+    // step, per its contract -- so its expectation tracks
+    // the agent even through cycles the gates close. A
+    // fresh sync (a new install generation) is the one act
+    // that clears a suspension and resets the watch. The
+    // home base is invalidated by: a discontinuity, the
+    // avatar sitting down, and (by the lazy establishment
+    // below reading the CURRENT position) the avatar
+    // standing up -- a fresh home base on every stand, no
+    // jump from a stale base (Leah's 2026-11-08 ruling).
+    static FSVRTeleportWatch s_teleport_watch;
+    static FSVRTeleportEventTracker s_teleport_events;
+    static U32 s_teleport_watch_generation = 0;
+    bool teleport_suspended = false;
+    bool home_base_invalid = false;
+    const char* home_base_invalid_reason = nullptr;
+    {
+        // The ending generation's labeled band evidence,
+        // recorded before a reset retires it
+        // [FIX3-R5-CODE-02 / CODE-R2-02 / CODE-R3-2A].
+        auto emit_band_evidence = []() {
+            if (s_teleport_watch.max_continuity_m > 0.f ||
+                s_teleport_watch.teleport_count > 0 ||
+                s_teleport_watch.unexplained_count > 0 ||
+                s_teleport_events.events_completed > 0 ||
+                s_teleport_events.events_incomplete > 0 ||
+                s_teleport_events.incompleteAtEnd() > 0)
+            {
+                FSVRBoneLog::eventDetectorBandObservation(
+                    s_teleport_watch.max_continuity_m,
+                    s_teleport_watch.teleport_step_max_m,
+                    s_teleport_watch.teleport_min_m,
+                    s_teleport_watch.teleport_count,
+                    s_teleport_watch.unexplained_count,
+                    s_teleport_watch.unexplained_max_m,
+                    s_teleport_events.event_min_m,
+                    s_teleport_events.event_max_m,
+                    s_teleport_events.events_completed,
+                    s_teleport_events.events_incomplete +
+                        s_teleport_events.incompleteAtEnd());
+            }
+        };
+        if (!session_view.established)
+        {
+            emit_band_evidence();
+            s_teleport_watch.reset();
+            s_teleport_events.reset();
+            s_teleport_watch_generation = 0;
+        }
+        else if (s_teleport_watch_generation !=
+                 session_view.install_generation)
+        {
+            emit_band_evidence();
+            s_teleport_watch.reset();
+            s_teleport_events.reset();
+            s_teleport_watch_generation =
+                session_view.install_generation;
+            // A fresh sync is also the validation label's
+            // session-start line (plan P5): the state the
+            // session begins in, announced once per sync.
+            FSCommon::report_to_nearby_chat(llformat(
+                "VR: avatar state %s",
+                fsvrAvatarPostureStateName(avatar_state)));
+        }
+        if (session_view.established)
+        {
+            if (lifecycle_changed)
+            {
+                // The avatar this cycle belongs to is not
+                // the one the watch and home base were
+                // built for [FIX3-R5-CODE-03]: retire both
+                // before the watch judges anything.
+                s_teleport_watch.reset();
+                s_teleport_events.reset();
+                home_base_invalid = true;
+                if (!home_base_invalid_reason)
+                {
+                    home_base_invalid_reason = "reconstruction";
+                }
+            }
+            LLViewerRegion* region = gAgent.getRegion();
+            const U64 region_id = region ? region->getHandle() : 0;
+            const bool was_suspended = s_teleport_watch.suspended;
+            // The evidence label [FIX3-R5-CODE-R2-02]: the
+            // viewer's own teleport state -- a source
+            // independent of the watch's threshold -- says
+            // whether this cycle's movement belongs to a
+            // known teleport.
+            const bool known_teleport =
+                gAgent.getTeleportState() !=
+                LLAgent::TELEPORT_NONE;
+            // Whole-event measurement [FIX3-R5-CODE-R3-2A]:
+            // the tracker sees the same label and position;
+            // a completion is recorded as it happens.
+            {
+                F32 event_net = 0.f;
+                if (s_teleport_events.observe(
+                        known_teleport, gAgent.getPositionAgent(),
+                        event_net))
+                {
+                    FSVRBoneLog::eventTeleportEventMeasured(
+                        event_net);
+                }
+            }
+            if (s_teleport_watch.observe(
+                    gAgent.getPositionAgent(), region_id,
+                    FSVR_TELEPORT_PROVISIONAL_EPSILON_M,
+                    known_teleport) ==
+                FSVRWatchVerdict::DISCONTINUITY)
+            {
+                home_base_invalid = true;
+                home_base_invalid_reason =
+                    s_teleport_watch.last_cause ==
+                            FSVRWatchCause::REGION
+                        ? "region"
+                        : "teleport";
+            }
+            teleport_suspended = s_teleport_watch.suspended;
+            if (!was_suspended && teleport_suspended)
+            {
+                // The suspension edge (plan P5): the cause
+                // and the effect, recorded once, and the
+                // user told in-world -- a suspension that
+                // only a fresh sync clears must never be
+                // silent. The cause is reported as itself
+                // [FIX3-R5-CODE-R3-2B]: a region change is
+                // not a suspected teleport.
+                if (s_teleport_watch.last_cause ==
+                    FSVRWatchCause::REGION)
+                {
+                    FSVRBoneLog::eventRegionDiscontinuity(
+                        s_teleport_watch.last_discontinuity_m);
+                    FSVRBoneLog::eventRootFollowSuspended(
+                        "region");
+                    FSCommon::report_to_nearby_chat(
+                        "VR: region changed -- root follow "
+                        "suspended until you sync again");
+                }
+                else
+                {
+                    FSVRBoneLog::eventTeleportSuspected(
+                        s_teleport_watch.last_discontinuity_m);
+                    FSVRBoneLog::eventRootFollowSuspended(
+                        "teleport");
+                    FSCommon::report_to_nearby_chat(
+                        "VR: teleport suspected -- root follow "
+                        "suspended until you sync again");
+                }
+            }
+        }
+        if (avatar_state_prev == FSVRAvatarPostureState::STANDING &&
+            fsvrAvatarStateIsSitting(avatar_state))
+        {
+            home_base_invalid = true;
+            if (!home_base_invalid_reason)
+            {
+                home_base_invalid_reason = "sitting";
+            }
+        }
+        // The cycle's suspension fact rides the plan input
+        // to the record (brief section 8.1).
+        input.root_follow_suspended = teleport_suspended;
+        // And the cycle inputs: the composition and the
+        // root step read the same fact for the fall-through
+        // (suspension withholds the write and the standing
+        // suppression, never the lean).
+        fix3_inputs.root_follow_suspended = teleport_suspended;
+    }
+    const bool standing_entry =
+        avatar_state == FSVRAvatarPostureState::STANDING &&
+        avatar_state_prev != FSVRAvatarPostureState::STANDING;
+
     LLVector3 root_move_delta = LLVector3::zero;
+    bool root_wrote = false;
+    // The one root-write eligibility decision, computed
+    // once at function scope: the anchor block consumes
+    // it to write, and the in-world indicator derives its
+    // ROOT line from it [FIX3-R5-CODE-R2-03] -- the
+    // indicator never reconstructs its own version.
+    const bool root_move_eligible =
+        session_view.established &&
+        snapshot.stage2_constraint_authorized &&
+        input.spine_sample_valid &&
+        input.head_position_enabled &&
+        input.spine_decisions_runtime_effective &&
+        input.cycle == FSVRAdapterCycleKind::NORMAL &&
+        !teleport_suspended &&
+        snapshot.teleport_detector_proven;
     {
         static bool s_root_anchor_valid = false;
         static U32 s_root_anchor_generation = 0;
         static LLVector3 s_root_anchor_agent = LLVector3::zero;
-        if (!session_view.established)
+        if (!session_view.established || home_base_invalid ||
+            standing_entry)
         {
+            // The invalidation record (plan P5): only a
+            // base that existed can be invalidated, and the
+            // reason rides with it -- a session loss, a
+            // teleport, or the avatar sitting down. A
+            // standing entry is a refresh, not an
+            // invalidation: its record is the establishment
+            // that follows.
+            if (s_root_anchor_valid)
+            {
+                const char* reason =
+                    !session_view.established ? "session"
+                                              : home_base_invalid_reason;
+                if (reason)
+                {
+                    FSVRBoneLog::eventHomeBaseInvalidated(reason);
+                }
+            }
             s_root_anchor_valid = false;
         }
-        const bool root_move_eligible =
-            snapshot.stage2_constraint_authorized &&
-            input.spine_sample_valid &&
-            input.head_position_enabled &&
-            input.spine_decisions_runtime_effective &&
-            input.cycle == FSVRAdapterCycleKind::NORMAL;
         if (root_move_eligible)
         {
             const FSVRStandingRootStep root_step =
@@ -2874,6 +3503,12 @@ void FSVRAdapterApplyForCharacter(LLCharacter* character, bool preview_cycle)
                         s_root_anchor_generation =
                             session_view.install_generation;
                         s_root_anchor_valid = true;
+                        // The establishment record (plan
+                        // P5): a home base now exists, from
+                        // the agent's position at this
+                        // moment, under this generation.
+                        FSVRBoneLog::eventHomeBaseEstablished(
+                            s_root_anchor_generation);
                     }
                     const LLVector3 before =
                         gAgent.getPositionAgent();
@@ -2886,10 +3521,126 @@ void FSVRAdapterApplyForCharacter(LLCharacter* character, bool preview_cycle)
                     if (!(target == before))
                     {
                         gAgent.setPositionAgent(target);
+                        // The watch's expectation updates
+                        // atomically with the write (plan P3
+                        // contract point 2), so the adapter's
+                        // own movement never trips it.
+                        s_teleport_watch.noteWrite(target);
+                        root_wrote = true;
                     }
                     root_move_delta = target - before;
                 }
             }
+        }
+        // The cycle's home-base facts ride the plan input
+        // to the record (brief section 8.1), read from the
+        // anchor store at the end of its own block.
+        input.home_base_valid = s_root_anchor_valid;
+        input.home_base_generation = s_root_anchor_generation;
+    }
+
+    // The watch's no-write bookkeeping (plan P3 contract
+    // point 1): a cycle that wrote nothing leaves the
+    // expectation at the position sampled at its end, so
+    // ordinary movement through unwritten cycles never
+    // accumulates into a false discontinuity.
+    if (!root_wrote && session_view.established)
+    {
+        s_teleport_watch.noteNoWrite(gAgent.getPositionAgent());
+    }
+
+    // The detector-unproven announcement [FIX3-R5-CODE-02]:
+    // standing in an established session while the
+    // detector's bands are unmeasured means root-follow is
+    // off for a reason the user must be able to see --
+    // recorded and announced once per install generation,
+    // never silently degraded (Leah's no-silent-fallbacks
+    // rule).
+    {
+        static U32 s_detector_unproven_announced_gen = 0;
+        if (session_view.established &&
+            avatar_state == FSVRAvatarPostureState::STANDING &&
+            !snapshot.teleport_detector_proven &&
+            s_detector_unproven_announced_gen !=
+                session_view.install_generation)
+        {
+            s_detector_unproven_announced_gen =
+                session_view.install_generation;
+            FSVRBoneLog::eventRootFollowDetectorUnproven();
+            FSCommon::report_to_nearby_chat(
+                "VR: root follow off -- teleport safety "
+                "check not proven yet");
+        }
+    }
+
+    // The persistent in-world indicator (brief section
+    // 8.2; [FIX3-R5-CODE-04]): three lines above the
+    // avatar, formatted purely from the facts this cycle
+    // consumed (fsvrFormatIndicatorLines) -- the
+    // indicator infers nothing itself. Present only
+    // inside an established session and only while its
+    // toggle is on; the text is rewritten only when it
+    // changes, the position follows the avatar.
+    {
+        static LLPointer<LLHUDNameTag> s_indicator_tag;
+        static std::string s_indicator_text;
+        const bool indicator_wanted =
+            session_view.established &&
+            snapshot.show_posture_indicator &&
+            gAgentAvatarp.notNull();
+        if (indicator_wanted)
+        {
+            FSVRIndicatorFacts facts;
+            facts.avatar_state = avatar_state;
+            facts.behaviour = input.posture_behaviour;
+            facts.session_established = true;
+            facts.root_follow_suspended = teleport_suspended;
+            facts.detector_proven =
+                snapshot.teleport_detector_proven;
+            facts.head_position_on = input.head_position_enabled;
+            facts.root_follow_bound_valid =
+                snapshot.root_follow_bound_valid;
+            // Derived from the production decision itself
+            // [FIX3-R5-CODE-R2-03]: the same eligibility
+            // conjunction the anchor block writes under,
+            // plus the home base those writes consume.
+            facts.root_writes_eligible =
+                root_move_eligible && input.home_base_valid;
+            const FSVRIndicatorLines lines =
+                fsvrFormatIndicatorLines(facts);
+            const std::string text = lines.avatar_line + "\n" +
+                lines.behaviour_line + "\n" + lines.root_line;
+            if (s_indicator_tag.isNull())
+            {
+                s_indicator_tag = static_cast<LLHUDNameTag*>(
+                    LLHUDObject::addHUDObject(
+                        LLHUDObject::LL_HUD_NAME_TAG));
+                s_indicator_tag->setSourceObject(gAgentAvatarp);
+                s_indicator_tag->setDoFade(false);
+                s_indicator_tag->setZCompare(false);
+                s_indicator_tag->setMaxLines(3);
+                s_indicator_text.clear();
+            }
+            if (text != s_indicator_text)
+            {
+                s_indicator_text = text;
+                s_indicator_tag->clearString();
+                s_indicator_tag->addLine(lines.avatar_line,
+                                         LLColor4::white);
+                s_indicator_tag->addLine(lines.behaviour_line,
+                                         LLColor4::white);
+                s_indicator_tag->addLine(lines.root_line,
+                                         LLColor4::white);
+            }
+            s_indicator_tag->setPositionAgent(
+                gAgentAvatarp->getWorldPosition() +
+                LLVector3(0.f, 0.f, 2.2f));
+        }
+        else if (s_indicator_tag.notNull())
+        {
+            s_indicator_tag->markDead();
+            s_indicator_tag = nullptr;
+            s_indicator_text.clear();
         }
     }
 
