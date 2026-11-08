@@ -119,6 +119,19 @@ struct FSVRBoneLogPlanData
     bool solver_targets_present = false;
     std::vector<LLQuaternion> solver_targets;
     std::vector<char> solver_target_mask;
+    // P2-07B Fix 3 (brief section 4): the plan result's
+    // root-channel record. root_offset is the cycle's
+    // computed standing root offset (world vector),
+    // present only when the standing channel produced
+    // one -- absent-means-absent, never a fabricated zero
+    // (F3-F). posture_behaviour names the posture
+    // behaviour in force for the cycle (a fsvrPosture-
+    // BehaviourName string owned by the calibration TU);
+    // nullptr serializes as absent, so pre-Fix-3 plan
+    // blocks parse identically (the F4-F1 standard).
+    bool root_offset_present = false;
+    LLVector3 root_offset = LLVector3::zero;
+    const char* posture_behaviour = nullptr;
 };
 
 struct FSVRBoneLogHeadRotSample
@@ -234,6 +247,52 @@ public:
         F32 anchor_forward_yaw_rad,
         const LLVector3& cornea_offset_head_local,
         const LLVector3& neutral_cornea_root);
+    // P2-07B Fix 3 (brief sections 2.1/2.4): the
+    // establishment record extended with the posture
+    // flavour installed and the scale contract in force
+    // per channel (fsvrPostureName / fsvrScaleContractName
+    // strings owned by the calibration TU). Any nullptr
+    // name serializes as absent, so the record's pre-Fix-3
+    // reading is unchanged (F3-F).
+    static void eventSyncExecuted(
+        U64 frame_token,
+        const LLVector3& anchor_hmd_local,
+        F32 anchor_forward_yaw_rad,
+        const LLVector3& cornea_offset_head_local,
+        const LLVector3& neutral_cornea_root,
+        const char* posture,
+        const char* lean_contract,
+        const char* root_contract);
+    // P2-07B Fix 3 (brief section 2.5): emitted once per
+    // establishment gap by the calibration shell (the
+    // pure FSVRPostureGapTracker decides) -- the
+    // undetermined-posture state announcing itself in the
+    // record, never per cycle.
+    static void eventPostureUndetermined();
+    // P2-07B Fix 3 (brief section 2.4): an invalid scale
+    // parameter failed its channel closed (never
+    // clamped). channel is "lean" or "root".
+    static void eventScaleParameterInvalid(const char* channel);
+    // P2-07B Fix 3 [FIX3-CODE-R1-03]: the standing root
+    // channel computed a valid offset, but the live
+    // agent write is gated OFF while OQ-2 (the
+    // playspace boundary policy) remains undecided --
+    // unbounded following may not be selected by
+    // implementation silence. Emitted by the adapter
+    // glue once per establishment, edge-latched like
+    // the scale-parameter events: the gate announces
+    // itself in the record, never per cycle.
+    static void eventRootFollowGated();
+    // P2-07B Fix 3 [FIX3-CODE-R3]: the root-follow
+    // bound (FSVRRootFollowBoundMeters) is absent or
+    // invalid, so OQ-2's ruled policy (stop at the
+    // bound) is not in force and live root movement
+    // stays gated off -- the gated state with its cause
+    // named. Same record shape as eventRootFollowGated;
+    // emitted by the adapter glue once per
+    // establishment alongside it, edge-latched the same
+    // way.
+    static void eventRootFollowBoundInvalid();
 
     // P2-07B Fix 4 (brief section 2.5): base-provenance
     // lifecycle events, emitted by the adapter glue when
@@ -290,6 +349,30 @@ public:
         F32 anchor_forward_yaw_rad,
         const LLVector3& cornea_offset_head_local,
         const LLVector3& neutral_cornea_root);
+    // Fix 3 extended form: the three Fix 3 names append
+    // as optional keys after neutral_cornea_root, each
+    // present only when its pointer is non-null.
+    static void buildSyncExecutedRecord(
+        std::string& out,
+        long long t_ms,
+        U64 frame_token,
+        const LLVector3& anchor_hmd_local,
+        F32 anchor_forward_yaw_rad,
+        const LLVector3& cornea_offset_head_local,
+        const LLVector3& neutral_cornea_root,
+        const char* posture,
+        const char* lean_contract,
+        const char* root_contract);
+    static void buildPostureUndeterminedRecord(std::string& out,
+                                               long long t_ms);
+    static void buildScaleParameterInvalidRecord(
+        std::string& out,
+        long long t_ms,
+        const char* channel);
+    static void buildRootFollowGatedRecord(std::string& out,
+                                           long long t_ms);
+    static void buildRootFollowBoundInvalidRecord(std::string& out,
+                                                  long long t_ms);
     static void buildDropsRecord(std::string& out,
                                  long long t_ms,
                                  U64 dropped_total);

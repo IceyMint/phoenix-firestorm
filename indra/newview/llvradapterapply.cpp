@@ -633,6 +633,337 @@ bool decideSpineSampleValid(const FSVRSpineSampleInputs& in)
            !in.calibration_in_progress;
 }
 
+// ---------------------------------------------------------------------------
+// P2-07B Fix 3 (brief sections 2.1/2.2/2.4): the posture
+// behaviour, the record names, the channel factors, the
+// shared displacement mapping and the standing root
+// step. Pure seams all: the composition below, the
+// glue's root application and the harnesses consume the
+// same functions, so a fixture tests the production
+// decision, never a reimplementation.
+// ---------------------------------------------------------------------------
+
+FSVRPostureBehaviour fsvrEffectivePostureBehaviour(
+    FSVRPosture posture, bool posture_swap)
+{
+    // The swap exchanges the two declared behaviours;
+    // UNDETERMINED has no behaviour to exchange into --
+    // it runs neither, whatever the swap says (brief
+    // section 2.1).
+    switch (posture)
+    {
+    case FSVRPosture::SEATED:
+        return posture_swap ? FSVRPostureBehaviour::STANDING
+                            : FSVRPostureBehaviour::SITTING;
+    case FSVRPosture::STANDING:
+        return posture_swap ? FSVRPostureBehaviour::SITTING
+                            : FSVRPostureBehaviour::STANDING;
+    case FSVRPosture::UNDETERMINED:
+    default:
+        return FSVRPostureBehaviour::NONE;
+    }
+}
+
+const char* fsvrPostureName(FSVRPosture posture)
+{
+    switch (posture)
+    {
+    case FSVRPosture::SEATED:   return "seated";
+    case FSVRPosture::STANDING: return "standing";
+    case FSVRPosture::UNDETERMINED:
+    default:                    return "undetermined";
+    }
+}
+
+const char* fsvrPostureBehaviourName(FSVRPostureBehaviour behaviour)
+{
+    switch (behaviour)
+    {
+    case FSVRPostureBehaviour::SITTING:  return "sitting";
+    case FSVRPostureBehaviour::STANDING: return "standing";
+    case FSVRPostureBehaviour::NONE:
+    default:                             return "undetermined";
+    }
+}
+
+const char* fsvrScaleContractName(FSVRScaleContract contract)
+{
+    switch (contract)
+    {
+    case FSVRScaleContract::PROPORTIONAL: return "proportional";
+    case FSVRScaleContract::OFF:          return "off";
+    case FSVRScaleContract::PROVISIONAL:
+    default:                              return "provisional";
+    }
+}
+
+LLVector3 fsvrMapAnchorDisplacement(
+    const FSVRSessionNeutralView& session,
+    const LLVector3& hmd_position_local,
+    F32 session_base_yaw_rad,
+    const LLQuaternion& root_world_rotation)
+{
+    // The shipped composition's Steps 1-2, verbatim:
+    // Step 1: the displacement from the session anchor,
+    // both in the current LOCAL space (the anchor makes
+    // no floor claim). hmd_position_local is the cycle's
+    // ONE manager read -- the same sample E7 judged
+    // (DP-C6E-3).
+    const LLVector3 d_local =
+        hmd_position_local - session.anchor_hmd_local;
+    // Step 2: the rotation path's placement pipeline in
+    // its vector form (brief section 2.13): P re-expresses
+    // the raw (right, up, back) components as (forward,
+    // left, up) components -- the correspondence stage 2's
+    // scalar reading implies -- q_yaw is the session's
+    // yaw-only frame alignment (theta_B, ICR-1), and the
+    // plan's root frame is the avatar-side carrier,
+    // substituted for the camera's chest basis by the
+    // spec's own ruling (PB-R1-03 bars the arbitrated pose
+    // here).
+    const LLVector3 p_mapped(-d_local.mV[VZ], -d_local.mV[VX],
+                             d_local.mV[VY]);
+    const LLQuaternion q_yaw(session_base_yaw_rad, LLVector3::z_axis);
+    return (p_mapped * q_yaw) * root_world_rotation;
+}
+
+FSVRManualRatioState fsvrManualRatioState(bool is_set,
+                                          bool is_invalid)
+{
+    // [FIX3-CODE-R1-01] The snapshot's per-channel
+    // derivation in seam form: unset is ABSENT (the
+    // derived ratio or provisional baseline rules);
+    // present and valid is VALID (the stated ratio
+    // rules); present but invalid is INVALID (the
+    // channel fails closed at the factor). The
+    // derivation itself -- what counts as set, and
+    // which present values are valid -- is
+    // captureForFrame's, beside the raw reads.
+    if (!is_set)
+    {
+        return FSVRManualRatioState::ABSENT;
+    }
+    return is_invalid ? FSVRManualRatioState::INVALID
+                      : FSVRManualRatioState::VALID;
+}
+
+FSVRChannelFactor fsvrLeanChannelFactor(
+    const FSVRSessionNeutralView& session, F32 lean_gain,
+    bool diag_force_unit_scale,
+    const FSVRFix3CycleInputs& inputs)
+{
+    FSVRChannelFactor out;
+    // Brief section 2.4's manual-ratio interaction rules,
+    // no exceptions: present and valid wins; present but
+    // invalid fails the channel closed (never clamped,
+    // never quietly replaced by the derived value). A
+    // state of VALID carrying a non-positive or
+    // non-finite value is invalid on its face and takes
+    // the same path.
+    if (inputs.manual_lean == FSVRManualRatioState::INVALID)
+    {
+        out.invalid = true;
+        return out;
+    }
+    // [FIX3-CODE-R1-02] The gain's validity is part of
+    // the factor decision, exactly as the root channel's
+    // already is: an invalid gain fails the channel
+    // closed ahead of every ratio source. The snapshot
+    // pins an invalid gain's carried value to 1.0, and
+    // that pinned substitute must never be consumed
+    // here as a valid gain -- substituting 1.0 and
+    // continuing is the silent fallback section 2.4
+    // bars. (The glue's E5 conjunction also fails the
+    // cycle on an invalid gain, CP-S1-4; the channel's
+    // own decision now fails closed on its own terms
+    // and names itself on the composition result.)
+    if (!inputs.lean_gain_valid)
+    {
+        out.invalid = true;
+        return out;
+    }
+    F32 ratio;
+    if (inputs.manual_lean == FSVRManualRatioState::VALID)
+    {
+        if (!std::isfinite(inputs.manual_lean_ratio) ||
+            inputs.manual_lean_ratio <= 0.f)
+        {
+            out.invalid = true;
+            return out;
+        }
+        // The user's stated ratio IS the ratio (proportional
+        // by declaration); the diagnostic, which forces the
+        // *calibration* ratio, does not touch it, exactly
+        // as it does not touch the gain.
+        ratio = inputs.manual_lean_ratio;
+    }
+    else if (diag_force_unit_scale)
+    {
+        // FSVRDiagForceUnitScale keeps its shipped meaning
+        // (CP-S1-3): it forces the calibration ratio to
+        // 1.0; the gain is a user preference and survives
+        // the diagnostic.
+        ratio = 1.f;
+    }
+    else if (session.scale_source == FSVRScaleSource::MEASURED_RECORD)
+    {
+        // The matched pair's own ratio, in the F32 form
+        // the shipped seam consumed it in.
+        ratio = static_cast<F32>(session.record.head_ratio);
+    }
+    else
+    {
+        // The provisional baseline (a sync-established
+        // neutral, whose record's head_ratio is never
+        // read; for NONE the block is unreachable in
+        // production, E5 having failed the cycle, and the
+        // baseline is the safe value regardless).
+        ratio = static_cast<F32>(
+            FSVRCalibration::PROVISIONAL_LEAN_BASELINE);
+    }
+    // The contract's one composition: ratio x gain in
+    // F32 (brief section 2.4's identity construction).
+    out.factor = ratio * lean_gain;
+    out.applied = true;
+    return out;
+}
+
+FSVRChannelFactor fsvrRootChannelFactor(
+    const FSVRFix3CycleInputs& inputs)
+{
+    FSVRChannelFactor out;
+    // The same interaction rules as the lean channel
+    // (fsvrLeanChannelFactor), over the root channel's
+    // own parameters: the gain's validity is the
+    // snapshot's shipped gain contract (rejected, never
+    // clamped); an invalid value of either parameter
+    // fails the channel closed.
+    if (inputs.manual_root == FSVRManualRatioState::INVALID)
+    {
+        out.invalid = true;
+        return out;
+    }
+    if (!inputs.root_gain_valid)
+    {
+        out.invalid = true;
+        return out;
+    }
+    // No proportional contract is specified for this
+    // channel in this brief (OQ-7): the ratio is the
+    // provisional baseline, or a valid manual ratio
+    // (proportional by declaration).
+    F32 ratio = 1.f;
+    if (inputs.manual_root == FSVRManualRatioState::VALID)
+    {
+        if (!std::isfinite(inputs.manual_root_ratio) ||
+            inputs.manual_root_ratio <= 0.f)
+        {
+            out.invalid = true;
+            return out;
+        }
+        ratio = inputs.manual_root_ratio;
+    }
+    out.factor = ratio * inputs.root_gain;
+    out.applied = true;
+    return out;
+}
+
+FSVRStandingRootStep fsvrComputeStandingRootStep(
+    const FSVRSessionNeutralView& session,
+    const LLVector3& hmd_position_local,
+    F32 session_base_yaw_rad,
+    const LLQuaternion& root_world_rotation,
+    const FSVRFix3CycleInputs& inputs)
+{
+    FSVRStandingRootStep step;
+    step.behaviour = fsvrEffectivePostureBehaviour(
+        session.posture, inputs.posture_swap);
+    if (step.behaviour != FSVRPostureBehaviour::STANDING ||
+        !inputs.head_position_enabled)
+    {
+        // Not the standing behaviour, or Head position is
+        // OFF (brief section 0.4: no positional behaviour
+        // of any kind, root channel included): the channel
+        // produces exactly zero.
+        return step;
+    }
+    const FSVRChannelFactor factor = fsvrRootChannelFactor(inputs);
+    if (!factor.applied)
+    {
+        // The channel fails closed: this cycle's
+        // displacement is consumed NOWHERE -- in
+        // particular it is never handed to the solver as
+        // a remainder (brief section 2.2 item 1's stated
+        // invariant).
+        step.root_scale_invalid = factor.invalid;
+        return step;
+    }
+    LLVector3 d_world = fsvrMapAnchorDisplacement(
+        session, hmd_position_local, session_base_yaw_rad,
+        root_world_rotation);
+    // [FIX3-CODE-R3] OQ-2 as ruled by Leah (2026-11-07:
+    // STOP AT THE BOUND): when the boundary policy is in
+    // force, the consumed displacement is radially
+    // clamped to the bound BEFORE per-channel scaling.
+    // The mapping above is a pure rotation chain, so the
+    // mapped vector's length IS the physical displacement
+    // from the sync anchor, and scaling it radially here
+    // clamps the physical displacement, direction
+    // preserved. Displacement beyond the bound is
+    // unconsumed: the offset stays where the bound put
+    // it, and because the state model remains OQ-1's
+    // form (b) -- the offset is a pure function of the
+    // current displacement -- walking back inside the
+    // bound brings the avatar back with the user, no
+    // re-sync, no accumulated remainder. When the policy
+    // is not in force (bound invalid) no clamp is
+    // applied either: the offset is still computed, for
+    // the record and the fixtures, from the displacement
+    // entire -- but nothing writes it and nothing
+    // suppresses the lean for it (live, below, is
+    // false), so the unclamped value reaches no consumer
+    // but the record.
+    if (inputs.root_follow_bound_valid)
+    {
+        const F32 len = d_world.length();
+        if (len > inputs.root_follow_bound_m)
+        {
+            d_world *= inputs.root_follow_bound_m / len;
+            step.bound_clamped = true;
+        }
+    }
+    // ScaleRoot: one F32 multiplication of the (possibly
+    // clamped) mapped displacement state (brief section
+    // 2.4's construction). Under OQ-1's ruled form (b)
+    // the state is the current cycle's displacement
+    // itself: the offset is anchored, never accumulated,
+    // and walking back is the return.
+    const LLVector3 offset = d_world * factor.factor;
+    if (!std::isfinite(offset.mV[VX]) ||
+        !std::isfinite(offset.mV[VY]) ||
+        !std::isfinite(offset.mV[VZ]))
+    {
+        // The provisional path's finite guard (S1-BRIEF-
+        // R1-02), extended to the root channel by brief
+        // section 2.4: a non-finite scaled displacement
+        // never reaches the root. The channel fails
+        // closed with its event, as for an invalid
+        // parameter.
+        step.root_scale_invalid = true;
+        return step;
+    }
+    step.root_offset = offset;
+    step.offset_valid = true;
+    // The write authorization, as one fact: a valid
+    // offset under a boundary policy in force. The glue
+    // writes only a live step; while the policy is not
+    // in force the step is computed and recorded but the
+    // agent does not move and the composition does not
+    // suppress [FIX3-CODE-R2-01].
+    step.live = inputs.root_follow_bound_valid;
+    return step;
+}
+
 bool composeHeadTargetBlock(
     const FSVRSessionNeutralView& session,
     const LLVector3& hmd_position_local, F32 session_base_yaw_rad,
@@ -640,7 +971,9 @@ bool composeHeadTargetBlock(
     const LLVector3& root_world_position, bool diag_force_unit_scale,
     F32 lean_gain,
     LLVector3& out_head_target_world,
-    LLVector3& out_cornea_offset_head_local)
+    LLVector3& out_cornea_offset_head_local,
+    const FSVRFix3CycleInputs* fix3_inputs,
+    FSVRFix3CompositionResult* fix3_result)
 {
     // P2-07B C6-E (CP-4; Package B spec section 7.3). Pure
     // over its named inputs; the glue calls it only when the
@@ -648,102 +981,200 @@ bool composeHeadTargetBlock(
     // established check below is the composition's own
     // presence condition (a session without a neutral has
     // nothing to compose from).
+    const FSVRFix3CycleInputs inputs =
+        fix3_inputs ? *fix3_inputs : FSVRFix3CycleInputs();
+    FSVRFix3CompositionResult fix3;
+    fix3.behaviour = fsvrEffectivePostureBehaviour(
+        session.posture, inputs.posture_swap);
     if (!session.established)
     {
+        if (fix3_result)
+        {
+            *fix3_result = fix3;
+        }
         return false;
     }
-    // Step 1: the displacement from the session anchor, both
-    // in the current LOCAL space (the anchor makes no floor
-    // claim). hmd_position_local is the cycle's ONE manager
-    // read -- the same sample E7 judged (DP-C6E-3).
-    const LLVector3 d_local =
-        hmd_position_local - session.anchor_hmd_local;
-    // Step 2: the rotation path's placement pipeline in its
-    // vector form (brief section 2.13): P re-expresses the
-    // raw (right, up, back) components as (forward, left,
-    // up) components -- the correspondence stage 2's scalar
-    // reading implies -- q_yaw is the session's yaw-only
-    // frame alignment (theta_B, ICR-1), and the plan's root
-    // frame is the avatar-side carrier, substituted for the
-    // camera's chest basis by the spec's own ruling
-    // (PB-R1-03 bars the arbitrated pose here).
-    const LLVector3 p_mapped(-d_local.mV[VZ], -d_local.mV[VX],
-                             d_local.mV[VY]);
-    const LLQuaternion q_yaw(session_base_yaw_rad, LLVector3::z_axis);
-    LLVector3 d_world =
-        (p_mapped * q_yaw) * root_world_rotation;
-    // P2-07B Stage 1 (CP-S1-3): the provisional mapping. For
-    // a sync-established neutral, the user's lean gain
-    // scales the target displacement BEFORE the solver sees
-    // it -- applied to d_world, not to the seam ratio, so
-    // FSVRDiagForceUnitScale keeps its exact shipped
-    // meaning (it forces the *calibration* ratio to 1.0;
-    // the gain is a user preference and survives the
-    // diagnostic). At gain 1.0 the cornea target moves
-    // exactly as far as the headset moved, in world units:
-    // a baseline response, not an anatomical proportion
-    // (REDESIGN-R1-01).
-    // The post-multiplication finite guard (S1-BRIEF-R1-02)
-    // lives in this branch only: this is the one path where
-    // a user-supplied multiplier meets an unbounded
-    // displacement, and a nonfinite target must never reach
-    // the solver from it. The measured path introduces no
-    // new multiplication and keeps its shipped behaviour
-    // exactly (its inputs remain bounded by the record
-    // validator); guarding it too would break the measured
-    // path's pinned bit-identity for no Stage 1 need.
-    const bool provisional =
-        session.scale_source == FSVRScaleSource::PROVISIONAL_SYNC;
-    if (provisional)
+    // Steps 1-2: the mapped displacement, through the one
+    // shared mapping (fsvrMapAnchorDisplacement).
+    const LLVector3 d_world = fsvrMapAnchorDisplacement(
+        session, hmd_position_local, session_base_yaw_rad,
+        root_world_rotation);
+    // P2-07B Fix 3 (brief section 2.2 item 1): the
+    // standing root step for this cycle -- the identical
+    // pure decision the glue executed before composition
+    // (the two agree by construction, sharing the code).
+    const FSVRStandingRootStep root_step =
+        fsvrComputeStandingRootStep(
+            session, hmd_position_local, session_base_yaw_rad,
+            root_world_rotation, inputs);
+    fix3.root_offset_valid = root_step.offset_valid;
+    fix3.root_offset = root_step.root_offset;
+    fix3.root_scale_invalid = root_step.root_scale_invalid;
+    // Both channels' parameter validity is a fact of the
+    // cycle independent of the behaviour in force: an
+    // invalid scale parameter is owed its event even in a
+    // cycle whose posture leaves its channel dormant
+    // (brief section 2.4 -- the channel is off, and says
+    // so). The factor decisions are evaluated once here
+    // and consumed below; the root step above ran the
+    // same pure root decision for its offset.
+    const FSVRChannelFactor lean_factor = fsvrLeanChannelFactor(
+        session, lean_gain, diag_force_unit_scale, inputs);
+    fix3.lean_scale_invalid = lean_factor.invalid;
+    if (!fix3.root_scale_invalid)
     {
-        d_world *= lean_gain;
-        if (!std::isfinite(d_world.mV[VX]) ||
-            !std::isfinite(d_world.mV[VY]) ||
-            !std::isfinite(d_world.mV[VZ]))
-        {
-            return false;
-        }
+        fix3.root_scale_invalid =
+            fsvrRootChannelFactor(inputs).invalid;
     }
     // Step 3: the neutral cornea, fixed root-relative at
     // establishment (PB-R1-03), re-expressed in the CURRENT
     // root frame -- the composition's only per-cycle
     // pose-dependent input. The cycle's arbitrated pose is
-    // never read here.
+    // never read here. Under the standing behaviour with
+    // OQ-2's policy in force this frame is the MOVED root
+    // frame (the glue applied the offset before base
+    // composition, brief section 2.2 item 4), so the
+    // target rides the root by construction (OQ-4's
+    // condition A).
     const LLVector3 neutral_cornea_world =
         session.neutral_cornea_root * root_world_rotation +
         root_world_position;
-    // Step 4: C6's shipped composition seam. P2-07B Stage 1
-    // (CP-S1-3): the ratio is selected by the view's scale
-    // source -- the record's head_ratio for a measured
-    // neutral (bit-identical to the shipped line), the
-    // provisional baseline constant for a sync-established
-    // one (whose record is a default NO_RECORD basis whose
-    // head_ratio is never read). For NONE the block is
-    // unreachable in production (E5 has already failed the
-    // cycle, CP-S1-4) and the baseline is the safe value
-    // regardless. The diagnostic is consumed here, at
-    // composition, per spec section 3.4 -- the record is
-    // not touched.
-    const F32 scale_ratio =
-        (session.scale_source == FSVRScaleSource::MEASURED_RECORD)
-            ? static_cast<F32>(session.record.head_ratio)
-            : static_cast<F32>(
-                  FSVRCalibration::PROVISIONAL_LEAN_BASELINE);
+    if (fix3.behaviour == FSVRPostureBehaviour::STANDING &&
+        inputs.root_follow_bound_valid)
+    {
+        // The root channel consumes the scaled, clamped
+        // displacement entire: the solver's translational
+        // input is ZERO -- a stated invariant of the
+        // standing contract (brief section 2.2 item 1),
+        // specified here, not computed as a residual
+        // (ScaleRoot(d) - root_offset would hand the
+        // solver the un-scaled remainder at any
+        // non-identity factor, and a failed-closed root
+        // channel would leak its displacement into the
+        // spine). Rotation is untouched: the head target
+        // is the neutral cornea in the current (moved)
+        // root frame, and the orientation path is not
+        // this function's. The composed target is finite
+        // whenever its inputs are (a sum of finite
+        // values can still overflow: the shipped
+        // S1-BRIEF-R1-02 guard applies unchanged -- no
+        // target is published from a nonfinite
+        // composition).
+        // [FIX3-CODE-R2-01] This branch is entered ONLY
+        // with the boundary policy in force. Standing
+        // without it -- the bound absent or invalid --
+        // falls through to the shipped lean composition
+        // below: OQ-2's gate withholds the root WRITE,
+        // it does not authorize suppressing the existing
+        // positional response while the avatar cannot
+        // move.
+        out_head_target_world = neutral_cornea_world;
+        if (!std::isfinite(out_head_target_world.mV[VX]) ||
+            !std::isfinite(out_head_target_world.mV[VY]) ||
+            !std::isfinite(out_head_target_world.mV[VZ]))
+        {
+            out_head_target_world = LLVector3::zero;
+            if (fix3_result)
+            {
+                *fix3_result = fix3;
+            }
+            return false;
+        }
+        // Step 5: the section 4.6 cornea offset, verbatim.
+        out_cornea_offset_head_local =
+            session.cornea_offset_head_local;
+        if (fix3_result)
+        {
+            *fix3_result = fix3;
+        }
+        return true;
+    }
+    // Sitting behaviour, the undetermined state's
+    // shipped profile (brief sections 2.3/2.5), and --
+    // since [FIX3-CODE-R2-01] -- the standing behaviour
+    // while OQ-2's boundary policy is not in force: the
+    // lean channel composes the target, under the
+    // scaling contract of brief section 2.4. For the
+    // gated standing user this IS the shipped behaviour:
+    // physical translation feeds the solver exactly as
+    // it did before Fix 3, because the avatar cannot
+    // consume it instead.
+    // P2-07B Stage 1 (CP-S1-3), as extended by Fix 3: the
+    // channel factor (ratio x gain, fsvrLeanChannelFactor)
+    // scales the target displacement BEFORE the solver
+    // sees it -- applied to d_world as ONE F32
+    // multiplication in the shipped lean_gain position, on
+    // every path. At factor exactly 1.0 the multiplicand
+    // is exactly 1.0f and the shipped arithmetic is
+    // reproduced bit for bit (F3-S2): for a provisional
+    // neutral the factor is the baseline x gain as
+    // shipped; for a measured one it is head_ratio x gain
+    // (the Stage 1 gain-blindness of the measured path is
+    // the asymmetry the brief's contract absorbs -- at
+    // the default gain 1.0 nothing changes, bit for bit).
+    if (!lean_factor.applied)
+    {
+        // The lean channel failed closed (an invalid
+        // manual ratio): no target is published, and the
+        // failure is named on the result for its event
+        // (fix3.lean_scale_invalid, set above).
+        if (fix3_result)
+        {
+            *fix3_result = fix3;
+        }
+        return false;
+    }
+    const LLVector3 scaled = d_world * lean_factor.factor;
+    // The post-multiplication finite guard
+    // (S1-BRIEF-R1-02), extended by Fix 3 to every channel
+    // factor application (brief section 2.4): a nonfinite
+    // scaled displacement never reaches the solver. (In
+    // Stage 1 the guard lived on the provisional path
+    // only, because that was the one path where a
+    // user-supplied multiplier met the displacement; the
+    // factor application now exists on both paths, so
+    // the guard covers both. For the measured path's
+    // validator-bounded inputs nothing changes.)
+    if (!std::isfinite(scaled.mV[VX]) ||
+        !std::isfinite(scaled.mV[VY]) ||
+        !std::isfinite(scaled.mV[VZ]))
+    {
+        if (fix3_result)
+        {
+            *fix3_result = fix3;
+        }
+        return false;
+    }
+    // Step 4: C6's shipped composition seam, with the
+    // ratio slot at 1.0 -- the channel factor above is
+    // the chain's one proportional application (brief
+    // section 2.4: there is no second proportional
+    // application downstream), and the seam's own
+    // arithmetic (neutral + displacement x ratio) is
+    // untouched.
     out_head_target_world = FSVRSpineSolver::composeHeadTarget(
-        neutral_cornea_world, d_world, scale_ratio,
-        diag_force_unit_scale);
-    if (provisional &&
-        (!std::isfinite(out_head_target_world.mV[VX]) ||
-         !std::isfinite(out_head_target_world.mV[VY]) ||
-         !std::isfinite(out_head_target_world.mV[VZ])))
+        neutral_cornea_world, scaled, 1.0f, false);
+    if (!std::isfinite(out_head_target_world.mV[VX]) ||
+        !std::isfinite(out_head_target_world.mV[VY]) ||
+        !std::isfinite(out_head_target_world.mV[VZ]))
     {
         // S1-BRIEF-R1-02: no target is published from a
-        // nonfinite provisional composition.
+        // nonfinite composition. (Stage 1 applied this
+        // guard on the provisional path; it now covers
+        // every factor application, as above.)
         out_head_target_world = LLVector3::zero;
+        if (fix3_result)
+        {
+            *fix3_result = fix3;
+        }
         return false;
     }
     // Step 5: the section 4.6 cornea offset, verbatim.
     out_cornea_offset_head_local = session.cornea_offset_head_local;
+    if (fix3_result)
+    {
+        *fix3_result = fix3;
+    }
     return true;
 }
 
@@ -782,6 +1213,18 @@ FSVRAdapterPlanResult FSVRAdapterApply::computePlan(
     // exists to drift.
     result.base_world_rotations = base_world_rotations;
     result.base_world_positions = base_world_positions;
+    // P2-07B Fix 3 (brief section 4): the cycle's posture
+    // behaviour and computed root offset, retained
+    // verbatim beside the base composition -- copied here,
+    // before any gate, so gate failures and
+    // whole-transaction refusal leave them unmodified.
+    // They are the recorder's facts; nothing in the plan
+    // reads them.
+    result.posture_behaviour = input.posture_behaviour;
+    result.posture_behaviour_present =
+        input.posture_behaviour_present;
+    result.root_offset_present = input.root_offset_present;
+    result.root_offset = input.root_offset;
     result.resolved_locals.resize(count);
     for (S32 i = 0; i < count; ++i)
     {
@@ -1726,6 +2169,7 @@ FSVRAdapterPlanResult FSVRAdapterApplyOnce::apply(
 #include "llvrtrackingframe.h"
 #include "llvrtrackingsettings.h"
 #include "llvoavatarself.h"
+#include "llagent.h"
 
 #include <algorithm>
 #include <map>
@@ -1777,6 +2221,31 @@ FSVRAdapterDomain domainForAdapterId(const std::string& adapter_id)
 LLCharacter* s_diag_consumer_character = nullptr;
 FSVRHeadRotConsumer s_diag_headrot_consumer;
 FSVRBlendObsConsumer s_diag_blend_consumer;
+
+// ------------------------------------------------------------------
+// P2-07B Fix 3: the live root write's authorization.
+// [FIX3-CODE-R1-03] gated the LLAgent::setPositionAgent
+// write while OQ-2 (the playspace boundary policy) was
+// undecided, because the offset math's absence of a
+// bound IS the follow-without-bound option, which the
+// brief requires be chosen knowingly, never selected by
+// implementation silence. [FIX3-CODE-R3] lands the
+// ruling: Leah chose STOP AT THE BOUND (2026-11-07).
+// The gate is therefore no longer a build constant; it
+// is the boundary policy's own validity, a snapshot
+// fact (FSVRRootFollowBoundMeters, derived in
+// llvrtrackingsettings.cpp): with a valid bound the
+// policy is in force, the consumed displacement is
+// radially clamped to it, and the write is live; with
+// the bound absent or invalid the policy is not in
+// force, the write stays gated off (never unbounded),
+// the standing composition keeps the shipped lean
+// behaviour [FIX3-CODE-R2-01], and the gate announces
+// itself once per establishment through the
+// root_follow_gated and root_follow_bound_invalid
+// bonelog events -- loud, not silent. The gate opens
+// because OQ-2 is now ruled, not by a silent flip.
+// ------------------------------------------------------------------
 
 void convertBlendJoint(const FSVRBlendObsJoint& in,
                        FSVRBoneLogBlendJoint& out)
@@ -2237,6 +2706,193 @@ void FSVRAdapterApplyForCharacter(LLCharacter* character, bool preview_cycle)
         }
     }
 
+    // P2-07B Fix 3 (brief sections 2.2/2.5/2.6): the
+    // cycle's Fix 3 facts and the standing root
+    // application. The behaviour is determined here, from
+    // the same session view copy the composition below
+    // consumes, so a cycle can never pair one flavour's
+    // neutral with the other's behaviour (F3-P2's pairing
+    // invariant): behaviour and neutral are read from one
+    // view, atomically for the cycle.
+    FSVRFix3CycleInputs fix3_inputs;
+    fix3_inputs.posture_swap = snapshot.posture_swap;
+    fix3_inputs.head_position_enabled =
+        snapshot.track_head_position;
+    // [FIX3-CODE-R1-02] The lean gain's validity rides
+    // the inputs beside its pinned value (which the
+    // composition receives as its lean_gain argument):
+    // the factor decision fails closed on it.
+    fix3_inputs.lean_gain_valid = snapshot.lean_gain_valid;
+    fix3_inputs.root_gain = snapshot.root_gain;
+    fix3_inputs.root_gain_valid = snapshot.root_gain_valid;
+    // [FIX3-CODE-R1-01] The manual ratio states are the
+    // snapshot's per-channel derivations over the global
+    // settings FSVRManualLeanRatio / FSVRManualRootRatio,
+    // mapped through fsvrManualRatioState (the pinned 0
+    // of an unset or invalid value is never consumed as
+    // a ratio). The two channels map independently.
+    fix3_inputs.manual_lean = fsvrManualRatioState(
+        snapshot.manual_lean_set, snapshot.manual_lean_invalid);
+    fix3_inputs.manual_lean_ratio = snapshot.manual_lean_ratio;
+    fix3_inputs.manual_root = fsvrManualRatioState(
+        snapshot.manual_root_set, snapshot.manual_root_invalid);
+    fix3_inputs.manual_root_ratio = snapshot.manual_root_ratio;
+    // [FIX3-CODE-R3] The boundary policy's facts ride
+    // the inputs from the same snapshot: the bound's
+    // carried value (0 when invalid) and its validity,
+    // which is the policy-in-force fact the step's
+    // clamp, the step's live flag and the composition's
+    // suppression all read -- one derivation, consumed
+    // identically everywhere.
+    fix3_inputs.root_follow_bound_m = snapshot.root_follow_bound_m;
+    fix3_inputs.root_follow_bound_valid =
+        snapshot.root_follow_bound_valid;
+    input.posture_behaviour = fsvrEffectivePostureBehaviour(
+        session_view.posture, snapshot.posture_swap);
+    input.posture_behaviour_present = true;
+
+    // The standing root application (brief section 2.2
+    // item 4; OQ-5 as ruled by Leah 2026-11-07: TRUE
+    // in-world movement). The offset is applied BEFORE
+    // the root frame is populated below, through the
+    // viewer's genuine agent movement channel --
+    // LLAgent::setPositionAgent, the frame-agent write
+    // every agent update to the simulator is built from,
+    // so the avatar genuinely relocates and other viewers
+    // see it move. It is NOT a render offset and NOT a
+    // solver output (Amendment 03 item 5). The applied
+    // position is absolute -- the agent anchor captured
+    // for this establishment plus the cycle's computed
+    // offset (OQ-1's ruled follow form (b)) -- never a
+    // per-cycle delta, so re-applying a cycle's offset is
+    // a no-op and no drift can accrue (F3-R5). The anchor
+    // is keyed to the neutral's install generation: a
+    // re-sync re-anchors (section 0.1 of the brief: no
+    // pre-sync root state survives a sync), and an
+    // invalidated establishment drops it.
+    // Eligibility is the cycle's own authorization facts,
+    // all of them: a Gate-1-authorized build (candidate
+    // or above -- in a NONE build the offset is computed
+    // and recorded by the composition below but never
+    // applied, exactly as the head target is composed and
+    // recorded but never written), the E5-E9 positional
+    // validity conjunction (which includes E8's
+    // seat-anchored suppression, brief section 0.8, and
+    // E9's calibration exclusion), the Head position
+    // toggle (section 0.4), the spine domain's gate-1
+    // decision fact, and an ordinary cycle kind.
+    // [FIX3-CODE-R3] One further condition stands
+    // between the computed offset and the write: the
+    // boundary policy must be in force. OQ-2 is now
+    // ruled (STOP AT THE BOUND), so the condition is the
+    // bound's validity in the snapshot: a valid bound
+    // opens the write (the step's offset is already the
+    // clamped one); an absent or invalid bound keeps the
+    // write gated off -- the cycle announces the gate
+    // and its cause once per establishment
+    // (root_follow_gated, root_follow_bound_invalid) and
+    // writes nothing, and the composition below keeps
+    // the shipped lean behaviour for the cycle
+    // [FIX3-CODE-R2-01]. The write decision reads the
+    // step's own live flag, the one pure fact the step
+    // computed from these same inputs. The anchor state
+    // below is deliberately NOT advanced while the gate
+    // is closed, so the establishment that eventually
+    // opens it anchors from the agent's position at that
+    // time, not from a position the gated cycles read.
+    LLVector3 root_move_delta = LLVector3::zero;
+    {
+        static bool s_root_anchor_valid = false;
+        static U32 s_root_anchor_generation = 0;
+        static LLVector3 s_root_anchor_agent = LLVector3::zero;
+        if (!session_view.established)
+        {
+            s_root_anchor_valid = false;
+        }
+        const bool root_move_eligible =
+            snapshot.stage2_constraint_authorized &&
+            input.spine_sample_valid &&
+            input.head_position_enabled &&
+            input.spine_decisions_runtime_effective &&
+            input.cycle == FSVRAdapterCycleKind::NORMAL;
+        if (root_move_eligible)
+        {
+            const FSVRStandingRootStep root_step =
+                fsvrComputeStandingRootStep(
+                    session_view, hmd_position_local,
+                    session_view.anchor_forward_yaw_rad,
+                    root_joint ? root_joint->getWorldRotation()
+                               : LLQuaternion(),
+                    fix3_inputs);
+            if (root_step.offset_valid)
+            {
+                if (!root_step.live)
+                {
+                    // [FIX3-CODE-R3] The boundary policy
+                    // is not in force (the bound is absent
+                    // or invalid): the offset was computed
+                    // and will be recorded by the
+                    // composition below, but the agent
+                    // write does not happen -- root-follow
+                    // never runs unbounded. Announce the
+                    // gate and its cause once per
+                    // establishment (edge-latched on the
+                    // install generation, in the
+                    // scale-parameter events' idiom): a
+                    // gate that fires every frame is a
+                    // silent gate. Nothing is applied, so
+                    // root_move_delta stays zero, the
+                    // transaction composes over the
+                    // unmoved frame, and the composition
+                    // keeps the shipped lean behaviour for
+                    // the standing user [FIX3-CODE-R2-01]
+                    // -- the gate is distinguishable in
+                    // the record by these two events, the
+                    // recorded offset, and the preserved
+                    // lean target alike.
+                    static bool s_root_gated_announced = false;
+                    static U32 s_root_gated_generation = 0;
+                    if (!s_root_gated_announced ||
+                        s_root_gated_generation !=
+                            session_view.install_generation)
+                    {
+                        FSVRBoneLog::eventRootFollowGated();
+                        FSVRBoneLog::eventRootFollowBoundInvalid();
+                        s_root_gated_announced = true;
+                        s_root_gated_generation =
+                            session_view.install_generation;
+                    }
+                }
+                else
+                {
+                    if (!s_root_anchor_valid ||
+                        s_root_anchor_generation !=
+                            session_view.install_generation)
+                    {
+                        s_root_anchor_agent =
+                            gAgent.getPositionAgent();
+                        s_root_anchor_generation =
+                            session_view.install_generation;
+                        s_root_anchor_valid = true;
+                    }
+                    const LLVector3 before =
+                        gAgent.getPositionAgent();
+                    const LLVector3 target =
+                        s_root_anchor_agent + root_step.root_offset;
+                    // The offset is finite by the step's own
+                    // guard, and the anchor is the agent's own
+                    // read: setPositionAgent's finite contract
+                    // is honoured.
+                    if (!(target == before))
+                    {
+                        gAgent.setPositionAgent(target);
+                    }
+                    root_move_delta = target - before;
+                }
+            }
+        }
+    }
+
     // The transaction root frame is the pelvis world. These are
     // the joint's cached world values at apply time; solver target
     // worlds are expressed in this same frame, which is the frame
@@ -2245,11 +2901,20 @@ void FSVRAdapterApplyForCharacter(LLCharacter* character, bool preview_cycle)
     // produces no writes regardless. The pre-runtime-enable
     // verification obligation for this frame is recorded at
     // FSVRAdapterPlanInput::root_world_rotation in the header.)
+    // P2-07B Fix 3 (brief section 2.2 item 4): the cached
+    // values predate this cycle's root application (the
+    // skeleton has not yet composed over the moved agent),
+    // so the frame the transaction composes over is the
+    // moved frame explicitly -- cached position plus the
+    // applied delta. Base composition, targets, solver and
+    // camera then all read the one moved root frame in the
+    // one pose transaction (OQ-4's condition A).
     if (root_joint)
     {
         input.root_world_rotation = root_joint->getWorldRotation();
         input.root_world_position = root_joint->getWorldPosition();
     }
+    input.root_world_position += root_move_delta;
 
     // P2-07B C6-E (CP-4): the per-cycle head-target block.
     // Composition is gated on the E5-E9 conjunction only
@@ -2264,6 +2929,15 @@ void FSVRAdapterApplyForCharacter(LLCharacter* character, bool preview_cycle)
     // target fields at their defaults, unread (solveSpine
     // guards on the flag). The wrist block is written false
     // explicitly, every cycle (section 7.4).
+    // P2-07B Fix 3: the composition runs with the cycle's
+    // Fix 3 fact set, and the plan input carries its
+    // determinations (the behaviour, set above from the
+    // same pure function, and the computed root offset)
+    // to the result for the record. fix3_result keeps its
+    // defaults when the conjunction short-circuits the
+    // composition, so the offset fields below are assigned
+    // unconditionally and never latched.
+    FSVRFix3CompositionResult fix3_result;
     input.head_target_valid =
         input.spine_sample_valid &&
         composeHeadTargetBlock(session_view, hmd_position_local,
@@ -2273,9 +2947,54 @@ void FSVRAdapterApplyForCharacter(LLCharacter* character, bool preview_cycle)
                                snapshot.diag_force_unit_scale,
                                snapshot.lean_gain,
                                input.head_target_world,
-                               input.cornea_offset_head_local);
+                               input.cornea_offset_head_local,
+                               &fix3_inputs, &fix3_result);
+    input.root_offset_present = fix3_result.root_offset_valid;
+    input.root_offset = fix3_result.root_offset;
     input.wrist_target_valid[0] = false;
     input.wrist_target_valid[1] = false;
+
+    // P2-07B Fix 3 (brief section 2.4): the
+    // scale_parameter_invalid events, edge-latched per
+    // parameter -- an invalid value announces itself once
+    // when it takes effect, not once per cycle (an alarm
+    // that fires every frame is a silent alarm).
+    // [FIX3-CODE-R1-04] The typed standing eye height is
+    // deliberately NOT an event source here: neither
+    // channel's factor consumes the value while OQ-7's
+    // usable-length references are unresolved, so its
+    // invalidity is not a channel failure and is
+    // reported against no channel. The snapshot keeps
+    // carrying the typed value and its validity state;
+    // if a future validated factor consumes it, that
+    // factor's channel takes the fail-closed behaviour
+    // (and this block its event) then.
+    {
+        static bool s_lean_gain_bad = false;
+        static bool s_root_gain_bad = false;
+        static bool s_lean_channel_bad = false;
+        static bool s_root_channel_bad = false;
+        if (!snapshot.lean_gain_valid && !s_lean_gain_bad)
+        {
+            FSVRBoneLog::eventScaleParameterInvalid("lean");
+        }
+        s_lean_gain_bad = !snapshot.lean_gain_valid;
+        if (!snapshot.root_gain_valid && !s_root_gain_bad)
+        {
+            FSVRBoneLog::eventScaleParameterInvalid("root");
+        }
+        s_root_gain_bad = !snapshot.root_gain_valid;
+        if (fix3_result.lean_scale_invalid && !s_lean_channel_bad)
+        {
+            FSVRBoneLog::eventScaleParameterInvalid("lean");
+        }
+        s_lean_channel_bad = fix3_result.lean_scale_invalid;
+        if (fix3_result.root_scale_invalid && !s_root_channel_bad)
+        {
+            FSVRBoneLog::eventScaleParameterInvalid("root");
+        }
+        s_root_channel_bad = fix3_result.root_scale_invalid;
+    }
 
     // One apply-once instance and the solvers for the process
     // (the self avatar is unique). C6/C7 (CP-7): the real

@@ -1544,12 +1544,78 @@ void FSVRSessionNeutral::invalidateForAccountOrRecordChange()
     }
 }
 
+// ---------------------------------------------------------------------------
+// P2-07B Fix 3 (brief sections 2.4 / 5.3 F3-S5): the
+// scale-contract label functions. Defined in the pure
+// region so the H8/H10-family harnesses fixture the
+// production functions, never reimplementations. (The
+// behaviour and name seams live in llvradapterapply.cpp
+// with their declarations: the adapter TU may not depend
+// on this one -- H1 links it alone.)
+// ---------------------------------------------------------------------------
+
+FSVRScaleContract fsvrLeanScaleContract(
+    const FSVRSessionNeutralView& view,
+    FSVRManualRatioState manual_lean)
+{
+    // Brief section 2.4 / F3-S5's matrix, lean row. An
+    // invalid manual ratio fails the channel closed and
+    // labels it neither contract (case 6). A valid one is
+    // proportional by declaration on any establishment
+    // (case 5). Otherwise only the measured
+    // establishment's matched pair is proportional
+    // (case 2): the record usable, with its avatar cornea
+    // height and its player HMD height both finite and
+    // positive -- the floor-relative pair the calibration
+    // model itself constructs. Half a pair (case 1), a
+    // sync establishment (case 3), and the typed eye
+    // height standing alone all stay provisional.
+    if (manual_lean == FSVRManualRatioState::INVALID)
+    {
+        return FSVRScaleContract::OFF;
+    }
+    if (manual_lean == FSVRManualRatioState::VALID)
+    {
+        return FSVRScaleContract::PROPORTIONAL;
+    }
+    if (view.scale_source == FSVRScaleSource::MEASURED_RECORD &&
+        view.record.status !=
+            FSVRCalibrationRecordValidation::RecordStatus::NO_RECORD &&
+        std::isfinite(view.record.avatar_cornea_height) &&
+        view.record.avatar_cornea_height > 0.0 &&
+        std::isfinite(view.record.player_hmd_height) &&
+        view.record.player_hmd_height > 0.0)
+    {
+        return FSVRScaleContract::PROPORTIONAL;
+    }
+    return FSVRScaleContract::PROVISIONAL;
+}
+
+FSVRScaleContract fsvrRootScaleContract(
+    FSVRManualRatioState manual_root)
+{
+    // Brief section 2.4 / F3-S5's matrix, root row: no
+    // validated root reference exists in this brief
+    // (OQ-7), so the channel is provisional unless a
+    // valid manual ratio makes it proportional by
+    // declaration; an invalid one fails it closed.
+    if (manual_root == FSVRManualRatioState::INVALID)
+    {
+        return FSVRScaleContract::OFF;
+    }
+    if (manual_root == FSVRManualRatioState::VALID)
+    {
+        return FSVRScaleContract::PROPORTIONAL;
+    }
+    return FSVRScaleContract::PROVISIONAL;
+}
+
 void FSVRSessionNeutral::installFromCapture(
     const FSVRCalibrationRecordValidation& record,
     const LLVector3& anchor_hmd_local, F32 anchor_forward_yaw_rad,
     const LLVector3& cornea_offset_head_local,
     const LLVector3& neutral_cornea_root,
-    FSVRScaleSource scale_source)
+    FSVRScaleSource scale_source, FSVRPosture posture)
 {
     const bool sitting_clear = mView.sitting_signals_clear;
     mView = FSVRSessionNeutralView();
@@ -1566,6 +1632,11 @@ void FSVRSessionNeutral::installFromCapture(
     // that do not share this entry. Nothing else advances
     // the counter.
     mView.scale_source = scale_source;
+    // P2-07B Fix 3 (brief section 2.1): the posture stamp
+    // rides the same write -- the flavour the installing
+    // act declared, or UNDETERMINED from a producer that
+    // declares none (the parameter's default).
+    mView.posture = posture;
     mView.install_generation = ++mInstallGeneration;
     mRecordBasis = record;
     mHaveRecordBasis = true;
@@ -1777,6 +1848,14 @@ void FSVRSessionNeutral::step(const FSVRSessionStepInputs& inputs)
     // independently -- exactly once per successful
     // establishment, as there.
     mView.scale_source = FSVRScaleSource::MEASURED_RECORD;
+    // P2-07B Fix 3 (brief sections 2.1/5.1 F3-P1): this
+    // producer declares no sync flavour -- the
+    // acquisition's establishment is not a flavour act --
+    // so its posture stamp is UNDETERMINED, written
+    // explicitly here as scale_source is: the view reset
+    // above default-constructs it, and this line keeps
+    // the producer's stamping visible at the write.
+    mView.posture = FSVRPosture::UNDETERMINED;
     mView.install_generation = ++mInstallGeneration;
     mState = FSVRSessionState::ESTABLISHED;
     resetAcquisition();
@@ -1829,6 +1908,22 @@ U64 s_local_transition_epoch = 0;
 bool s_sync_pending = false;
 U64 s_sync_request_incarnation = 0;  // OpenXR incarnation at request time
 U64 s_sync_request_skeleton_gen = 0; // skeleton-rebuild generation at request time
+// P2-07B Fix 3 (brief section 2.5): the pending request's
+// posture flavour -- the determination itself, declared
+// by the user's sync act and stamped on the neutral the
+// executing cycle installs. It is part of the request,
+// raised and consumed with it; nothing outside a sync
+// act ever writes it, and posture is never inferred.
+FSVRPosture s_sync_request_posture = FSVRPosture::SEATED;
+
+// P2-07B Fix 3 (brief section 2.5): the posture-gap
+// announcement state. The tracker is the pure decision
+// (one posture_undetermined event per establishment
+// gap); the notification latch spends the one
+// per-VR-activation viewer notification and re-arms
+// when VR deactivates.
+FSVRPostureGapTracker s_posture_gap_tracker;
+bool s_posture_gap_notified = false;
 
 F64 shellNowSeconds()
 {
@@ -2027,24 +2122,95 @@ void executeSync(const FSVRAdapterPlanInput& input,
     // fabricates a record (CP-S1-4's anti-masquerade rule)
     // -- and report success. This report is the only
     // "calibration synced" emission in the tree: success is
-    // reported only by an install.
+    // reported only by an install. P2-07B Fix 3: the
+    // install also stamps the pending request's posture
+    // flavour -- the capture is otherwise today's, in
+    // every particular.
     s_session_neutral.installFromCapture(
         FSVRCalibrationRecordValidation{},
         hmd_position, stage2YawOfForward(hmd_forward), offset,
-        neutral_root, FSVRScaleSource::PROVISIONAL_SYNC);
+        neutral_root, FSVRScaleSource::PROVISIONAL_SYNC,
+        s_sync_request_posture);
     // P2-07B feel-regrounding diagnostic: the install is
     // the sync_executed event; record the installed pair
     // beside the tree's only success report.
+    // P2-07B Fix 3 (brief sections 2.1/2.4): the
+    // establishment record also names the posture flavour
+    // installed and the scale contract in force per
+    // channel, computed from the installed view by the
+    // pure label functions. [FIX3-CODE-R1-01] The manual
+    // states the labels are computed from are production
+    // facts now: the frame's settings snapshot, mapped
+    // through the same fsvrManualRatioState the adapter
+    // glue maps its cycle inputs through -- one source,
+    // so the record can never name a contract the
+    // composition is not running (F3-S5's honesty rule).
+    const FSVRSessionNeutralView& installed_view =
+        s_session_neutral.view();
+    const FSVRTrackingSettingsSnapshot& label_snapshot =
+        FSVRTrackingSettings::captureForFrame();
     FSVRBoneLog::eventSyncExecuted(
         input.frame_token, hmd_position,
-        stage2YawOfForward(hmd_forward), offset, neutral_root);
-    FSCommon::report_to_nearby_chat("calibration synced");
+        stage2YawOfForward(hmd_forward), offset, neutral_root,
+        fsvrPostureName(installed_view.posture),
+        fsvrScaleContractName(fsvrLeanScaleContract(
+            installed_view,
+            fsvrManualRatioState(label_snapshot.manual_lean_set,
+                                 label_snapshot.manual_lean_invalid))),
+        fsvrScaleContractName(fsvrRootScaleContract(
+            fsvrManualRatioState(label_snapshot.manual_root_set,
+                                 label_snapshot.manual_root_invalid))));
+    // P2-07B Fix 3 (brief section 2.1): a successful sync
+    // names the flavour it established, the same way the
+    // refusals above name their reasons.
+    FSCommon::report_to_nearby_chat(
+        std::string("calibration synced (") +
+        fsvrPostureName(installed_view.posture) + ")");
+}
+
+// P2-07B Fix 3 (brief section 2.5): the undetermined-
+// posture announcements, evaluated by the step hook on
+// every stepped cycle. The bonelog event fires once per
+// establishment gap (the pure tracker's decision); the
+// viewer notification fires once per VR activation
+// while a gap holds, and names the consequence -- the
+// shipped behaviour remains active -- not merely the
+// missing act, so silence can never be read as
+// "positional tracking is off". Neither ever fires per
+// cycle, and the state never resolves itself by
+// inference, however long it persists.
+void announcePostureGapIfNeeded()
+{
+    const FSVRSessionNeutralView& view = s_session_neutral.view();
+    if (s_posture_gap_tracker.update(view.established,
+                                     view.posture,
+                                     view.install_generation))
+    {
+        FSVRBoneLog::eventPostureUndetermined();
+    }
+    if (!LLOpenXRManager::instance().isVRModeActive())
+    {
+        // The notification latch is per VR activation: it
+        // re-arms while VR is inactive.
+        s_posture_gap_notified = false;
+        return;
+    }
+    const bool gap = !view.established ||
+                     view.posture == FSVRPosture::UNDETERMINED;
+    if (gap && !s_posture_gap_notified)
+    {
+        FSCommon::report_to_nearby_chat(
+            "posture not set - current movement behaviour "
+            "unchanged; sync seated or standing to enable "
+            "posture behaviour");
+        s_posture_gap_notified = true;
+    }
 }
 
 } // namespace
 
 // static
-void FSVRCalibration::requestCalibration()
+void FSVRCalibration::requestCalibration(FSVRPosture flavour)
 {
     // P2-07B feel-regrounding diagnostic: every /xr
     // calibrate invocation is a bonelog event, refused
@@ -2096,8 +2262,16 @@ void FSVRCalibration::requestCalibration()
     }
     // Stamp the request with the session incarnation and
     // skeleton generation it is bound to, and raise it.
+    // P2-07B Fix 3 (brief section 2.5): the request also
+    // carries the posture flavour the user's act declared
+    // -- the determination rides the request and is
+    // stamped by the executing cycle's install. A refused
+    // second invocation leaves the pending request (and
+    // its flavour) undisturbed, exactly as it leaves the
+    // stamps.
     s_sync_request_incarnation = incarnation;
     s_sync_request_skeleton_gen = skeleton_gen;
+    s_sync_request_posture = flavour;
     s_sync_pending = true;
 }
 
@@ -2198,6 +2372,15 @@ void FSVRCalibration::stepFromAdapterCycle(
     // step hook runs without an assembly-side consumer
     // still refreshes the fact.
     s_session_neutral.noteSittingSignals(signals.clear());
+
+    // P2-07B Fix 3 (brief section 2.5): the posture-gap
+    // announcements ride every stepped cycle, ahead of
+    // the steady-state early return below -- a gap is
+    // precisely the steady state this hook usually
+    // short-circuits, and the announcements are its
+    // once-per-gap / once-per-activation facts, not
+    // per-cycle work.
+    announcePostureGapIfNeeded();
 
     if (!s_transaction.active() &&
         s_session_neutral.state() == FSVRSessionState::ESTABLISHED &&

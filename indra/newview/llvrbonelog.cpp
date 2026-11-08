@@ -355,6 +355,21 @@ void appendPlanBlock(std::string& out,
     appendBool(out, plan.head_group_refusal);
     out += ",\"writes\":";
     out += std::to_string(plan.writes_count);
+    // P2-07B Fix 3 (brief section 4): the posture
+    // behaviour in force for the cycle and the standing
+    // channel's computed root offset, both optional --
+    // absent entirely when the plan carried neither, so
+    // pre-Fix-3 plan blocks parse identically (F3-F).
+    if (plan.posture_behaviour)
+    {
+        out += ",\"posture_behaviour\":";
+        appendJsonString(out, plan.posture_behaviour);
+    }
+    if (plan.root_offset_present)
+    {
+        out += ",\"root_offset\":";
+        appendVec(out, plan.root_offset);
+    }
     out += '}';
 }
 
@@ -567,6 +582,27 @@ void FSVRBoneLog::buildSyncExecutedRecord(
     const LLVector3& cornea_offset_head_local,
     const LLVector3& neutral_cornea_root)
 {
+    buildSyncExecutedRecord(out, t_ms, frame_token,
+                            anchor_hmd_local,
+                            anchor_forward_yaw_rad,
+                            cornea_offset_head_local,
+                            neutral_cornea_root,
+                            nullptr, nullptr, nullptr);
+}
+
+// static
+void FSVRBoneLog::buildSyncExecutedRecord(
+    std::string& out,
+    long long t_ms,
+    U64 frame_token,
+    const LLVector3& anchor_hmd_local,
+    F32 anchor_forward_yaw_rad,
+    const LLVector3& cornea_offset_head_local,
+    const LLVector3& neutral_cornea_root,
+    const char* posture,
+    const char* lean_contract,
+    const char* root_contract)
+{
     out.clear();
     out += "{\"event\":\"sync_executed\",\"t_ms\":";
     out += std::to_string(t_ms);
@@ -583,6 +619,68 @@ void FSVRBoneLog::buildSyncExecutedRecord(
     appendVec(out, cornea_offset_head_local);
     out += ",\"neutral_cornea_root\":";
     appendVec(out, neutral_cornea_root);
+    // P2-07B Fix 3 (brief sections 2.1/2.4): the
+    // establishment's posture flavour and per-channel
+    // scale contracts, appended only when named -- a
+    // record carrying none of them is byte-identical to
+    // its pre-Fix-3 form (F3-F).
+    if (posture)
+    {
+        out += ",\"posture\":";
+        appendJsonString(out, posture);
+    }
+    if (lean_contract)
+    {
+        out += ",\"lean_contract\":";
+        appendJsonString(out, lean_contract);
+    }
+    if (root_contract)
+    {
+        out += ",\"root_contract\":";
+        appendJsonString(out, root_contract);
+    }
+    out += "}\n";
+}
+
+// static
+void FSVRBoneLog::buildPostureUndeterminedRecord(
+    std::string& out, long long t_ms)
+{
+    out.clear();
+    out += "{\"event\":\"posture_undetermined\",\"t_ms\":";
+    out += std::to_string(t_ms);
+    out += "}\n";
+}
+
+// static
+void FSVRBoneLog::buildScaleParameterInvalidRecord(
+    std::string& out, long long t_ms, const char* channel)
+{
+    out.clear();
+    out += "{\"event\":\"scale_parameter_invalid\",\"t_ms\":";
+    out += std::to_string(t_ms);
+    out += ",\"channel\":";
+    appendJsonString(out, channel ? channel : "");
+    out += "}\n";
+}
+
+// static
+void FSVRBoneLog::buildRootFollowGatedRecord(
+    std::string& out, long long t_ms)
+{
+    out.clear();
+    out += "{\"event\":\"root_follow_gated\",\"t_ms\":";
+    out += std::to_string(t_ms);
+    out += "}\n";
+}
+
+// static
+void FSVRBoneLog::buildRootFollowBoundInvalidRecord(
+    std::string& out, long long t_ms)
+{
+    out.clear();
+    out += "{\"event\":\"root_follow_bound_invalid\",\"t_ms\":";
+    out += std::to_string(t_ms);
     out += "}\n";
 }
 
@@ -1570,6 +1668,17 @@ void sampleCycleImpl(LLCharacter* character,
         }
     }
 
+    // P2-07B Fix 3 (brief section 4): the result's posture
+    // behaviour in force and computed root offset, copied
+    // only when the plan carried them (absent stays
+    // absent in the record, F3-F).
+    plan.posture_behaviour =
+        result.posture_behaviour_present
+            ? fsvrPostureBehaviourName(result.posture_behaviour)
+            : nullptr;
+    plan.root_offset_present = result.root_offset_present;
+    plan.root_offset = result.root_offset;
+
     FSVRBoneLog::buildSampleRecordV2(
         state.scratch, nowMs(), input.frame_token,
         hmd_position_valid, hmd_position_local,
@@ -1675,6 +1784,136 @@ void FSVRBoneLog::eventSyncExecuted(
                                 anchor_forward_yaw_rad,
                                 cornea_offset_head_local,
                                 neutral_cornea_root);
+        enqueueLine(state.scratch);
+    }
+    catch (...)
+    {
+        s_hard_disabled.store(true);
+    }
+}
+
+// static
+void FSVRBoneLog::eventSyncExecuted(
+    U64 frame_token,
+    const LLVector3& anchor_hmd_local,
+    F32 anchor_forward_yaw_rad,
+    const LLVector3& cornea_offset_head_local,
+    const LLVector3& neutral_cornea_root,
+    const char* posture,
+    const char* lean_contract,
+    const char* root_contract)
+{
+    if (!enabled() || s_hard_disabled.load())
+    {
+        return;
+    }
+    try
+    {
+        BoneLogState& state = bonelogState();
+        if (state.writer_failed.load())
+        {
+            return;
+        }
+        buildSyncExecutedRecord(state.scratch, nowMs(),
+                                frame_token, anchor_hmd_local,
+                                anchor_forward_yaw_rad,
+                                cornea_offset_head_local,
+                                neutral_cornea_root,
+                                posture, lean_contract,
+                                root_contract);
+        enqueueLine(state.scratch);
+    }
+    catch (...)
+    {
+        s_hard_disabled.store(true);
+    }
+}
+
+// static
+void FSVRBoneLog::eventPostureUndetermined()
+{
+    if (!enabled() || s_hard_disabled.load())
+    {
+        return;
+    }
+    try
+    {
+        BoneLogState& state = bonelogState();
+        if (state.writer_failed.load())
+        {
+            return;
+        }
+        buildPostureUndeterminedRecord(state.scratch, nowMs());
+        enqueueLine(state.scratch);
+    }
+    catch (...)
+    {
+        s_hard_disabled.store(true);
+    }
+}
+
+// static
+void FSVRBoneLog::eventScaleParameterInvalid(const char* channel)
+{
+    if (!enabled() || s_hard_disabled.load())
+    {
+        return;
+    }
+    try
+    {
+        BoneLogState& state = bonelogState();
+        if (state.writer_failed.load())
+        {
+            return;
+        }
+        buildScaleParameterInvalidRecord(state.scratch, nowMs(),
+                                         channel);
+        enqueueLine(state.scratch);
+    }
+    catch (...)
+    {
+        s_hard_disabled.store(true);
+    }
+}
+
+// static
+void FSVRBoneLog::eventRootFollowGated()
+{
+    if (!enabled() || s_hard_disabled.load())
+    {
+        return;
+    }
+    try
+    {
+        BoneLogState& state = bonelogState();
+        if (state.writer_failed.load())
+        {
+            return;
+        }
+        buildRootFollowGatedRecord(state.scratch, nowMs());
+        enqueueLine(state.scratch);
+    }
+    catch (...)
+    {
+        s_hard_disabled.store(true);
+    }
+}
+
+// static
+void FSVRBoneLog::eventRootFollowBoundInvalid()
+{
+    if (!enabled() || s_hard_disabled.load())
+    {
+        return;
+    }
+    try
+    {
+        BoneLogState& state = bonelogState();
+        if (state.writer_failed.load())
+        {
+            return;
+        }
+        buildRootFollowBoundInvalidRecord(state.scratch, nowMs());
         enqueueLine(state.scratch);
     }
     catch (...)

@@ -27,6 +27,12 @@ const char* const FSVRTrackingSettings::SETTING_DIAG_FORCE_UNIT_SCALE = "FSVRDia
 const char* const FSVRTrackingSettings::SETTING_DIAG_POSITIONAL_SOLVE = "FSVRDiagPositionalSolve";
 const char* const FSVRTrackingSettings::SETTING_DIAG_FULL_CHAIN_SOLVE = "FSVRDiagFullChainSolve";
 const char* const FSVRTrackingSettings::SETTING_LEAN_RESPONSE_GAIN = "FSVRLeanResponseGain";
+const char* const FSVRTrackingSettings::SETTING_POSTURE_SWAP = "FSVRPostureSwap";
+const char* const FSVRTrackingSettings::SETTING_ROOT_RESPONSE_GAIN = "FSVRRootResponseGain";
+const char* const FSVRTrackingSettings::SETTING_STANDING_EYE_HEIGHT_CM = "FSVRStandingEyeHeightCm";
+const char* const FSVRTrackingSettings::SETTING_MANUAL_LEAN_RATIO = "FSVRManualLeanRatio";
+const char* const FSVRTrackingSettings::SETTING_MANUAL_ROOT_RATIO = "FSVRManualRootRatio";
+const char* const FSVRTrackingSettings::SETTING_ROOT_FOLLOW_BOUND_METERS = "FSVRRootFollowBoundMeters";
 
 // P2-07B C6-E Gate-1 authorization (CP-5 part 1a). NONE in every
 // ordinary build. Advanced ONLY by a dedicated authorization
@@ -321,6 +327,31 @@ bool s_last_diag_full_chain_solve = true;
 // capture and churned the snapshot generation.
 F32 s_last_lean_gain = 1.f;
 bool s_last_lean_gain_valid = true;
+// P2-07B Fix 3 (brief section 2.6): last-observed Fix 3
+// values, in the snapshot's derived forms like the lean
+// gain's pair above -- the posture swap flag, the root
+// gain's (validity, sanitized value) pair, and the eye
+// height's (set, invalid, sanitized value) triple --
+// initialized to the declared defaults' derived forms.
+bool s_last_posture_swap = false;
+F32 s_last_root_gain = 1.f;
+bool s_last_root_gain_valid = true;
+F32 s_last_standing_eye_height_cm = 0.f;
+bool s_last_standing_eye_height_set = false;
+bool s_last_standing_eye_height_invalid = false;
+// P2-07B Fix 3 [FIX3-CODE-R1-01]: the manual ratios'
+// derived triples, one per channel, in the same form.
+F32 s_last_manual_lean_ratio = 0.f;
+bool s_last_manual_lean_set = false;
+bool s_last_manual_lean_invalid = false;
+F32 s_last_manual_root_ratio = 0.f;
+bool s_last_manual_root_set = false;
+bool s_last_manual_root_invalid = false;
+// P2-07B Fix 3 [FIX3-CODE-R3]: the root-follow bound's
+// derived pair (sanitized value, validity), initialized
+// to the declared default's derived form (2.5, valid).
+F32 s_last_root_follow_bound_m = 2.5f;
+bool s_last_root_follow_bound_valid = true;
 FSVRTrackingSettingsSnapshot s_snapshot;
 bool s_snapshot_initialized = false;
 
@@ -423,6 +454,113 @@ const FSVRTrackingSettingsSnapshot& FSVRTrackingSettings::captureForFrame()
                                  lean_gain_raw >= 0.05f &&
                                  lean_gain_raw <= 3.0f;
     const F32 lean_gain = lean_gain_valid ? lean_gain_raw : 1.f;
+    // P2-07B Fix 3 (brief section 2.6): the Fix 3 raw
+    // values, read beside the lean gain, with their
+    // derivations computed here in the same style. The
+    // root gain takes the lean gain's exact contract
+    // (finite AND within 0.05..3.0; rejected outright,
+    // never clamped). The eye height's declared 0 is
+    // the unset state -- a first-class provisional
+    // state, not an error; a finite positive value is
+    // set; anything else (negative, NaN, infinite) is
+    // present-but-invalid, carried as typed state only
+    // -- neither channel consumes the value while
+    // OQ-7's references are unresolved, so its
+    // invalidity fails no channel and is reported
+    // against none [FIX3-CODE-R1-04]. Its sanitized
+    // value is 0 whenever it is not set.
+    const bool posture_swap =
+        gSavedSettings.getBOOL(SETTING_POSTURE_SWAP);
+    const F32 root_gain_raw =
+        gSavedSettings.getF32(SETTING_ROOT_RESPONSE_GAIN);
+    const bool root_gain_valid = std::isfinite(root_gain_raw) &&
+                                 root_gain_raw >= 0.05f &&
+                                 root_gain_raw <= 3.0f;
+    const F32 root_gain = root_gain_valid ? root_gain_raw : 1.f;
+    const F32 eye_height_raw =
+        gSavedSettings.getF32(SETTING_STANDING_EYE_HEIGHT_CM);
+    const bool eye_height_set = std::isfinite(eye_height_raw) &&
+                                eye_height_raw > 0.f;
+    const bool eye_height_invalid = !eye_height_set &&
+                                    eye_height_raw != 0.f;
+    const F32 eye_height_cm = eye_height_set ? eye_height_raw : 0.f;
+    // P2-07B Fix 3 [FIX3-CODE-R1-01]: the manual limb
+    // ratios, one derivation per channel in the eye
+    // height's style. The declared 0 is UNSET (the
+    // setting absent and a deliberate 0 are the same
+    // state by specification): the channel's derived
+    // ratio or provisional baseline rules, silently.
+    // A present value engages only inside the valid
+    // domain (finite AND within 0.05..3.0 -- the domain
+    // is the main chat's design specification, recorded
+    // in P2-07B-FIX3-CODE-REVISION-R2.md for the R2
+    // verdict to rule on; it mirrors the gain domain
+    // deliberately, a limb-length ratio outside that
+    // span not being a body proportion); a present
+    // value outside it (out-of-domain, negative, NaN,
+    // infinite) is INVALID and fails its channel closed
+    // at the composition seam -- never clamped, never
+    // quietly replaced by the derived value (brief
+    // section 2.4). The carried value is the raw value
+    // when valid and 0 otherwise, so the snapshot never
+    // carries a non-finite or out-of-domain F32
+    // downstream; a NaN raw reads as present (NaN != 0)
+    // and lands INVALID, never as a per-capture change
+    // (the derived triple, not the raw F32, rides the
+    // change tuple below -- [S1-CODE-R1-01]'s rule).
+    const F32 manual_lean_raw =
+        gSavedSettings.getF32(SETTING_MANUAL_LEAN_RATIO);
+    const bool manual_lean_set = manual_lean_raw != 0.f;
+    const bool manual_lean_valid = std::isfinite(manual_lean_raw) &&
+                                   manual_lean_raw >= 0.05f &&
+                                   manual_lean_raw <= 3.0f;
+    const bool manual_lean_invalid = manual_lean_set &&
+                                     !manual_lean_valid;
+    const F32 manual_lean_ratio = manual_lean_valid ? manual_lean_raw
+                                                    : 0.f;
+    const F32 manual_root_raw =
+        gSavedSettings.getF32(SETTING_MANUAL_ROOT_RATIO);
+    const bool manual_root_set = manual_root_raw != 0.f;
+    const bool manual_root_valid = std::isfinite(manual_root_raw) &&
+                                   manual_root_raw >= 0.05f &&
+                                   manual_root_raw <= 3.0f;
+    const bool manual_root_invalid = manual_root_set &&
+                                     !manual_root_valid;
+    const F32 manual_root_ratio = manual_root_valid ? manual_root_raw
+                                                    : 0.f;
+    // P2-07B Fix 3 [FIX3-CODE-R3]: the root-follow bound
+    // (OQ-2 as ruled by Leah 2026-11-07: STOP AT THE
+    // BOUND). The declared default is 2.5 physical
+    // metres (the main chat's design call, recorded in
+    // P2-07B-FIX3-CODE-REVISION-R3.md for the R3
+    // ruling). The derivation's valid domain is finite
+    // AND 0 < v <= 10: zero is the setting's absent
+    // form and not a radius; a negative or non-finite
+    // value is not a radius; a value beyond 10 m is
+    // beyond any physical playspace and, in the common
+    // case, a unit error (centimetres typed as metres)
+    // that must fail loudly rather than silently become
+    // effectively unbounded following. The carried value
+    // is the raw value when valid and 0 otherwise, so
+    // the snapshot never carries a non-finite or
+    // out-of-domain F32 downstream. When the bound is
+    // invalid the policy is not in force: the adapter
+    // keeps live root movement gated off (never
+    // unbounded) and preserves the shipped standing
+    // lean composition [FIX3-CODE-R2-01], announcing
+    // the cause in the record. The derived pair, never
+    // the raw F32, rides the change tuple below
+    // ([S1-CODE-R1-01]'s rule, so a NaN raw cannot
+    // re-fire a generation change every capture).
+    const F32 root_follow_bound_raw =
+        gSavedSettings.getF32(SETTING_ROOT_FOLLOW_BOUND_METERS);
+    const bool root_follow_bound_valid =
+        std::isfinite(root_follow_bound_raw) &&
+        root_follow_bound_raw > 0.f &&
+        root_follow_bound_raw <= 10.f;
+    const F32 root_follow_bound_m = root_follow_bound_valid
+                                        ? root_follow_bound_raw
+                                        : 0.f;
     const std::string canonical = canonicalLLSD(raw_disabled);
 
     const bool changed = !s_snapshot_initialized || !s_last_canonical_valid ||
@@ -439,7 +577,26 @@ const FSVRTrackingSettingsSnapshot& FSVRTrackingSettings::captureForFrame()
                          diag_positional_solve != s_last_diag_positional_solve ||
                          diag_full_chain_solve != s_last_diag_full_chain_solve ||
                          lean_gain != s_last_lean_gain ||
-                         lean_gain_valid != s_last_lean_gain_valid;
+                         lean_gain_valid != s_last_lean_gain_valid ||
+                         posture_swap != s_last_posture_swap ||
+                         root_gain != s_last_root_gain ||
+                         root_gain_valid != s_last_root_gain_valid ||
+                         eye_height_cm != s_last_standing_eye_height_cm ||
+                         eye_height_set != s_last_standing_eye_height_set ||
+                         eye_height_invalid !=
+                             s_last_standing_eye_height_invalid ||
+                         manual_lean_ratio != s_last_manual_lean_ratio ||
+                         manual_lean_set != s_last_manual_lean_set ||
+                         manual_lean_invalid !=
+                             s_last_manual_lean_invalid ||
+                         manual_root_ratio != s_last_manual_root_ratio ||
+                         manual_root_set != s_last_manual_root_set ||
+                         manual_root_invalid !=
+                             s_last_manual_root_invalid ||
+                         root_follow_bound_m !=
+                             s_last_root_follow_bound_m ||
+                         root_follow_bound_valid !=
+                             s_last_root_follow_bound_valid;
     if (!changed)
     {
         return s_snapshot;
@@ -460,6 +617,20 @@ const FSVRTrackingSettingsSnapshot& FSVRTrackingSettings::captureForFrame()
     s_last_diag_full_chain_solve = diag_full_chain_solve;
     s_last_lean_gain = lean_gain;
     s_last_lean_gain_valid = lean_gain_valid;
+    s_last_posture_swap = posture_swap;
+    s_last_root_gain = root_gain;
+    s_last_root_gain_valid = root_gain_valid;
+    s_last_standing_eye_height_cm = eye_height_cm;
+    s_last_standing_eye_height_set = eye_height_set;
+    s_last_standing_eye_height_invalid = eye_height_invalid;
+    s_last_manual_lean_ratio = manual_lean_ratio;
+    s_last_manual_lean_set = manual_lean_set;
+    s_last_manual_lean_invalid = manual_lean_invalid;
+    s_last_manual_root_ratio = manual_root_ratio;
+    s_last_manual_root_set = manual_root_set;
+    s_last_manual_root_invalid = manual_root_invalid;
+    s_last_root_follow_bound_m = root_follow_bound_m;
+    s_last_root_follow_bound_valid = root_follow_bound_valid;
 
     FSVRTrackingSettingsSnapshot next;
     next.generation = s_snapshot_initialized ? s_snapshot.generation + 1 : 1;
@@ -501,6 +672,39 @@ const FSVRTrackingSettingsSnapshot& FSVRTrackingSettings::captureForFrame()
     // (OPEN-S1-5).
     next.lean_gain_valid = lean_gain_valid;
     next.lean_gain = lean_gain;
+    // P2-07B Fix 3 (brief section 2.6): the Fix 3 fields,
+    // from the derivations beside the raw reads above.
+    // The derived forms ride the change tuple, so a
+    // change in any of them advances the generation and
+    // retires continuity history through the existing
+    // term, exactly as a gain change does.
+    next.posture_swap = posture_swap;
+    next.root_gain_valid = root_gain_valid;
+    next.root_gain = root_gain;
+    next.standing_eye_height_cm = eye_height_cm;
+    next.standing_eye_height_set = eye_height_set;
+    next.standing_eye_height_invalid = eye_height_invalid;
+    // P2-07B Fix 3 [FIX3-CODE-R1-01]: the manual
+    // ratios' derived triples, from the derivations
+    // beside the raw reads above. They ride the change
+    // tuple, so a change in either channel's manual
+    // state advances the generation and retires
+    // continuity history through the existing term,
+    // exactly as a gain change does.
+    next.manual_lean_ratio = manual_lean_ratio;
+    next.manual_lean_set = manual_lean_set;
+    next.manual_lean_invalid = manual_lean_invalid;
+    next.manual_root_ratio = manual_root_ratio;
+    next.manual_root_set = manual_root_set;
+    next.manual_root_invalid = manual_root_invalid;
+    // P2-07B Fix 3 [FIX3-CODE-R3]: the root-follow
+    // bound's derived pair, from the derivation beside
+    // the raw read above. It rides the change tuple, so
+    // a change in the bound state advances the
+    // generation and retires continuity history through
+    // the existing term, exactly as a gain change does.
+    next.root_follow_bound_m = root_follow_bound_m;
+    next.root_follow_bound_valid = root_follow_bound_valid;
     next.schema_valid =
         next.disabled_bones.parse_status ==
         FSVRTrackingDisabledBoneSet::ParseStatus::VALID;

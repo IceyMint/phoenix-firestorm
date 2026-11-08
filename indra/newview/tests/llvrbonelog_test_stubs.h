@@ -104,6 +104,27 @@ struct FSVRAdapterPlanInput
     std::vector<FSVRAdapterJointInput> joints;
 };
 
+// Fix 3: mirrored because llvrbonelog.cpp reads the
+// result's posture fields in the plan-block fill. The
+// enum values and the name strings mirror the real ones
+// in llvradapterapply.h, as the gate enum above does.
+enum class FSVRPostureBehaviour
+{
+    NONE     = 0,
+    SITTING  = 1,
+    STANDING = 2
+};
+
+inline const char* fsvrPostureBehaviourName(FSVRPostureBehaviour behaviour)
+{
+    switch (behaviour)
+    {
+    case FSVRPostureBehaviour::SITTING:  return "sitting";
+    case FSVRPostureBehaviour::STANDING: return "standing";
+    default:                             return "undetermined";
+    }
+}
+
 struct FSVRAdapterPlanResult
 {
     bool applied = false;
@@ -113,6 +134,11 @@ struct FSVRAdapterPlanResult
     // Fix 4 (CP-F4-3): mirrored because llvrbonelog.cpp
     // reads it in the plan-block fill.
     std::map<S32, LLQuaternion> solver_target_worlds;
+    // Fix 3: mirrored for the same reason.
+    FSVRPostureBehaviour posture_behaviour = FSVRPostureBehaviour::NONE;
+    bool posture_behaviour_present = false;
+    bool root_offset_present = false;
+    LLVector3 root_offset;
     std::vector<S32> writes;
     std::vector<LLQuaternion> resolved_locals;
     std::vector<LLQuaternion> resolved_world_rotations;

@@ -150,6 +150,72 @@
       <key>Value</key>
       <real>1.0</real>
     </map>
+    <key>FSVRPostureSwap</key>
+    <map>
+      <key>Comment</key>
+      <string>P2-07B Fix 3: swap the posture behaviours -- standing uses the sitting behaviour (spine lean, no root motion) and sitting uses the standing behaviour (root moves, no spine lean for translation). Off: standing moves the root, sitting leans (Leah's 2026-11-07 ruling).</string>
+      <key>Persist</key>
+      <integer>1</integer>
+      <key>Type</key>
+      <string>Boolean</string>
+      <key>Value</key>
+      <boolean>false</boolean>
+    </map>
+    <key>FSVRRootResponseGain</key>
+    <map>
+      <key>Comment</key>
+      <string>P2-07B Fix 3: root response gain -- when you move, she moves this much (standing root-follow sensitivity). A response gain, not a body measurement and not an avatar-size proportion. Accepted range 0.05 to 3.0; a value outside it is rejected (root channel off), never clamped.</string>
+      <key>Persist</key>
+      <integer>1</integer>
+      <key>Type</key>
+      <string>F32</string>
+      <key>Value</key>
+      <real>1.0</real>
+    </map>
+    <key>FSVRStandingEyeHeightCm</key>
+    <map>
+      <key>Comment</key>
+      <string>P2-07B Fix 3: your standing eye height in plain centimetres (floor to eye, not total body height). The physical reference for the movement-scaling contracts. 0 means unset, which is a normal state (provisional scaling), not an error.</string>
+      <key>Persist</key>
+      <integer>1</integer>
+      <key>Type</key>
+      <string>F32</string>
+      <key>Value</key>
+      <real>0.0</real>
+    </map>
+    <key>FSVRManualLeanRatio</key>
+    <map>
+      <key>Comment</key>
+      <string>P2-07B Fix 3: your stated lean limb ratio (avatar side over physical side) for the lean channel. A manual proportion you declare: it replaces the derived ratio, the lean gain still multiplies it, and the channel is proportional by your declaration. 0 means unset (the derived ratio or the provisional baseline rules). Accepted range 0.05 to 3.0; a value outside it fails the lean channel closed (no positional lean), never clamped and never quietly replaced by the derived value.</string>
+      <key>Persist</key>
+      <integer>1</integer>
+      <key>Type</key>
+      <string>F32</string>
+      <key>Value</key>
+      <real>0.0</real>
+    </map>
+    <key>FSVRManualRootRatio</key>
+    <map>
+      <key>Comment</key>
+      <string>P2-07B Fix 3: your stated root limb ratio (avatar side over physical side) for the root channel (standing root-follow). A manual proportion you declare: it replaces the provisional baseline, the root gain still multiplies it, and the channel is proportional by your declaration. 0 means unset (the provisional baseline rules). Accepted range 0.05 to 3.0; a value outside it fails the root channel closed (no root motion), never clamped and never quietly replaced.</string>
+      <key>Persist</key>
+      <integer>1</integer>
+      <key>Type</key>
+      <string>F32</string>
+      <key>Value</key>
+      <real>0.0</real>
+    </map>
+    <key>FSVRRootFollowBoundMeters</key>
+    <map>
+      <key>Comment</key>
+      <string>P2-07B Fix 3 (OQ-2, ruled by Leah 2026-11-07: stop at the bound): the standing root-follow bound, in PHYSICAL metres from where you synced. Your avatar follows you inside this radius; walk past it and the avatar stays at the edge until you walk back inside -- it is never left behind and never needs a re-sync. The bound is measured on your real steps, before any size scaling. Accepted range: above 0 up to 10 metres. A value outside it (including 0) turns live root-follow OFF and keeps the shipped lean behaviour instead, with the reason announced -- it never follows without a bound and never fails silently.</string>
+      <key>Persist</key>
+      <integer>1</integer>
+      <key>Type</key>
+      <string>F32</string>
+      <key>Value</key>
+      <real>2.5</real>
+    </map>
   <key>FSEnforceStrictObjectCheck</key>
   <map>
     <key>Comment</key>

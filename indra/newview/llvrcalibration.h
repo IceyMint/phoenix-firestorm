@@ -218,6 +218,17 @@ enum class FSVRScaleSource : U8
     PROVISIONAL_SYNC = 2,
 };
 
+// P2-07B Fix 3 (brief sections 2.1/2.4): the posture
+// and scale-contract vocabulary (FSVRPosture,
+// FSVRPostureBehaviour, FSVRScaleContract,
+// FSVRManualRatioState) and the behaviour/name pure
+// seams are declared in llvradapterapply.h, which this
+// header includes: the plan input carries the behaviour
+// and the composition consumes the view, so the shared
+// names live on the adapter side of the include edge.
+// The view's posture field below is stamped under the
+// same CP-S1-1 producer rule as scale_source.
+
 struct FSVRSessionNeutralView
 {
     bool established = false;
@@ -245,6 +256,14 @@ struct FSVRSessionNeutralView
     // established is true with NONE is never a solvable
     // basis (E5, CP-S1-4).
     FSVRScaleSource scale_source = FSVRScaleSource::NONE;
+    // P2-07B Fix 3 (brief section 2.1): the posture
+    // flavour this neutral was established with, stamped
+    // by the same producers that stamp scale_source
+    // (CP-S1-1's discipline). Default-constructed is
+    // UNDETERMINED, the fail-closed state: posture
+    // behaviours stay off and the shipped profile
+    // continues (brief section 2.5).
+    FSVRPosture posture = FSVRPosture::UNDETERMINED;
     // P2-07B Stage 1 (CP-S1-1/CP-S1-2, S1-BRIEF-R1-01): the
     // session-neutral installation generation this view was
     // installed under -- the machine's monotonic counter,
@@ -256,6 +275,74 @@ struct FSVRSessionNeutralView
     // this value; 0 is the never-installed default and no
     // established view ever carries it.
     U32 install_generation = 0;
+};
+
+// P2-07B Fix 3 (brief sections 2.4 / 5.3 F3-S5): the
+// scale contract in force, per channel, as a pure
+// function of the establishment and the channel's manual
+// ratio state -- the label the bonelog establishment
+// record carries and the only terms any surface may use
+// for the state. The lean channel is PROPORTIONAL only
+// on a MEASURED_RECORD establishment whose record
+// carries its matched pair (a usable record with a
+// finite positive avatar cornea height AND its finite
+// positive player HMD height -- floor-relative on both
+// sides, the calibration model's own construction), or
+// on a valid manual ratio on either establishment. The
+// root channel has no validated reference in this brief
+// (OQ-7): PROVISIONAL unless a valid manual ratio makes
+// it proportional by declaration. An INVALID manual
+// ratio labels the channel OFF (failed closed, F3-S4).
+// The typed standing eye height alone appears nowhere in
+// these rules: a physical reference without its matched
+// avatar counterpart is half a pair and confers nothing.
+FSVRScaleContract fsvrLeanScaleContract(
+    const FSVRSessionNeutralView& view,
+    FSVRManualRatioState manual_lean);
+FSVRScaleContract fsvrRootScaleContract(
+    FSVRManualRatioState manual_root);
+
+// P2-07B Fix 3 (brief section 2.5): the posture-gap
+// announcement decision, pure so the harness fixtures
+// the exact rule the shell executes. A gap is any span
+// in which no flavoured establishment is in force: no
+// establishment at all, or an establishment whose
+// producer stamped no flavour. update() returns true
+// exactly once per gap entry -- on entering a gap, and
+// again when a new establishment begins a new gap --
+// and false while a gap merely persists, however long:
+// the posture_undetermined event fires per establishment
+// gap, never per cycle.
+struct FSVRPostureGapTracker
+{
+    bool gap_open = false;
+    bool gap_was_established = false;
+    U32 gap_generation = 0;
+
+    bool update(bool established, FSVRPosture posture,
+                U32 install_generation)
+    {
+        const bool gap = !established ||
+                         posture == FSVRPosture::UNDETERMINED;
+        if (!gap)
+        {
+            gap_open = false;
+            gap_was_established = false;
+            gap_generation = 0;
+            return false;
+        }
+        const bool entry = !gap_open ||
+                           established != gap_was_established ||
+                           (established &&
+                            install_generation != gap_generation);
+        if (entry)
+        {
+            gap_open = true;
+            gap_was_established = established;
+            gap_generation = established ? install_generation : 0;
+        }
+        return entry;
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -535,13 +622,21 @@ public:
     // basis. A successful installation advances the
     // installation generation exactly once and stamps it
     // into the view (S1-BRIEF-R1-01).
+    // P2-07B Fix 3 (brief section 2.1): the posture
+    // argument is CP-S1-1's stamping rule extended to the
+    // posture fact: the sync passes the flavour its act
+    // declared; every other producer passes nothing and
+    // the establishment is UNDETERMINED by default --
+    // fail-closed, exactly as a scale_source of NONE is
+    // for the scale fact.
     void installFromCapture(
         const FSVRCalibrationRecordValidation& record,
         const LLVector3& anchor_hmd_local,
         F32 anchor_forward_yaw_rad,
         const LLVector3& cornea_offset_head_local,
         const LLVector3& neutral_cornea_root,
-        FSVRScaleSource scale_source);
+        FSVRScaleSource scale_source,
+        FSVRPosture posture = FSVRPosture::UNDETERMINED);
 
 private:
     void dropToSuspended();
@@ -775,7 +870,17 @@ public:
     // read). The transaction machine remains in the tree
     // as the retained diagnostic path; after this reroute
     // it has no production entry point.
-    static void requestCalibration();
+    // P2-07B Fix 3 (brief section 2.5): the sync act
+    // carries a posture flavour -- the flavour IS the
+    // posture determination, chosen by the user's one
+    // deliberate act at the sync surface. The plain
+    // request is the seated flavour (today's act,
+    // unchanged in what it captures); the standing
+    // flavour is requested explicitly. The flavour rides
+    // the pending request and is stamped on the neutral
+    // the executing cycle installs.
+    static void requestCalibration(
+        FSVRPosture flavour = FSVRPosture::SEATED);
     // CP-4 item 2: the glue populates the plan input's hold
     // flag from this.
     static bool transactionActive();

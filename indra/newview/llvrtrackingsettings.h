@@ -103,6 +103,90 @@ struct FSVRTrackingSettingsSnapshot
     // preference, not a profile (redesign sections 5/11).
     F32  lean_gain       = 1.f;  // FSVRLeanResponseGain
     bool lean_gain_valid = true;
+    // P2-07B Fix 3 (brief section 2.6): the posture-model
+    // settings, read beside lean_gain in the same style.
+    // posture_swap exchanges the two posture behaviours
+    // (the effective behaviour is a pure function of the
+    // neutral's stamped posture and this flag). root_gain
+    // is the root channel's k, with the shipped gain
+    // semantics: root_gain is the raw user value when
+    // root_gain_valid, and 1.0 otherwise; consumers use
+    // the value only under the validity flag (the root
+    // channel fails closed when it is false, never
+    // clamped). standing_eye_height_cm is the typed
+    // physical reference (floor to eye, plain cm):
+    // standing_eye_height_set is false when the user has
+    // not entered one (the declared 0 -- a first-class
+    // provisional state, not an error);
+    // standing_eye_height_invalid names a present but
+    // unusable value (negative or non-finite). The eye
+    // height is carried as typed state only: neither
+    // channel's factor consumes it while OQ-7's
+    // usable-length references are unresolved, so its
+    // invalidity fails NO channel and is reported
+    // against none [FIX3-CODE-R1-04]. The value is
+    // pinned to 0 whenever it is not set, so the
+    // snapshot never carries a non-finite or negative
+    // F32 downstream.
+    bool posture_swap = false;            // FSVRPostureSwap
+    F32  root_gain = 1.f;                 // FSVRRootResponseGain
+    bool root_gain_valid = true;
+    F32  standing_eye_height_cm = 0.f;    // FSVRStandingEyeHeightCm
+    bool standing_eye_height_set = false;
+    bool standing_eye_height_invalid = false;
+    // P2-07B Fix 3 [FIX3-CODE-R1-01]: the manual limb
+    // ratios (brief section 2.4's manual-ratio dials),
+    // one per channel, each with its own independent
+    // state in the eye height's (value, set, invalid)
+    // form. The declared 0 is UNSET (manual_*_set
+    // false): the channel's derived ratio or provisional
+    // baseline rules. A present value inside the valid
+    // domain (finite, 0.05..3.0 -- the domain is the
+    // main chat's design specification, recorded in
+    // P2-07B-FIX3-CODE-REVISION-R2.md for the R2
+    // verdict to rule on) is carried in manual_*_ratio
+    // and engages (the glue maps it to the composition
+    // seam's VALID). A present value outside the domain
+    // (or non-finite) is INVALID: manual_*_invalid is
+    // true and the ratio is pinned to 0, so the snapshot
+    // never carries a non-finite or out-of-domain F32
+    // downstream; the seam fails that channel closed,
+    // never clamped, never quietly replaced by the
+    // derived value. The two channels' states are
+    // derived and carried independently.
+    F32  manual_lean_ratio = 0.f;         // FSVRManualLeanRatio
+    bool manual_lean_set = false;
+    bool manual_lean_invalid = false;
+    F32  manual_root_ratio = 0.f;         // FSVRManualRootRatio
+    bool manual_root_set = false;
+    bool manual_root_invalid = false;
+    // P2-07B Fix 3 [FIX3-CODE-R3]: the root-follow bound
+    // (OQ-2 as ruled by Leah 2026-11-07: STOP AT THE
+    // BOUND). FSVRRootFollowBoundMeters is the radius in
+    // PHYSICAL metres, measured on the pre-scale
+    // displacement from the sync anchor; the consumed
+    // displacement is radially clamped to it before
+    // per-channel scaling (the main chat's design call,
+    // recorded in P2-07B-FIX3-CODE-REVISION-R3.md for
+    // the R3 ruling; declared default 2.5). The
+    // derivation's valid domain is finite AND
+    // 0 < v <= 10: zero is not a radius (and is the
+    // setting's absent form), a negative or non-finite
+    // value is not a radius, and a value beyond 10 m is
+    // beyond any physical playspace -- it would make
+    // the bound meaningless and, in the common case, is
+    // a unit error (centimetres typed as metres) that
+    // must fail loudly rather than silently become
+    // effectively unbounded following. root_follow_bound_m
+    // carries the raw value when valid and 0 otherwise,
+    // so the snapshot never carries a non-finite or
+    // out-of-domain F32 downstream. When the bound is
+    // invalid the policy is NOT in force: live root
+    // movement stays gated off (never unbounded, never
+    // silent) and the standing composition keeps the
+    // shipped lean behaviour [FIX3-CODE-R2-01].
+    F32  root_follow_bound_m = 0.f;       // FSVRRootFollowBoundMeters
+    bool root_follow_bound_valid = false;
     bool schema_valid = false;
     // Effective head/neck selections equal the legacy behavior:
     // mNeck and mHead enabled, pitch and roll enabled, schema valid.
@@ -228,6 +312,12 @@ public:
     static const char* const SETTING_DIAG_POSITIONAL_SOLVE;
     static const char* const SETTING_DIAG_FULL_CHAIN_SOLVE;
     static const char* const SETTING_LEAN_RESPONSE_GAIN;
+    static const char* const SETTING_POSTURE_SWAP;
+    static const char* const SETTING_ROOT_RESPONSE_GAIN;
+    static const char* const SETTING_STANDING_EYE_HEIGHT_CM;
+    static const char* const SETTING_MANUAL_LEAN_RATIO;
+    static const char* const SETTING_MANUAL_ROOT_RATIO;
+    static const char* const SETTING_ROOT_FOLLOW_BOUND_METERS;
 };
 
 #endif // LL_LLVRTRACKINGSETTINGS_H

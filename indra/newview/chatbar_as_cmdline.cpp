@@ -797,13 +797,33 @@ bool cmd_line_chat(std::string_view revised_text, EChatType type, bool from_gest
                     // fall-through below, and touches nothing
                     // else: no settings write, no recenter,
                     // no yaw-base access (spec section 4.1).
+                    // P2-07B Fix 3 (brief section 2.5): the
+                    // sync act gains its standing flavour --
+                    // "/xr calibrate standing" is the one
+                    // deliberate act that declares a standing
+                    // sync; the plain command remains the
+                    // seated sync, unchanged in what it
+                    // captures. The flavour is the posture
+                    // determination itself: it rides the
+                    // request and is stamped at establishment.
+                    // Any other token remains a usage error.
                     std::string extra_arg;
+                    FSVRPosture flavour = FSVRPosture::SEATED;
                     if (i >> extra_arg)
                     {
-                        FSCommon::report_to_nearby_chat("Usage: /xr calibrate");
-                        return false;
+                        LLStringUtil::toLower(extra_arg);
+                        if (extra_arg == "standing")
+                        {
+                            flavour = FSVRPosture::STANDING;
+                        }
+                        else
+                        {
+                            FSCommon::report_to_nearby_chat(
+                                "Usage: /xr calibrate [standing]");
+                            return false;
+                        }
                     }
-                    FSVRCalibration::requestCalibration();
+                    FSVRCalibration::requestCalibration(flavour);
                     return false;
                 }
                 if (!has_arg || xr_arg == "toggle")

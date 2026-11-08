@@ -46,6 +46,111 @@
 // every caller see the complete type.
 struct FSVRSessionNeutralView;
 
+// ---------------------------------------------------------------------------
+// P2-07B Fix 3 (brief sections 2.1/2.4): the posture and
+// movement-scaling vocabulary. Declared here, on the
+// adapter side of the include edge, because both the
+// plan (below) and C5's session-neutral view (in
+// llvrcalibration.h, which includes this header) name
+// these types.
+// ---------------------------------------------------------------------------
+
+// The posture flavour a sync established (brief section
+// 2.1), stamped on the neutral view beside scale_source
+// under the same CP-S1-1 producer rule: every producer
+// of an established view stamps it, and the
+// default-constructed state is the fail-closed one -- a
+// producer that stamps nothing yields UNDETERMINED, and
+// the system treats that as the brief's section 2.5
+// state (posture behaviours off, shipped profile
+// continues, announced), never as a guessed flavour.
+// Posture is a property of the neutral, not of the live
+// pose: it changes only when a sync establishes a new
+// neutral, and it is invalidated with the neutral. It is
+// NEVER inferred from any measured quantity (brief
+// section 2.5; F3-P3's negative control).
+enum class FSVRPosture : U8
+{
+    UNDETERMINED = 0,   // default-constructed; fail-closed
+    SEATED       = 1,   // established by a seated sync
+    STANDING     = 2,   // established by a standing sync
+};
+
+// The effective behaviour a cycle runs (brief section
+// 2.1): a pure function of the neutral's stamped
+// posture and FSVRPostureSwap -- SEATED runs the sitting
+// behaviour, STANDING the standing behaviour, the swap
+// exchanges them, and UNDETERMINED runs neither posture
+// behaviour whatever the swap says.
+enum class FSVRPostureBehaviour : U8
+{
+    NONE     = 0,   // undetermined: no posture behaviour
+    SITTING  = 1,   // spine lean as shipped; root still
+    STANDING = 2,   // root follows; no translational lean
+};
+
+FSVRPostureBehaviour fsvrEffectivePostureBehaviour(
+    FSVRPosture posture, bool posture_swap);
+
+// Record/display names for the Fix 3 facts (the
+// gateName idiom): stable strings the bonelog records
+// and the sync's chat feedback use, produced in one
+// place so every surface names a state identically.
+const char* fsvrPostureName(FSVRPosture posture);
+const char* fsvrPostureBehaviourName(FSVRPostureBehaviour behaviour);
+
+// The two scale contracts, per channel (brief section
+// 2.4). PROPORTIONAL is in force only when the channel's
+// factor rests on landmark-matched endpoints (the
+// measured establishment's matched pair) or on a valid
+// manual ratio (proportional by the user's own
+// declaration). PROVISIONAL is everything else (baseline
+// x gain -- an honest sensitivity, never described as
+// avatar-size scaling). OFF is the failed-closed state:
+// an invalid scale parameter took the channel out, with
+// its event; it is labeled neither, because it is not a
+// contract at all.
+enum class FSVRScaleContract : U8
+{
+    PROVISIONAL  = 0,
+    PROPORTIONAL = 1,
+    OFF          = 2,
+};
+
+const char* fsvrScaleContractName(FSVRScaleContract contract);
+
+// A channel's manual limb-ratio state (brief section
+// 2.4), as consumed through the settings snapshot's
+// shipped global form. ABSENT: the derived ratio (or the
+// provisional baseline) rules. VALID: the user's stated
+// ratio replaces the derived one and the channel is
+// proportional by declaration. INVALID: present but
+// outside the valid domain or non-finite -- the channel
+// fails closed, never clamped, never quietly replaced
+// by the derived value. Production derives the state
+// per channel from the global settings
+// FSVRManualLeanRatio / FSVRManualRootRatio through
+// the snapshot [FIX3-CODE-R1-01]: the declared 0 is
+// ABSENT (unset), a finite value within 0.05..3.0 is
+// VALID, any other present value is INVALID.
+enum class FSVRManualRatioState : U8
+{
+    ABSENT  = 0,
+    VALID   = 1,
+    INVALID = 2,
+};
+
+// The one mapping from a snapshot's per-channel manual
+// derivation -- its (set, invalid) pair over the
+// channel's global ratio setting -- to the seam state
+// above [FIX3-CODE-R1-01]. Every production consumer of
+// the fact (the adapter glue's cycle inputs, the
+// calibration shell's establishment-record labels)
+// maps through here, never re-deriving it at a call
+// site.
+FSVRManualRatioState fsvrManualRatioState(bool is_set,
+                                          bool is_invalid);
+
 // Which solver domain a joint belongs to. NONE joints are never
 // written by the C1 solvers: the head and neck (brief section 3.5
 // [R1]: C1 never writes mHead or mNeck in Package A -- the one
@@ -316,6 +421,23 @@ struct FSVRAdapterPlanInput
     // keys on this field alone. Independent of gates 1-5 by
     // design (spec section 3.1 authorization contract).
     bool calibration_hold_active = false;
+
+    // P2-07B Fix 3 (brief sections 2.2/4): the posture
+    // behaviour in force for this cycle -- the pure
+    // function of the neutral's stamped posture and the
+    // snapshot's swap, computed by the glue (or by a
+    // harness mirroring it) -- and the standing channel's
+    // computed root offset for the cycle. The offset is a
+    // VALUE the plan carries to the result for the record;
+    // the plan itself moves nothing (its application is
+    // the glue's, through the agent movement channel
+    // Leah's OQ-5 ruling settled). posture_behaviour_
+    // present is false when no behaviour was determined
+    // for the cycle (the record then omits the fact).
+    FSVRPostureBehaviour posture_behaviour = FSVRPostureBehaviour::NONE;
+    bool posture_behaviour_present = false;
+    bool root_offset_present = false;
+    LLVector3 root_offset = LLVector3::zero;
 };
 
 // Read-only view handed to the solvers: the plan input plus the
@@ -637,6 +759,17 @@ struct FSVRAdapterPlanResult
     // Nothing in the plan reads this field; retaining it
     // changes no behaviour (F4-Z1 A/B).
     std::map<S32, LLQuaternion> solver_target_worlds;
+    // P2-07B Fix 3 (brief section 4): the plan input's
+    // posture behaviour and computed root offset, retained
+    // verbatim for the recorder (the bonelog plan block's
+    // optional keys). Copied in computePlan beside the
+    // base composition, before any gate: they describe
+    // the cycle's composition facts, not its outcome, and
+    // remain unchanged on gate failures.
+    FSVRPostureBehaviour posture_behaviour = FSVRPostureBehaviour::NONE;
+    bool posture_behaviour_present = false;
+    bool root_offset_present = false;
+    LLVector3 root_offset = LLVector3::zero;
     // Write-through boundary outcomes, per side (zero when the
     // boundary did not run for that side).
     FSVRAdapterArmOutcome arm_outcome_left;
@@ -652,6 +785,191 @@ struct FSVRAdapterPlanResult
 //  && in.hmd_position_valid && in.sitting_signals_clear
 //  && !in.calibration_in_progress
 bool decideSpineSampleValid(const FSVRSpineSampleInputs& in);
+
+// ---------------------------------------------------------------------------
+// P2-07B Fix 3 (brief sections 2.2/2.4/2.6): the posture
+// cycle's inputs and outputs, and the pure channel seams
+// the composition and the glue share. One implementation
+// of each fact, consumed by the composition, by the
+// glue's root application, and by the harnesses -- never
+// reimplemented at a call site.
+// ---------------------------------------------------------------------------
+
+// The cycle's Fix 3 facts beyond the shipped
+// composition's own parameters: the swap and the Head
+// position toggle from the settings snapshot, both
+// channels' gains with their validities (the shipped
+// gain contract: invalid is rejected, never clamped,
+// and the channel fails closed), and the two channels'
+// manual limb-ratio states (section 2.4: a VALID
+// manual ratio replaces the channel's derived ratio
+// and the gain still multiplies it; an INVALID one
+// fails the channel closed). The lean gain's VALUE
+// reaches the composition through
+// composeHeadTargetBlock's lean_gain parameter (the
+// shipped Stage 1 surface); its VALIDITY rides here
+// [FIX3-CODE-R1-02] so the lean factor decision itself
+// fails closed on an invalid gain instead of consuming
+// the snapshot's pinned 1.0 as a valid value.
+// Production populates the manual states from the
+// snapshot's per-channel derivations over the global
+// settings FSVRManualLeanRatio / FSVRManualRootRatio
+// [FIX3-CODE-R1-01] (per-avatar profile storage
+// remains redesign Stage 2 machinery, outside this
+// brief; the seam is where a future source lands).
+struct FSVRFix3CycleInputs
+{
+    bool posture_swap = false;          // FSVRPostureSwap
+    bool head_position_enabled = false; // FSVRTrackHeadPosition
+    bool lean_gain_valid = true;        // FSVRLeanResponseGain
+    F32  root_gain = 1.f;               // FSVRRootResponseGain
+    bool root_gain_valid = true;
+    FSVRManualRatioState manual_lean = FSVRManualRatioState::ABSENT;
+    F32  manual_lean_ratio = 0.f;
+    FSVRManualRatioState manual_root = FSVRManualRatioState::ABSENT;
+    F32  manual_root_ratio = 0.f;
+    // OQ-2's ruled boundary policy [FIX3-CODE-R3]: the
+    // root-follow bound from the snapshot
+    // (FSVRRootFollowBoundMeters), in PHYSICAL metres on
+    // the pre-scale displacement from the sync anchor,
+    // with its validity. The policy is in force only
+    // when root_follow_bound_valid: the standing step
+    // then radially clamps the consumed displacement to
+    // root_follow_bound_m before scaling, the
+    // composition suppresses translational solver input,
+    // and the glue may write the agent position. When
+    // the bound is invalid the policy is NOT in force:
+    // no write, no suppression -- the standing
+    // composition keeps the shipped lean behaviour
+    // [FIX3-CODE-R2-01]. The default-constructed fact
+    // set (no policy) is the fail-closed one.
+    F32  root_follow_bound_m = 0.f;
+    bool root_follow_bound_valid = false;
+};
+
+// What the Fix 3 composition determined for the cycle,
+// beyond the head target itself. behaviour is the
+// effective posture behaviour (the pure function of the
+// view's posture and the swap). root_offset is the
+// standing channel's computed offset (ScaleRoot of the
+// anchor-relative displacement state -- of the
+// OQ-2-clamped displacement when the boundary policy
+// is in force [FIX3-CODE-R3]), meaningful only
+// when root_offset_valid: standing behaviour in force,
+// Head position ON, and the root channel's factor
+// applied. It is computed and recorded in every such
+// state, including while the live write is gated off
+// (the policy not in force): the record describes the
+// channel's determination, not the write's outcome.
+// In every other state root_offset is exactly
+// zero and root_offset_valid is false (sitting: F3-R2;
+// undetermined: section 2.5; Head position OFF: section
+// 0.4 of the brief). lean_scale_invalid /
+// root_scale_invalid name the channels an invalid scale
+// parameter failed closed this cycle (section 2.4): the
+// glue turns each into its scale_parameter_invalid
+// bonelog event, edge-latched.
+struct FSVRFix3CompositionResult
+{
+    FSVRPostureBehaviour behaviour = FSVRPostureBehaviour::NONE;
+    bool root_offset_valid = false;
+    LLVector3 root_offset = LLVector3::zero;
+    bool lean_scale_invalid = false;
+    bool root_scale_invalid = false;
+};
+
+// One channel's factor decision (brief section 2.4):
+// factor is the channel's total F(c) = ratio x gain,
+// composed in F32, ready for the single F32
+// multiplication of the mapped displacement. applied is
+// false when the channel is off -- invalid is then true
+// when an invalid scale parameter (not a mere absence)
+// is what took it out.
+struct FSVRChannelFactor
+{
+    bool applied = false;
+    bool invalid = false;
+    F32  factor = 1.f;
+};
+
+// The lean channel's factor for an establishment: the
+// measured establishment's ratio is its record's
+// head_ratio (the matched pair's own value), the
+// provisional baseline otherwise; a valid manual ratio
+// replaces either; FSVRDiagForceUnitScale forces the
+// derived ratio to 1.0 and never touches a manual ratio
+// or a gain (the shipped diagnostic meaning). The gain
+// multiplies on EVERY path now (brief section 2.4: the
+// Stage 1 asymmetry -- gain on the provisional path
+// only -- is absorbed into the contract). An invalid
+// lean gain (inputs.lean_gain_valid false) fails the
+// channel closed ahead of every ratio source: the
+// snapshot's pinned substitute value is never consumed
+// as a valid gain [FIX3-CODE-R1-02].
+FSVRChannelFactor fsvrLeanChannelFactor(
+    const FSVRSessionNeutralView& session, F32 lean_gain,
+    bool diag_force_unit_scale,
+    const FSVRFix3CycleInputs& inputs);
+
+// The root channel's factor: no proportional contract
+// is specified for it in this brief (OQ-7), so its ratio
+// is the provisional baseline 1.0, or a valid manual
+// ratio (proportional by declaration). The gain is the
+// snapshot's root gain under its validity flag.
+FSVRChannelFactor fsvrRootChannelFactor(
+    const FSVRFix3CycleInputs& inputs);
+
+// The shipped displacement mapping, factored out of the
+// composition so the glue's root step and the
+// composition read the identical value: the
+// anchor-relative LOCAL displacement mapped through the
+// rotation path's vector form (P, the session's yaw-only
+// q_yaw, the root frame's rotation). Pure over its
+// arguments; no factor is applied here.
+LLVector3 fsvrMapAnchorDisplacement(
+    const FSVRSessionNeutralView& session,
+    const LLVector3& hmd_position_local,
+    F32 session_base_yaw_rad,
+    const LLQuaternion& root_world_rotation);
+
+// The standing root step for one cycle, as one pure
+// decision: the behaviour in force, and -- only when
+// the standing behaviour is in force and Head position
+// is ON -- the root channel's offset for the cycle
+// (ScaleRoot of the current anchor-relative
+// displacement; OQ-1's follow form, Leah's 2026-11-07
+// ruling). Since [FIX3-CODE-R3] the displacement the
+// offset is computed from is the OQ-2-clamped one when
+// the boundary policy is in force (radial clamp to the
+// bound, applied before scaling; bound_clamped names a
+// cycle the clamp actually reduced). A failed-closed
+// root channel yields offset_valid false with
+// root_scale_invalid set: the cycle's displacement is
+// then consumed NOWHERE, never handed to the solver as
+// a remainder (brief section 2.2 item 1's stated
+// invariant). live is the step's write authorization:
+// offset_valid AND the boundary policy in force -- the
+// one fact the glue's write decision and the harness
+// rig's application both read. The glue applies a live
+// offset through the agent movement channel before
+// base composition; the composition recomputes the
+// identical value for the record.
+struct FSVRStandingRootStep
+{
+    FSVRPostureBehaviour behaviour = FSVRPostureBehaviour::NONE;
+    bool offset_valid = false;
+    LLVector3 root_offset = LLVector3::zero;
+    bool root_scale_invalid = false;
+    bool bound_clamped = false;
+    bool live = false;
+};
+
+FSVRStandingRootStep fsvrComputeStandingRootStep(
+    const FSVRSessionNeutralView& session,
+    const LLVector3& hmd_position_local,
+    F32 session_base_yaw_rad,
+    const LLQuaternion& root_world_rotation,
+    const FSVRFix3CycleInputs& inputs);
 
 // P2-07B C6-E (CP-4): the per-cycle head-target composition
 // (Package B spec section 7.3), pure over its named inputs.
@@ -676,6 +994,28 @@ bool decideSpineSampleValid(const FSVRSpineSampleInputs& in);
 // FSVRDiagForceUnitScale keeps its shipped meaning (it
 // forces the *calibration* ratio to 1.0); the gain is a
 // user preference and survives the diagnostic.
+// P2-07B Fix 3 (brief sections 2.2/2.4): the composition
+// is extended, not replaced. The lean channel's factor
+// (fsvrLeanChannelFactor: ratio x gain, composed in F32)
+// is applied as ONE F32 multiplication of the mapped
+// displacement, in the shipped lean_gain position, on
+// every path -- the measured path's gain-blindness is
+// superseded by the brief's contract (its gain now
+// applies as the contract's k; at factor exactly 1.0 the
+// composed target is bit-identical to the shipped
+// composition, F3-S2). Under the standing behaviour WITH
+// OQ-2's boundary policy in force [FIX3-CODE-R3] the
+// root channel consumes the (clamped) displacement
+// entire and the solver's translational input is ZERO
+// by stated invariant (never a computed residual);
+// under standing WITHOUT the policy in force the
+// composition is the shipped lean one, exactly as
+// under sitting or undetermined [FIX3-CODE-R2-01].
+// fix3_inputs == nullptr runs
+// the cycle with the brief's default fact set (no swap,
+// Head position OFF for the root step, gains 1.0 valid,
+// no manual ratios); fix3_result, when non-null,
+// receives the cycle's Fix 3 determinations.
 bool composeHeadTargetBlock(
     const FSVRSessionNeutralView& session,
     const LLVector3& hmd_position_local,
@@ -685,7 +1025,9 @@ bool composeHeadTargetBlock(
     bool diag_force_unit_scale,
     F32 lean_gain,
     LLVector3& out_head_target_world,
-    LLVector3& out_cornea_offset_head_local);
+    LLVector3& out_cornea_offset_head_local,
+    const FSVRFix3CycleInputs* fix3_inputs = nullptr,
+    FSVRFix3CompositionResult* fix3_result = nullptr);
 
 // ---------------------------------------------------------------------------
 // P2-07B Fix 4 (brief sections 2.2/2.3/2.5): base
