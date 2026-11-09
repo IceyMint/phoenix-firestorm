@@ -1,0 +1,4104 @@
+/**
+ * @file llvradapterapply.cpp
+ * @brief P2-07B C1: Stage-2 adapter apply point. See
+ *        llvradapterapply.h for the contract.
+ *
+ * Composition algebra (C0 section 4.2.1, proven from
+ * llquaternion.cpp:534-546): in LL's operator*, the LEFT operand
+ * applies first, so a joint's world rotation is
+ *     world = local * parent_world
+ * and the committed local for a desired world target is
+ *     local = target_world * ~parent_world
+ * with world quaternions normalized before operator~ (operator*
+ * does not renormalize). Parent worlds are always composed from
+ * the just-committed locals of this transaction (same-cycle by
+ * construction); LLJoint::setWorldRotation is never used, because
+ * it derives locals from the parent's CACHED world matrix, which
+ * inside updateMotions is still the previous cycle's (brief
+ * section 2.6).
+ */
+
+#include "llviewerprecompiledheaders.h"
+
+#include "llvradapterapply.h"
+
+#include "llvrcalibration.h"
+#include "llvrbonelog.h"
+#include "llvrspinesolver.h"
+
+#include <cmath>
+#include <set>
+
+namespace
+{
+
+// Compose the base (arbitrated) pose over the root frame, parents
+// first. The input list is topologically ordered.
+void composeBaseWorlds(const FSVRAdapterPlanInput& input,
+                       std::vector<LLQuaternion>& out_rotations,
+                       std::vector<LLVector3>& out_positions)
+{
+    const S32 count = static_cast<S32>(input.joints.size());
+    out_rotations.resize(count);
+    out_positions.resize(count);
+    for (S32 i = 0; i < count; ++i)
+    {
+        const FSVRAdapterJointInput& joint = input.joints[i];
+        LLQuaternion parent_rot = input.root_world_rotation;
+        LLVector3 parent_pos = input.root_world_position;
+        if (joint.parent_index >= 0)
+        {
+            parent_rot = out_rotations[joint.parent_index];
+            parent_pos = out_positions[joint.parent_index];
+        }
+        LLQuaternion world = joint.base_local * parent_rot;
+        world.normalize();
+        out_rotations[i] = world;
+        out_positions[i] = parent_pos + (joint.rest_offset * parent_rot);
+    }
+}
+
+// ------------------------------------------------------------------
+// P2-07B Fix 1 (CP-F1-1): head-group reconciliation helpers. All
+// operations are total-angle / quaternion operations; no Euler
+// decomposition appears anywhere in the new code (brief
+// section 7 R-6).
+// ------------------------------------------------------------------
+
+// The head-group local cap: HEAD_ROTATION_CONSTRAINT's value,
+// F_PI_BY_TWO * 0.8f (72 deg), duplicated by value per the
+// llagentcamera.cpp:149 precedent ("match LLHeadRotMotion";
+// the constant itself is at llheadrotmotion.cpp:91). The
+// native 72 deg is a COMBINED bound -- the head's total
+// rotation relative to its basis frame, constrained once at
+// llheadrotmotion.cpp:323 before the lag-share distribution
+// writes the two locals -- and no per-joint local cap exists
+// natively (CP-F1-0 Q4; brief INV-F1-03 [R2]). This constant
+// is the adapter's per-local backstop value for the cascade
+// (the neck stage's cap, and the head stage's constrain under
+// the native operation and value); the combined bound itself
+// is enforced by the selection in CP-F1-1 step 5.
+constexpr F32 kHeadGroupLocalCapRad = F_PI_BY_TWO * 0.8f;
+
+// F32 tolerance on the combined-bound pass test (CP-F1-1
+// step 5): the candidate at or below the bound plus this
+// tolerance is the cascade pair, selected unchanged.
+constexpr F32 kHeadGroupBoundTolRad = 1e-5f;
+
+// Shortest-arc, sign-invariant total angle of a rotation
+// (q and -q measure identically): 2*atan2(|vec|, |w|) over
+// the normalized quaternion. The atan2 form keeps full F32
+// resolution at small angles, where the acos(|w|) form
+// quantizes (CP-F1-1 step 4 [R2] (i)).
+F32 quaternionAngleRad(const LLQuaternion& q_in)
+{
+    LLQuaternion q = q_in;
+    q.normalize();
+    const F32 vlen = std::sqrt(q.mQ[VX] * q.mQ[VX] +
+                               q.mQ[VY] * q.mQ[VY] +
+                               q.mQ[VZ] * q.mQ[VZ]);
+    return 2.f * std::atan2(vlen, std::fabs(q.mQ[VW]));
+}
+
+// The rotation q_in rescaled to the given total angle about
+// its own shortest-arc axis (scale_angle, CP-F1-1 step 5).
+LLQuaternion scaleQuaternionAngle(const LLQuaternion& q_in,
+                                  F32 target_angle_rad)
+{
+    LLQuaternion q = q_in;
+    q.normalize();
+    if (q.mQ[VW] < 0.f)
+    {
+        q = LLQuaternion(-q.mQ[VX], -q.mQ[VY], -q.mQ[VZ],
+                         -q.mQ[VW]);
+    }
+    const F32 vlen = std::sqrt(q.mQ[VX] * q.mQ[VX] +
+                               q.mQ[VY] * q.mQ[VY] +
+                               q.mQ[VZ] * q.mQ[VZ]);
+    if (vlen < 1e-9f)
+    {
+        // No axis to scale about: the rotation is the
+        // identity at F32 resolution, and the only target
+        // the selection forms for it is the identity's own.
+        return LLQuaternion();
+    }
+    const LLVector3 axis(q.mQ[VX] / vlen, q.mQ[VY] / vlen,
+                         q.mQ[VZ] / vlen);
+    return LLQuaternion(target_angle_rad, axis);
+}
+
+bool domainAuthority(const FSVRAdapterJointInput& joint,
+                     bool spine_authority, bool arm_authority)
+{
+    switch (joint.domain)
+    {
+    case FSVRAdapterDomain::SPINE:
+        return spine_authority;
+    case FSVRAdapterDomain::ARM_LEFT:
+    case FSVRAdapterDomain::ARM_RIGHT:
+        return arm_authority;
+    default:
+        return false;
+    }
+}
+
+// The plan-side write-through host (boundary contract in the
+// header). It holds the transaction's provisional state for one
+// side's arm phase: a copy of the locals the transaction has
+// resolved so far (post-spine), which the solver edits through
+// the host. The transaction reads the result back only if the
+// solver completes; on abort the host is simply destroyed with
+// the transaction's committed state untouched (contract point
+// (c)). Worlds are composed from the provisional locals on every
+// read -- the host keeps no world cache, so a parent-world read
+// after a provisional parent-changing write necessarily reflects
+// it (contract point (b)).
+class PlanWriteThroughHost final : public FSVRAdapterWriteThroughHost
+{
+public:
+    PlanWriteThroughHost(const FSVRAdapterPlanInput& input,
+                         FSVRAdapterDomain side_domain,
+                         const std::vector<LLQuaternion>& seed_locals)
+        : mInput(input), mSideDomain(side_domain), mLocals(seed_locals)
+    {
+    }
+
+    bool writeProvisionalLocal(S32 joint_index,
+                               const LLQuaternion& local) override
+    {
+        if (!inRange(joint_index) ||
+            mInput.joints[joint_index].domain != mSideDomain)
+        {
+            // Only this side's arm chain may be written through
+            // the host (contract point (a)).
+            return false;
+        }
+        LLQuaternion q = local;
+        q.normalize();
+        mLocals[joint_index] = q;
+        mWritten.insert(joint_index);
+        return true;
+    }
+
+    bool readProvisionalLocal(S32 joint_index,
+                              LLQuaternion& out_local) const override
+    {
+        if (!inRange(joint_index))
+        {
+            return false;
+        }
+        out_local = mLocals[joint_index];
+        return true;
+    }
+
+    bool readWorldRotation(S32 joint_index,
+                           LLQuaternion& out_rotation) const override
+    {
+        LLVector3 pos;
+        return composeWorld(joint_index, out_rotation, pos);
+    }
+
+    bool readWorldPosition(S32 joint_index,
+                           LLVector3& out_position) const override
+    {
+        LLQuaternion rot;
+        return composeWorld(joint_index, rot, out_position);
+    }
+
+    bool wasWritten(S32 joint_index) const
+    {
+        return mWritten.find(joint_index) != mWritten.end();
+    }
+
+private:
+    bool inRange(S32 index) const
+    {
+        return index >= 0 &&
+               index < static_cast<S32>(mInput.joints.size());
+    }
+
+    bool composeWorld(S32 joint_index, LLQuaternion& out_rot,
+                      LLVector3& out_pos) const
+    {
+        if (!inRange(joint_index))
+        {
+            return false;
+        }
+        // Collect the chain up to the plan root, then compose
+        // downward from the root frame.
+        std::vector<S32> chain;
+        for (S32 cursor = joint_index; cursor >= 0;
+             cursor = mInput.joints[cursor].parent_index)
+        {
+            chain.push_back(cursor);
+        }
+        LLQuaternion rot = mInput.root_world_rotation;
+        LLVector3 pos = mInput.root_world_position;
+        for (auto it = chain.rbegin(); it != chain.rend(); ++it)
+        {
+            const FSVRAdapterJointInput& joint = mInput.joints[*it];
+            LLQuaternion world = mLocals[*it] * rot;
+            world.normalize();
+            pos = pos + (joint.rest_offset * rot);
+            rot = world;
+        }
+        out_rot = rot;
+        out_pos = pos;
+        return true;
+    }
+
+    const FSVRAdapterPlanInput& mInput;
+    FSVRAdapterDomain mSideDomain;
+    std::vector<LLQuaternion> mLocals;
+    std::set<S32> mWritten;
+};
+
+} // namespace
+
+// static
+bool FSVRAdapterApply::isJointEligible(const FSVRAdapterPlanInput& input,
+                                       const FSVRAdapterJointInput& joint,
+                                       bool spine_authority,
+                                       bool arm_authority)
+{
+    if (!joint.in_registry)
+    {
+        return false;
+    }
+    if (joint.domain == FSVRAdapterDomain::NONE)
+    {
+        // Head, neck, collars, structural ancestors: never written
+        // (brief section 3.5 [R1], spec section 6.2).
+        return false;
+    }
+    if (!joint.decision_grants_base &&
+        !domainAuthority(joint, spine_authority, arm_authority))
+    {
+        return false;
+    }
+    if (joint.disabled)
+    {
+        // L4 exception is spine-only (spec section 6.1; D4: it
+        // never extends to arms).
+        if (!(input.bend_disabled_bones &&
+              joint.domain == FSVRAdapterDomain::SPINE))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+// static
+FSVRAdapterCycleKind FSVRAdapterApply::classifyCycle(
+    bool preview_cycle, bool controller_paused)
+{
+    if (preview_cycle)
+    {
+        return FSVRAdapterCycleKind::PREVIEW;
+    }
+    if (controller_paused)
+    {
+        // A paused controller reaches the post-blend hook only
+        // through FORCE_UPDATE (brief section 2.3).
+        return FSVRAdapterCycleKind::PAUSED_FORCE;
+    }
+    return FSVRAdapterCycleKind::NORMAL;
+}
+
+// static
+const std::vector<std::string>&
+FSVRAdapterApply::calibrationHoldJointNames()
+{
+    // Spec section 3.1's in-scope set, by skeleton joint
+    // name (brief section 2.7, confirmed against
+    // llvrboneregistry.cpp): the D7 spine chain, mNeck,
+    // mHead, and per side collar/shoulder/elbow/wrist.
+    // Fingers are not held and not read.
+    static const std::vector<std::string> names = {
+        "mSpine1",      "mSpine2",      "mTorso",
+        "mSpine3",      "mSpine4",      "mChest",
+        "mNeck",        "mHead",
+        "mCollarLeft",  "mShoulderLeft", "mElbowLeft", "mWristLeft",
+        "mCollarRight", "mShoulderRight", "mElbowRight", "mWristRight"};
+    return names;
+}
+
+// static
+bool FSVRAdapterApply::continuityCarries(
+    bool have_previous, U64 frame_token, U64 previous_token,
+    U64 settings_generation, U64 previous_settings_generation,
+    U64 continuity_epoch, U64 previous_continuity_epoch,
+    U64 install_generation, U64 previous_install_generation)
+{
+    // P2-07B C8 (CP-3): the glue's retirement predicate, with
+    // the continuity-epoch conjunct added to the committed
+    // token/generation terms. See the header for the contract;
+    // the glue calls this function, so what H8 fixtures is
+    // what production evaluates.
+    // P2-07B Stage 1 (CP-S1-2): the installation-generation
+    // conjunct (S1-BRIEF-R1-01) -- carried history was
+    // produced relative to the neutral installed under
+    // previous_install_generation; a resync (any producer)
+    // advances the view's generation and retires it.
+    return have_previous &&
+           frame_token == previous_token + 1 &&
+           settings_generation == previous_settings_generation &&
+           continuity_epoch == previous_continuity_epoch &&
+           install_generation == previous_install_generation;
+}
+
+// ---------------------------------------------------------------------------
+// P2-07B Fix 4 (CP-F4-1): the base-provenance seam (brief
+// sections 2.2/2.3). Pure over the store and the cycle's
+// named inputs, in the DIAG-1 house pattern: the glue owns
+// the store, the lifecycle detection and the bonelog
+// emission; these functions own the classification rules,
+// so the fixtures exercise exactly what production runs.
+// ---------------------------------------------------------------------------
+
+namespace
+{
+
+// The brief's closeness tolerance: seed vs lineage, and
+// live vs lineage on a no-write cycle, are "the same"
+// below 0.01 degrees (section 2.2).
+constexpr F32 kProvenanceToleranceRad = 0.01f * DEG_TO_RAD;
+
+F32 provenanceAngleDeg(const LLQuaternion& a,
+                       const LLQuaternion& b)
+{
+    return quaternionAngleRad(a * ~b) * RAD_TO_DEG;
+}
+
+bool provenanceClose(const LLQuaternion& a,
+                     const LLQuaternion& b)
+{
+    return quaternionAngleRad(a * ~b) <= kProvenanceToleranceRad;
+}
+
+} // namespace
+
+// static
+void FSVRAdapterApply::provenanceReset(
+    FSVRBaseProvenanceStore& store,
+    const std::vector<FSVRAdapterJointInput>& joints,
+    const char* reason,
+    std::vector<FSVRBaseProvenanceEvent>& events)
+{
+    store.entries.clear();
+    store.dormant.clear();
+    for (const FSVRAdapterJointInput& joint : joints)
+    {
+        FSVRBaseProvenanceEntry entry;
+        entry.has_commit = false;
+        entry.anim_local = joint.base_local;
+        entry.expected_live_local = joint.base_local;
+        store.entries[joint.name] = entry;
+    }
+    FSVRBaseProvenanceEvent event;
+    event.kind = FSVRBaseProvenanceEventKind::RESET;
+    event.reason = reason ? reason : "";
+    events.push_back(event);
+}
+
+// static
+void FSVRAdapterApply::provenanceAssembly(
+    FSVRBaseProvenanceStore& store,
+    std::vector<FSVRAdapterJointInput>& joints,
+    const std::vector<FSVRBaseBlendFact>& facts,
+    bool record_valid,
+    std::vector<FSVRBaseProvenanceEvent>& events)
+{
+    // Membership reconciliation (brief section 2.5): a
+    // stored joint no longer in the presented set leaves
+    // the active set, loudly -- but its provenance is NOT
+    // dropped [FIX4-CODE-R1-02]: it moves to the dormant
+    // map under the same ownership and is restored
+    // verbatim if the joint returns, because the joint's
+    // live local may still be an adapter commit from
+    // before its departure, and re-seeding from it would
+    // adopt the adapter's own bend as animation.
+    {
+        std::set<std::string> present_names;
+        for (const FSVRAdapterJointInput& joint : joints)
+        {
+            present_names.insert(joint.name);
+        }
+        for (auto it = store.entries.begin();
+             it != store.entries.end();)
+        {
+            if (present_names.count(it->first) == 0)
+            {
+                FSVRBaseProvenanceEvent event;
+                event.kind = FSVRBaseProvenanceEventKind::RESET;
+                event.joint_name = it->first;
+                event.reason = "membership";
+                events.push_back(event);
+                store.dormant[it->first] = it->second;
+                it = store.entries.erase(it);
+            }
+            else
+            {
+                ++it;
+            }
+        }
+    }
+
+    for (size_t i = 0; i < joints.size(); ++i)
+    {
+        FSVRAdapterJointInput& joint = joints[i];
+        const LLQuaternion live_local = joint.base_local;
+        const FSVRBaseBlendFact fact =
+            (i < facts.size()) ? facts[i] : FSVRBaseBlendFact();
+        auto it = store.entries.find(joint.name);
+        if (it == store.entries.end())
+        {
+            // Re-entry after a membership absence under
+            // unchanged ownership [FIX4-CODE-R1-02]: the
+            // dormant provenance is restored verbatim and
+            // this cycle classifies normally below. The
+            // joint's live local is NOT consulted as a
+            // seed: it may still be the adapter's commit
+            // from before the absence.
+            auto dormant_it = store.dormant.find(joint.name);
+            if (dormant_it != store.dormant.end())
+            {
+                store.entries[joint.name] = dormant_it->second;
+                store.dormant.erase(dormant_it);
+                it = store.entries.find(joint.name);
+            }
+            else
+            {
+                // First sight (store creation, or a joint
+                // that newly joined the set under this
+                // ownership): seeded from the joint's
+                // current local. The caller guarantees
+                // this runs before any adapter write
+                // reaches the joint under the current
+                // ownership (F4-S6), so the seed is the
+                // joint's animation/rest local, never a
+                // commit.
+                FSVRBaseProvenanceEntry entry;
+                entry.has_commit = false;
+                entry.anim_local = live_local;
+                entry.expected_live_local = live_local;
+                store.entries[joint.name] = entry;
+                continue;
+            }
+        }
+        FSVRBaseProvenanceEntry& entry = it->second;
+        if (!entry.has_commit)
+        {
+            // Never adapter-written: the live local IS the
+            // animation stack's value, tracked verbatim.
+            entry.anim_local = live_local;
+            entry.expected_live_local = live_local;
+            continue;
+        }
+        if (!record_valid || !fact.present)
+        {
+            // Fail closed [R3 verdict safeguard +
+            // FIX4-CODE-R1-01]: a tracked joint with no
+            // trustworthy classification this cycle is NOT
+            // read as NO_WRITE (which would carry
+            // contaminated state silently, and a stale
+            // written entry must never be classified at
+            // all) -- but its provenance is NOT dropped
+            // either. A missing record is a gap in the
+            // observation, not evidence about authorship:
+            // the event names the gap, the presented base
+            // stays the joint's trusted animation local,
+            // and the commit history and live lineage are
+            // retained untouched, so the next classified
+            // cycle resumes exactly where the last
+            // trustworthy one left off. Re-seeding from
+            // the live local here would adopt a value that
+            // may be the adapter's own commit -- the
+            // ratchet this fix exists to break.
+            FSVRBaseProvenanceEvent event;
+            event.kind = FSVRBaseProvenanceEventKind::RESET;
+            event.joint_name = joint.name;
+            event.reason = record_valid
+                               ? "record_inconsistent"
+                               : "record_unavailable";
+            events.push_back(event);
+            joint.base_local = entry.anim_local;
+            continue;
+        }
+        switch (fact.blend_class)
+        {
+        case FSVRBaseBlendClass::SEED_DISCARDED:
+            // The blend discarded its seed: the result is
+            // animation output entire, whatever its value
+            // -- including a value equal to the stored
+            // commit [R1 case (i)]. Adopt unconditionally.
+            entry.anim_local = fact.result_local;
+            entry.expected_live_local = fact.result_local;
+            break;
+        case FSVRBaseBlendClass::SEED_PRESERVED:
+            // Additive-only: the result factors as
+            // added_rot * seed by the blend's own
+            // construction. The gate judges the SEED
+            // against the lineage (never the last commit
+            // [R2]): a seed the lineage cannot explain is
+            // a discontinuity the rules do not cover --
+            // carry the tracked local, drop the additive
+            // contribution, say so, and re-base the
+            // lineage to the blend's result so the next
+            // cycle is judged from where the skeleton
+            // actually is. No silent fallback.
+            if (provenanceClose(fact.seed_local,
+                                entry.expected_live_local))
+            {
+                entry.anim_local =
+                    fact.added_rot * entry.anim_local;
+            }
+            else
+            {
+                FSVRBaseProvenanceEvent event;
+                event.kind =
+                    FSVRBaseProvenanceEventKind::UNCLASSIFIED;
+                event.joint_name = joint.name;
+                event.divergence_deg =
+                    provenanceAngleDeg(
+                        fact.seed_local,
+                        entry.expected_live_local);
+                events.push_back(event);
+            }
+            entry.expected_live_local = fact.result_local;
+            break;
+        case FSVRBaseBlendClass::NO_WRITE:
+        default:
+            // The blend did not write the joint. The live
+            // local is either the lineage value (our own
+            // commit, or an animation-attributed local, or
+            // their composition) or it moved without the
+            // blend and without us: a foreign write. The
+            // foreign value is adopted (the skeleton holds
+            // it and the next seed is built on it) and the
+            // lineage re-bases to it. Inside tolerance the
+            // cycle is an ordinary carry: the presented
+            // base is the tracked animation local and the
+            // lineage does not revert [R2].
+            if (!provenanceClose(live_local,
+                                 entry.expected_live_local))
+            {
+                entry.anim_local = live_local;
+                entry.expected_live_local = live_local;
+            }
+            break;
+        }
+        joint.base_local = entry.anim_local;
+    }
+}
+
+// static
+void FSVRAdapterApply::provenanceCommitWrites(
+    FSVRBaseProvenanceStore& store,
+    const std::vector<FSVRAdapterJointInput>& joints,
+    const std::vector<FSVRAdapterWrite>& writes)
+{
+    for (const FSVRAdapterWrite& write : writes)
+    {
+        if (write.joint_index < 0 ||
+            write.joint_index >=
+                static_cast<S32>(joints.size()))
+        {
+            continue;
+        }
+        auto it =
+            store.entries.find(joints[write.joint_index].name);
+        if (it == store.entries.end())
+        {
+            continue;
+        }
+        it->second.has_commit = true;
+        it->second.commit_local = write.local;
+        it->second.expected_live_local = write.local;
+    }
+}
+
+bool decideSpineSampleValid(const FSVRSpineSampleInputs& in)
+{
+    // P2-07B C6-E (CP-2): the E5-E9 conjunction, verbatim.
+    // Extracted so H10 tests the production composition
+    // (Package B spec section 9); the glue supplies the
+    // cycle's values, this function only composes them.
+    // P2-07B Stage 1 (CP-S1-4): E5's input is the renamed
+    // scale_input_valid; the conjunction's shape is
+    // unchanged.
+    return in.scale_input_valid && in.neutral_established &&
+           in.hmd_position_valid && in.sitting_signals_clear &&
+           !in.calibration_in_progress;
+}
+
+// ---------------------------------------------------------------------------
+// P2-07B Fix 3 (brief sections 2.1/2.2/2.4): the posture
+// behaviour, the record names, the channel factors, the
+// shared displacement mapping and the standing root
+// step. Pure seams all: the composition below, the
+// glue's root application and the harnesses consume the
+// same functions, so a fixture tests the production
+// decision, never a reimplementation.
+// ---------------------------------------------------------------------------
+
+FSVRPostureBehaviour fsvrEffectivePostureBehaviour(
+    FSVRPosture posture, bool posture_swap)
+{
+    // The swap exchanges the two declared behaviours;
+    // UNDETERMINED has no behaviour to exchange into --
+    // it runs neither, whatever the swap says (brief
+    // section 2.1).
+    switch (posture)
+    {
+    case FSVRPosture::SEATED:
+        return posture_swap ? FSVRPostureBehaviour::STANDING
+                            : FSVRPostureBehaviour::SITTING;
+    case FSVRPosture::STANDING:
+        return posture_swap ? FSVRPostureBehaviour::SITTING
+                            : FSVRPostureBehaviour::STANDING;
+    case FSVRPosture::UNDETERMINED:
+    default:
+        return FSVRPostureBehaviour::NONE;
+    }
+}
+
+const char* fsvrPostureName(FSVRPosture posture)
+{
+    switch (posture)
+    {
+    case FSVRPosture::SEATED:   return "seated";
+    case FSVRPosture::STANDING: return "standing";
+    case FSVRPosture::UNDETERMINED:
+    default:                    return "undetermined";
+    }
+}
+
+const char* fsvrPostureBehaviourName(FSVRPostureBehaviour behaviour)
+{
+    switch (behaviour)
+    {
+    case FSVRPostureBehaviour::SITTING:  return "sitting";
+    case FSVRPostureBehaviour::STANDING: return "standing";
+    case FSVRPostureBehaviour::NONE:
+    default:                             return "undetermined";
+    }
+}
+
+FSVRAvatarPostureState fsvrClassifyAvatarState(
+    const FSVRAvatarStateSample& sample)
+{
+    // R5 brief section 2.2's truth table, row for row (see
+    // the declaration in llvradapterapply.h). The order of
+    // the checks is the table's: avatar validity first, then
+    // the sitting flag's two families. No measured quantity
+    // and no history is consulted -- the classification is
+    // this sample alone.
+    if (!sample.avatar_valid)
+    {
+        return FSVRAvatarPostureState::INVALID;
+    }
+    if (sample.sitting_flag)
+    {
+        if (sample.parent_present)
+        {
+            // An object sit when the parent resolves as the
+            // avatar's root prim; an unresolvable parent
+            // leaves the subtype unknown -- still sitting
+            // (brief section 2.3).
+            return sample.parent_is_object
+                ? FSVRAvatarPostureState::SITTING_OBJECT
+                : FSVRAvatarPostureState::SITTING_SUBTYPE_UNKNOWN;
+        }
+        switch (sample.ground_motion)
+        {
+        case FSVRGroundMotion::ACTIVE:
+            // The ground-sit motion is the ground sit: its
+            // start/stop drives sitDown(true/false) in the
+            // stock animation-state path, and the per-frame
+            // reconciliation preserves an unparented sit
+            // exactly while the motion is active.
+            return FSVRAvatarPostureState::SITTING_GROUND;
+        case FSVRGroundMotion::INACTIVE:
+            // The flag says sitting but the motion that
+            // would hold the sit is neither active nor
+            // loading (the sampler reads loading as
+            // UNKNOWN, below): the stock reconciliation
+            // retires such a sit the same frame.
+            // Contradictory evidence, classified UNKNOWN,
+            // never resolved by guessing (brief 2.2).
+            return FSVRAvatarPostureState::UNKNOWN;
+        case FSVRGroundMotion::UNKNOWN:
+        default:
+            return FSVRAvatarPostureState::SITTING_SUBTYPE_UNKNOWN;
+        }
+    }
+    // Sitting flag clear.
+    if (sample.parent_present)
+    {
+        // A parented avatar whose sitting flag is clear
+        // contradicts the stock setParent contract
+        // (setParent drives sitOnObject/getOffObject
+        // synchronously): contradictory, never guessed.
+        return FSVRAvatarPostureState::UNKNOWN;
+    }
+    switch (sample.ground_motion)
+    {
+    case FSVRGroundMotion::INACTIVE:
+        return FSVRAvatarPostureState::STANDING;
+    case FSVRGroundMotion::ACTIVE:
+    case FSVRGroundMotion::UNKNOWN:
+    default:
+        return FSVRAvatarPostureState::UNKNOWN;
+    }
+}
+
+const char* fsvrAvatarPostureStateName(FSVRAvatarPostureState state)
+{
+    switch (state)
+    {
+    case FSVRAvatarPostureState::STANDING:
+        return "standing";
+    case FSVRAvatarPostureState::SITTING_OBJECT:
+        return "sitting_object";
+    case FSVRAvatarPostureState::SITTING_GROUND:
+        return "sitting_ground";
+    case FSVRAvatarPostureState::SITTING_SUBTYPE_UNKNOWN:
+        return "sitting_subtype_unknown";
+    case FSVRAvatarPostureState::INVALID:
+        return "invalid";
+    case FSVRAvatarPostureState::UNKNOWN:
+    default:
+        return "unknown";
+    }
+}
+
+const char* fsvrGroundMotionName(FSVRGroundMotion motion)
+{
+    switch (motion)
+    {
+    case FSVRGroundMotion::INACTIVE: return "inactive";
+    case FSVRGroundMotion::ACTIVE:   return "active";
+    case FSVRGroundMotion::UNKNOWN:
+    default:                          return "unknown";
+    }
+}
+
+bool fsvrAvatarStateIsSitting(FSVRAvatarPostureState state)
+{
+    // Brief section 2.3: sitting is sitting -- the resolved
+    // subtypes and the subtype-unknown state all run the
+    // sitting behaviour; only the label differs.
+    return state == FSVRAvatarPostureState::SITTING_OBJECT ||
+           state == FSVRAvatarPostureState::SITTING_GROUND ||
+           state == FSVRAvatarPostureState::SITTING_SUBTYPE_UNKNOWN;
+}
+
+FSVRPostureBehaviour fsvrSelectPostureBehaviour(
+    FSVRAvatarPostureState state)
+{
+    // R5 brief section 2.3's behaviour table, and section
+    // 2.4's fail-closed row: UNKNOWN and INVALID run
+    // neither posture behaviour. Sitting is sitting: every
+    // sitting state, subtype unknown included, selects the
+    // sitting behaviour.
+    if (state == FSVRAvatarPostureState::STANDING)
+    {
+        return FSVRPostureBehaviour::STANDING;
+    }
+    if (fsvrAvatarStateIsSitting(state))
+    {
+        return FSVRPostureBehaviour::SITTING;
+    }
+    return FSVRPostureBehaviour::NONE;
+}
+
+FSVRPostureBehaviour fsvrCycleBehaviour(
+    const FSVRSessionNeutralView& session,
+    const FSVRFix3CycleInputs& inputs)
+{
+    // The one behaviour derivation (see the declaration):
+    // the R5 sampled state when the cycle carries one, the
+    // R3 stamp-and-swap derivation otherwise. On the R5
+    // path FSVRPostureSwap is recorded-but-inert (plan P4):
+    // inputs.posture_swap is not consulted here.
+    if (inputs.avatar_state_present)
+    {
+        return fsvrSelectPostureBehaviour(inputs.avatar_state);
+    }
+    return fsvrEffectivePostureBehaviour(
+        session.posture, inputs.posture_swap);
+}
+
+FSVRIndicatorLines fsvrFormatIndicatorLines(
+    const FSVRIndicatorFacts& facts)
+{
+    // Brief section 8.2's exact presentations. The em
+    // dashes are part of the specified strings.
+    FSVRIndicatorLines lines;
+    switch (facts.avatar_state)
+    {
+    case FSVRAvatarPostureState::STANDING:
+        lines.avatar_line = "AVATAR: STANDING";
+        break;
+    case FSVRAvatarPostureState::SITTING_OBJECT:
+        lines.avatar_line = "AVATAR: SITTING \xe2\x80\x94 OBJECT";
+        break;
+    case FSVRAvatarPostureState::SITTING_GROUND:
+        lines.avatar_line = "AVATAR: SITTING \xe2\x80\x94 GROUND";
+        break;
+    case FSVRAvatarPostureState::SITTING_SUBTYPE_UNKNOWN:
+        lines.avatar_line = "AVATAR: SITTING \xe2\x80\x94 SUBTYPE UNKNOWN";
+        break;
+    case FSVRAvatarPostureState::INVALID:
+        lines.avatar_line = "AVATAR: INVALID";
+        break;
+    case FSVRAvatarPostureState::UNKNOWN:
+    default:
+        lines.avatar_line = "AVATAR: UNKNOWN";
+        break;
+    }
+    switch (facts.behaviour)
+    {
+    case FSVRPostureBehaviour::STANDING:
+        lines.behaviour_line = "BEHAVIOUR: ROOT FOLLOW";
+        break;
+    case FSVRPostureBehaviour::SITTING:
+        lines.behaviour_line = "BEHAVIOUR: SPINE LEAN";
+        break;
+    case FSVRPostureBehaviour::NONE:
+    default:
+        lines.behaviour_line =
+            "BEHAVIOUR: DISABLED \xe2\x80\x94 UNKNOWN STATE";
+        break;
+    }
+    if (facts.root_follow_suspended)
+    {
+        lines.root_line = "ROOT: SUSPENDED \xe2\x80\x94 SYNC REQUIRED";
+    }
+    else if (facts.behaviour != FSVRPostureBehaviour::STANDING ||
+             !facts.session_established)
+    {
+        lines.root_line = "ROOT: NOT ELIGIBLE";
+    }
+    else if (!facts.detector_proven || !facts.head_position_on)
+    {
+        lines.root_line = "ROOT: SUPPRESSED";
+    }
+    else if (!facts.root_follow_bound_valid)
+    {
+        lines.root_line = "ROOT: BOUNDARY";
+    }
+    else if (facts.root_writes_eligible)
+    {
+        lines.root_line = "ROOT: ACTIVE";
+    }
+    else
+    {
+        lines.root_line = "ROOT: NOT ELIGIBLE";
+    }
+    return lines;
+}
+
+const char* fsvrScaleContractName(FSVRScaleContract contract)
+{
+    switch (contract)
+    {
+    case FSVRScaleContract::PROPORTIONAL: return "proportional";
+    case FSVRScaleContract::OFF:          return "off";
+    case FSVRScaleContract::PROVISIONAL:
+    default:                              return "provisional";
+    }
+}
+
+LLVector3 fsvrMapAnchorDisplacement(
+    const FSVRSessionNeutralView& session,
+    const LLVector3& hmd_position_local,
+    F32 session_base_yaw_rad,
+    const LLQuaternion& root_world_rotation)
+{
+    // The shipped composition's Steps 1-2, verbatim:
+    // Step 1: the displacement from the session anchor,
+    // both in the current LOCAL space (the anchor makes
+    // no floor claim). hmd_position_local is the cycle's
+    // ONE manager read -- the same sample E7 judged
+    // (DP-C6E-3).
+    const LLVector3 d_local =
+        hmd_position_local - session.anchor_hmd_local;
+    // Step 2: the rotation path's placement pipeline in
+    // its vector form (brief section 2.13): P re-expresses
+    // the raw (right, up, back) components as (forward,
+    // left, up) components -- the correspondence stage 2's
+    // scalar reading implies -- q_yaw is the session's
+    // yaw-only frame alignment (theta_B, ICR-1), and the
+    // plan's root frame is the avatar-side carrier,
+    // substituted for the camera's chest basis by the
+    // spec's own ruling (PB-R1-03 bars the arbitrated pose
+    // here).
+    const LLVector3 p_mapped(-d_local.mV[VZ], -d_local.mV[VX],
+                             d_local.mV[VY]);
+    const LLQuaternion q_yaw(session_base_yaw_rad, LLVector3::z_axis);
+    return (p_mapped * q_yaw) * root_world_rotation;
+}
+
+FSVRManualRatioState fsvrManualRatioState(bool is_set,
+                                          bool is_invalid)
+{
+    // [FIX3-CODE-R1-01] The snapshot's per-channel
+    // derivation in seam form: unset is ABSENT (the
+    // derived ratio or provisional baseline rules);
+    // present and valid is VALID (the stated ratio
+    // rules); present but invalid is INVALID (the
+    // channel fails closed at the factor). The
+    // derivation itself -- what counts as set, and
+    // which present values are valid -- is
+    // captureForFrame's, beside the raw reads.
+    if (!is_set)
+    {
+        return FSVRManualRatioState::ABSENT;
+    }
+    return is_invalid ? FSVRManualRatioState::INVALID
+                      : FSVRManualRatioState::VALID;
+}
+
+FSVRChannelFactor fsvrLeanChannelFactor(
+    const FSVRSessionNeutralView& session, F32 lean_gain,
+    bool diag_force_unit_scale,
+    const FSVRFix3CycleInputs& inputs)
+{
+    FSVRChannelFactor out;
+    // Brief section 2.4's manual-ratio interaction rules,
+    // no exceptions: present and valid wins; present but
+    // invalid fails the channel closed (never clamped,
+    // never quietly replaced by the derived value). A
+    // state of VALID carrying a non-positive or
+    // non-finite value is invalid on its face and takes
+    // the same path.
+    if (inputs.manual_lean == FSVRManualRatioState::INVALID)
+    {
+        out.invalid = true;
+        return out;
+    }
+    // [FIX3-CODE-R1-02] The gain's validity is part of
+    // the factor decision, exactly as the root channel's
+    // already is: an invalid gain fails the channel
+    // closed ahead of every ratio source. The snapshot
+    // pins an invalid gain's carried value to 1.0, and
+    // that pinned substitute must never be consumed
+    // here as a valid gain -- substituting 1.0 and
+    // continuing is the silent fallback section 2.4
+    // bars. (The glue's E5 conjunction also fails the
+    // cycle on an invalid gain, CP-S1-4; the channel's
+    // own decision now fails closed on its own terms
+    // and names itself on the composition result.)
+    if (!inputs.lean_gain_valid)
+    {
+        out.invalid = true;
+        return out;
+    }
+    F32 ratio;
+    if (inputs.manual_lean == FSVRManualRatioState::VALID)
+    {
+        if (!std::isfinite(inputs.manual_lean_ratio) ||
+            inputs.manual_lean_ratio <= 0.f)
+        {
+            out.invalid = true;
+            return out;
+        }
+        // The user's stated ratio IS the ratio (proportional
+        // by declaration); the diagnostic, which forces the
+        // *calibration* ratio, does not touch it, exactly
+        // as it does not touch the gain.
+        ratio = inputs.manual_lean_ratio;
+    }
+    else if (diag_force_unit_scale)
+    {
+        // FSVRDiagForceUnitScale keeps its shipped meaning
+        // (CP-S1-3): it forces the calibration ratio to
+        // 1.0; the gain is a user preference and survives
+        // the diagnostic.
+        ratio = 1.f;
+    }
+    else if (session.scale_source == FSVRScaleSource::MEASURED_RECORD)
+    {
+        // The matched pair's own ratio, in the F32 form
+        // the shipped seam consumed it in.
+        ratio = static_cast<F32>(session.record.head_ratio);
+    }
+    else
+    {
+        // The provisional baseline (a sync-established
+        // neutral, whose record's head_ratio is never
+        // read; for NONE the block is unreachable in
+        // production, E5 having failed the cycle, and the
+        // baseline is the safe value regardless).
+        ratio = static_cast<F32>(
+            FSVRCalibration::PROVISIONAL_LEAN_BASELINE);
+    }
+    // The contract's one composition: ratio x gain in
+    // F32 (brief section 2.4's identity construction).
+    out.factor = ratio * lean_gain;
+    out.applied = true;
+    return out;
+}
+
+FSVRChannelFactor fsvrRootChannelFactor(
+    const FSVRFix3CycleInputs& inputs)
+{
+    FSVRChannelFactor out;
+    // The same interaction rules as the lean channel
+    // (fsvrLeanChannelFactor), over the root channel's
+    // own parameters: the gain's validity is the
+    // snapshot's shipped gain contract (rejected, never
+    // clamped); an invalid value of either parameter
+    // fails the channel closed.
+    if (inputs.manual_root == FSVRManualRatioState::INVALID)
+    {
+        out.invalid = true;
+        return out;
+    }
+    if (!inputs.root_gain_valid)
+    {
+        out.invalid = true;
+        return out;
+    }
+    // No proportional contract is specified for this
+    // channel in this brief (OQ-7): the ratio is the
+    // provisional baseline, or a valid manual ratio
+    // (proportional by declaration).
+    F32 ratio = 1.f;
+    if (inputs.manual_root == FSVRManualRatioState::VALID)
+    {
+        if (!std::isfinite(inputs.manual_root_ratio) ||
+            inputs.manual_root_ratio <= 0.f)
+        {
+            out.invalid = true;
+            return out;
+        }
+        ratio = inputs.manual_root_ratio;
+    }
+    out.factor = ratio * inputs.root_gain;
+    out.applied = true;
+    return out;
+}
+
+FSVRStandingRootStep fsvrComputeStandingRootStep(
+    const FSVRSessionNeutralView& session,
+    const LLVector3& hmd_position_local,
+    F32 session_base_yaw_rad,
+    const LLQuaternion& root_world_rotation,
+    const FSVRFix3CycleInputs& inputs)
+{
+    FSVRStandingRootStep step;
+    step.behaviour = fsvrCycleBehaviour(session, inputs);
+    if (step.behaviour != FSVRPostureBehaviour::STANDING ||
+        !inputs.head_position_enabled)
+    {
+        // Not the standing behaviour, or Head position is
+        // OFF (brief section 0.4: no positional behaviour
+        // of any kind, root channel included): the channel
+        // produces exactly zero.
+        return step;
+    }
+    const FSVRChannelFactor factor = fsvrRootChannelFactor(inputs);
+    if (!factor.applied)
+    {
+        // The channel fails closed: this cycle's
+        // displacement is consumed NOWHERE -- in
+        // particular it is never handed to the solver as
+        // a remainder (brief section 2.2 item 1's stated
+        // invariant).
+        step.root_scale_invalid = factor.invalid;
+        return step;
+    }
+    LLVector3 d_world = fsvrMapAnchorDisplacement(
+        session, hmd_position_local, session_base_yaw_rad,
+        root_world_rotation);
+    // [FIX3-CODE-R3] OQ-2 as ruled by Leah (2026-11-07:
+    // STOP AT THE BOUND): when the boundary policy is in
+    // force, the consumed displacement is radially
+    // clamped to the bound BEFORE per-channel scaling.
+    // The mapping above is a pure rotation chain, so the
+    // mapped vector's length IS the physical displacement
+    // from the sync anchor, and scaling it radially here
+    // clamps the physical displacement, direction
+    // preserved. Displacement beyond the bound is
+    // unconsumed: the offset stays where the bound put
+    // it, and because the state model remains OQ-1's
+    // form (b) -- the offset is a pure function of the
+    // current displacement -- walking back inside the
+    // bound brings the avatar back with the user, no
+    // re-sync, no accumulated remainder. When the policy
+    // is not in force (bound invalid) no clamp is
+    // applied either: the offset is still computed, for
+    // the record and the fixtures, from the displacement
+    // entire -- but nothing writes it and nothing
+    // suppresses the lean for it (live, below, is
+    // false), so the unclamped value reaches no consumer
+    // but the record.
+    if (inputs.root_follow_bound_valid)
+    {
+        const F32 len = d_world.length();
+        if (len > inputs.root_follow_bound_m)
+        {
+            d_world *= inputs.root_follow_bound_m / len;
+            step.bound_clamped = true;
+        }
+    }
+    // ScaleRoot: one F32 multiplication of the (possibly
+    // clamped) mapped displacement state (brief section
+    // 2.4's construction). Under OQ-1's ruled form (b)
+    // the state is the current cycle's displacement
+    // itself: the offset is anchored, never accumulated,
+    // and walking back is the return.
+    const LLVector3 offset = d_world * factor.factor;
+    if (!std::isfinite(offset.mV[VX]) ||
+        !std::isfinite(offset.mV[VY]) ||
+        !std::isfinite(offset.mV[VZ]))
+    {
+        // The provisional path's finite guard (S1-BRIEF-
+        // R1-02), extended to the root channel by brief
+        // section 2.4: a non-finite scaled displacement
+        // never reaches the root. The channel fails
+        // closed with its event, as for an invalid
+        // parameter.
+        step.root_scale_invalid = true;
+        return step;
+    }
+    step.root_offset = offset;
+    step.offset_valid = true;
+    // The write authorization, as one fact: a valid
+    // offset under a boundary policy in force. The glue
+    // writes only a live step; while the policy is not
+    // in force the step is computed and recorded but the
+    // agent does not move and the composition does not
+    // suppress [FIX3-CODE-R2-01]. On the R5 path the
+    // teleport detector must also be proven
+    // [FIX3-R5-CODE-02]; the legacy path never consults
+    // the detector fact and keeps the R3 contract.
+    step.live = inputs.root_follow_bound_valid &&
+                !inputs.root_follow_suspended &&
+                (!inputs.avatar_state_present ||
+                 inputs.detector_proven);
+    return step;
+}
+
+bool composeHeadTargetBlock(
+    const FSVRSessionNeutralView& session,
+    const LLVector3& hmd_position_local, F32 session_base_yaw_rad,
+    const LLQuaternion& root_world_rotation,
+    const LLVector3& root_world_position, bool diag_force_unit_scale,
+    F32 lean_gain,
+    LLVector3& out_head_target_world,
+    LLVector3& out_cornea_offset_head_local,
+    const FSVRFix3CycleInputs* fix3_inputs,
+    FSVRFix3CompositionResult* fix3_result)
+{
+    // P2-07B C6-E (CP-4; Package B spec section 7.3). Pure
+    // over its named inputs; the glue calls it only when the
+    // CP-2 conjunction holds for the cycle, and the
+    // established check below is the composition's own
+    // presence condition (a session without a neutral has
+    // nothing to compose from).
+    const FSVRFix3CycleInputs inputs =
+        fix3_inputs ? *fix3_inputs : FSVRFix3CycleInputs();
+    FSVRFix3CompositionResult fix3;
+    fix3.behaviour = fsvrCycleBehaviour(session, inputs);
+    if (!session.established)
+    {
+        if (fix3_result)
+        {
+            *fix3_result = fix3;
+        }
+        return false;
+    }
+    // Steps 1-2: the mapped displacement, through the one
+    // shared mapping (fsvrMapAnchorDisplacement).
+    const LLVector3 d_world = fsvrMapAnchorDisplacement(
+        session, hmd_position_local, session_base_yaw_rad,
+        root_world_rotation);
+    // P2-07B Fix 3 (brief section 2.2 item 1): the
+    // standing root step for this cycle -- the identical
+    // pure decision the glue executed before composition
+    // (the two agree by construction, sharing the code).
+    const FSVRStandingRootStep root_step =
+        fsvrComputeStandingRootStep(
+            session, hmd_position_local, session_base_yaw_rad,
+            root_world_rotation, inputs);
+    fix3.root_offset_valid = root_step.offset_valid;
+    fix3.root_offset = root_step.root_offset;
+    fix3.root_scale_invalid = root_step.root_scale_invalid;
+    // Both channels' parameter validity is a fact of the
+    // cycle independent of the behaviour in force: an
+    // invalid scale parameter is owed its event even in a
+    // cycle whose posture leaves its channel dormant
+    // (brief section 2.4 -- the channel is off, and says
+    // so). The factor decisions are evaluated once here
+    // and consumed below; the root step above ran the
+    // same pure root decision for its offset.
+    const FSVRChannelFactor lean_factor = fsvrLeanChannelFactor(
+        session, lean_gain, diag_force_unit_scale, inputs);
+    fix3.lean_scale_invalid = lean_factor.invalid;
+    if (!fix3.root_scale_invalid)
+    {
+        fix3.root_scale_invalid =
+            fsvrRootChannelFactor(inputs).invalid;
+    }
+    if (inputs.avatar_state_present &&
+        (inputs.avatar_state == FSVRAvatarPostureState::UNKNOWN ||
+         inputs.avatar_state == FSVRAvatarPostureState::INVALID))
+    {
+        // P2-07B Fix 3 R5 (brief section 2.4): a genuinely
+        // unknown or invalid avatar state runs neither
+        // posture behaviour -- in particular the shipped
+        // lean does NOT fall through for it (the R3
+        // undetermined profile is superseded on the R5
+        // path, and only there: cycles without a sampled
+        // state keep the R3 contract verbatim). No head
+        // target is published this cycle; the determinations
+        // recorded above (behaviour NONE; both channels'
+        // invalidity facts) stand for the record, and the
+        // state itself is announced by the glue's diagnostic
+        // (plan P5).
+        if (fix3_result)
+        {
+            *fix3_result = fix3;
+        }
+        return false;
+    }
+    // Step 3: the neutral cornea, fixed root-relative at
+    // establishment (PB-R1-03), re-expressed in the CURRENT
+    // root frame -- the composition's only per-cycle
+    // pose-dependent input. The cycle's arbitrated pose is
+    // never read here. Under the standing behaviour with
+    // OQ-2's policy in force this frame is the MOVED root
+    // frame (the glue applied the offset before base
+    // composition, brief section 2.2 item 4), so the
+    // target rides the root by construction (OQ-4's
+    // condition A).
+    const LLVector3 neutral_cornea_world =
+        session.neutral_cornea_root * root_world_rotation +
+        root_world_position;
+    if (fix3.behaviour == FSVRPostureBehaviour::STANDING &&
+        inputs.root_follow_bound_valid &&
+        !inputs.root_follow_suspended &&
+        (!inputs.avatar_state_present || inputs.detector_proven))
+    {
+        // The root channel consumes the scaled, clamped
+        // displacement entire: the solver's translational
+        // input is ZERO -- a stated invariant of the
+        // standing contract (brief section 2.2 item 1),
+        // specified here, not computed as a residual
+        // (ScaleRoot(d) - root_offset would hand the
+        // solver the un-scaled remainder at any
+        // non-identity factor, and a failed-closed root
+        // channel would leak its displacement into the
+        // spine). Rotation is untouched: the head target
+        // is the neutral cornea in the current (moved)
+        // root frame, and the orientation path is not
+        // this function's. The composed target is finite
+        // whenever its inputs are (a sum of finite
+        // values can still overflow: the shipped
+        // S1-BRIEF-R1-02 guard applies unchanged -- no
+        // target is published from a nonfinite
+        // composition).
+        // [FIX3-CODE-R2-01] This branch is entered ONLY
+        // with the boundary policy in force. Standing
+        // without it -- the bound absent or invalid --
+        // falls through to the shipped lean composition
+        // below: OQ-2's gate withholds the root WRITE,
+        // it does not authorize suppressing the existing
+        // positional response while the avatar cannot
+        // move.
+        out_head_target_world = neutral_cornea_world;
+        if (!std::isfinite(out_head_target_world.mV[VX]) ||
+            !std::isfinite(out_head_target_world.mV[VY]) ||
+            !std::isfinite(out_head_target_world.mV[VZ]))
+        {
+            out_head_target_world = LLVector3::zero;
+            if (fix3_result)
+            {
+                *fix3_result = fix3;
+            }
+            return false;
+        }
+        // Step 5: the section 4.6 cornea offset, verbatim.
+        out_cornea_offset_head_local =
+            session.cornea_offset_head_local;
+        if (fix3_result)
+        {
+            *fix3_result = fix3;
+        }
+        return true;
+    }
+    // Sitting behaviour, the undetermined state's
+    // shipped profile (brief sections 2.3/2.5), and --
+    // since [FIX3-CODE-R2-01] -- the standing behaviour
+    // while OQ-2's boundary policy is not in force, and
+    // (R5) while root-follow is suspended by the teleport
+    // watch: the
+    // lean channel composes the target, under the
+    // scaling contract of brief section 2.4. For the
+    // gated standing user this IS the shipped behaviour:
+    // physical translation feeds the solver exactly as
+    // it did before Fix 3, because the avatar cannot
+    // consume it instead.
+    // P2-07B Stage 1 (CP-S1-3), as extended by Fix 3: the
+    // channel factor (ratio x gain, fsvrLeanChannelFactor)
+    // scales the target displacement BEFORE the solver
+    // sees it -- applied to d_world as ONE F32
+    // multiplication in the shipped lean_gain position, on
+    // every path. At factor exactly 1.0 the multiplicand
+    // is exactly 1.0f and the shipped arithmetic is
+    // reproduced bit for bit (F3-S2): for a provisional
+    // neutral the factor is the baseline x gain as
+    // shipped; for a measured one it is head_ratio x gain
+    // (the Stage 1 gain-blindness of the measured path is
+    // the asymmetry the brief's contract absorbs -- at
+    // the default gain 1.0 nothing changes, bit for bit).
+    if (!lean_factor.applied)
+    {
+        // The lean channel failed closed (an invalid
+        // manual ratio): no target is published, and the
+        // failure is named on the result for its event
+        // (fix3.lean_scale_invalid, set above).
+        if (fix3_result)
+        {
+            *fix3_result = fix3;
+        }
+        return false;
+    }
+    const LLVector3 scaled = d_world * lean_factor.factor;
+    // The post-multiplication finite guard
+    // (S1-BRIEF-R1-02), extended by Fix 3 to every channel
+    // factor application (brief section 2.4): a nonfinite
+    // scaled displacement never reaches the solver. (In
+    // Stage 1 the guard lived on the provisional path
+    // only, because that was the one path where a
+    // user-supplied multiplier met the displacement; the
+    // factor application now exists on both paths, so
+    // the guard covers both. For the measured path's
+    // validator-bounded inputs nothing changes.)
+    if (!std::isfinite(scaled.mV[VX]) ||
+        !std::isfinite(scaled.mV[VY]) ||
+        !std::isfinite(scaled.mV[VZ]))
+    {
+        if (fix3_result)
+        {
+            *fix3_result = fix3;
+        }
+        return false;
+    }
+    // Step 4: C6's shipped composition seam, with the
+    // ratio slot at 1.0 -- the channel factor above is
+    // the chain's one proportional application (brief
+    // section 2.4: there is no second proportional
+    // application downstream), and the seam's own
+    // arithmetic (neutral + displacement x ratio) is
+    // untouched.
+    out_head_target_world = FSVRSpineSolver::composeHeadTarget(
+        neutral_cornea_world, scaled, 1.0f, false);
+    if (!std::isfinite(out_head_target_world.mV[VX]) ||
+        !std::isfinite(out_head_target_world.mV[VY]) ||
+        !std::isfinite(out_head_target_world.mV[VZ]))
+    {
+        // S1-BRIEF-R1-02: no target is published from a
+        // nonfinite composition. (Stage 1 applied this
+        // guard on the provisional path; it now covers
+        // every factor application, as above.)
+        out_head_target_world = LLVector3::zero;
+        if (fix3_result)
+        {
+            *fix3_result = fix3;
+        }
+        return false;
+    }
+    // Step 5: the section 4.6 cornea offset, verbatim.
+    out_cornea_offset_head_local = session.cornea_offset_head_local;
+    if (fix3_result)
+    {
+        *fix3_result = fix3;
+    }
+    return true;
+}
+
+// static
+FSVRAdapterPlanResult FSVRAdapterApply::computePlan(
+    const FSVRAdapterPlanInput& input,
+    FSVRAdapterSpineSolver& spine_solver,
+    FSVRAdapterArmSolver& arm_solver)
+{
+    return computePlan(input, spine_solver, arm_solver, nullptr, nullptr);
+}
+
+// static
+FSVRAdapterPlanResult FSVRAdapterApply::computePlan(
+    const FSVRAdapterPlanInput& input,
+    FSVRAdapterSpineSolver& spine_solver,
+    FSVRAdapterArmSolver& arm_solver,
+    FSVRAdapterWriteThroughArmSolver* write_through_solver,
+    FSVRAdapterArmPostClamp* post_clamp)
+{
+    FSVRAdapterPlanResult result;
+    const S32 count = static_cast<S32>(input.joints.size());
+
+    // The base composition is computed in every outcome, so a
+    // gate-failed result still reports the arbitrated pose as the
+    // resolved pose (no-write = arbitrated pose, brief section
+    // 3.6).
+    std::vector<LLQuaternion> base_world_rotations;
+    std::vector<LLVector3> base_world_positions;
+    composeBaseWorlds(input, base_world_rotations, base_world_positions);
+    // P2-07B DIAG-1 (D-1, Route A): retain the base
+    // composition on the result, copied here -- before any
+    // committed-state modification -- so gate failures and
+    // whole-transaction refusal leave it unmodified. One
+    // composition, computed once; no second implementation
+    // exists to drift.
+    result.base_world_rotations = base_world_rotations;
+    result.base_world_positions = base_world_positions;
+    // P2-07B Fix 3 (brief section 4): the cycle's posture
+    // behaviour and computed root offset, retained
+    // verbatim beside the base composition -- copied here,
+    // before any gate, so gate failures and
+    // whole-transaction refusal leave them unmodified.
+    // They are the recorder's facts; nothing in the plan
+    // reads them.
+    result.posture_behaviour = input.posture_behaviour;
+    result.posture_behaviour_present =
+        input.posture_behaviour_present;
+    result.root_offset_present = input.root_offset_present;
+    result.root_offset = input.root_offset;
+    // P2-07B Fix 3 R5: the R5 recorder facts ride beside
+    // them, copied at the same point for the same reason.
+    result.avatar_state = input.avatar_state;
+    result.avatar_state_present = input.avatar_state_present;
+    result.root_follow_suspended = input.root_follow_suspended;
+    result.home_base_valid = input.home_base_valid;
+    result.home_base_generation = input.home_base_generation;
+    result.posture_swap_configured = input.posture_swap_configured;
+    result.posture_swap_inert = input.posture_swap_inert;
+    result.resolved_locals.resize(count);
+    for (S32 i = 0; i < count; ++i)
+    {
+        result.resolved_locals[i] = input.joints[i].base_local;
+    }
+    result.resolved_world_rotations = base_world_rotations;
+    result.resolved_world_positions = base_world_positions;
+
+    auto fail = [&result](FSVRAdapterGate gate) {
+        result.first_failing_gate = gate;
+        return result;
+    };
+
+    // Cycle gate: production gate inputs (brief section 4 [R1]
+    // cases). A paused controller's ordinary update never blends;
+    // a FORCE_UPDATE on a paused controller does reach the blend
+    // (section 2.3), and an Animation Preview cycle publishes live
+    // decisions -- the gates, not the hook placement, make both
+    // no-ops (OQ-5, discharged by test).
+    if (!input.blend_ran || input.cycle != FSVRAdapterCycleKind::NORMAL)
+    {
+        return fail(FSVRAdapterGate::CYCLE);
+    }
+    // Non-self context (the bridge exists only on LLVOAvatarSelf;
+    // this check is what the harness exercises).
+    if (!input.context_armed)
+    {
+        return fail(FSVRAdapterGate::CONTEXT);
+    }
+    // P2-07B C5 (CP-5): the calibration-hold branch (Package B
+    // spec section 3.1's authorization contract). Entered iff
+    // the plan input carries an active C5 calibration
+    // transaction; its authority derives from that transaction
+    // alone and is independent of gates 1-5 by design, so it
+    // sits after the cycle/context checks that precede gate 1
+    // and before every gate exit. In a hold cycle the solver
+    // phases do not run and no solver is invoked: the result
+    // is the held pose -- bind locals (identity, C0 section 1)
+    // for exactly the section 3.1 hold set, base locals
+    // carried over their held parents for every other joint --
+    // with exactly one write per hold-set joint present in
+    // the input, and no other writes (no targets, no pole
+    // state, no continuity bookkeeping).
+    if (input.calibration_hold_active)
+    {
+        const std::vector<std::string>& hold_names =
+            FSVRAdapterApply::calibrationHoldJointNames();
+        std::vector<char> is_hold(count, 0);
+        for (S32 i = 0; i < count; ++i)
+        {
+            for (const std::string& name : hold_names)
+            {
+                if (input.joints[i].name == name)
+                {
+                    is_hold[i] = 1;
+                    break;
+                }
+            }
+        }
+        result.applied = true;
+        for (S32 i = 0; i < count; ++i)
+        {
+            const FSVRAdapterJointInput& joint = input.joints[i];
+            LLQuaternion parent_rot = input.root_world_rotation;
+            LLVector3 parent_pos = input.root_world_position;
+            if (joint.parent_index >= 0)
+            {
+                parent_rot = result.resolved_world_rotations[joint.parent_index];
+                parent_pos = result.resolved_world_positions[joint.parent_index];
+            }
+            const LLQuaternion local =
+                is_hold[i] ? LLQuaternion() : joint.base_local;
+            LLQuaternion world = local * parent_rot;
+            world.normalize();
+            result.resolved_locals[i] = local;
+            result.resolved_world_rotations[i] = world;
+            result.resolved_world_positions[i] =
+                parent_pos + (joint.rest_offset * parent_rot);
+            if (is_hold[i])
+            {
+                result.writes.push_back({i, LLQuaternion()});
+            }
+        }
+        return result;
+    }
+    // Gate 1: frame identity. Consuming Stage-1 shadow decisions
+    // as if they were grants is the failure mode this gate exists
+    // to prevent. P2-07B C6-E (CP-5 part 3): the test is the
+    // scoped disjunction over the per-domain facts -- a domain's
+    // shadow state never blocks the other domain, and the legacy
+    // all-bones field no longer gates (recorded fact only).
+    if (!input.decisions_published || !input.decisions_current ||
+        !(input.spine_decisions_runtime_effective ||
+          input.arm_decisions_runtime_effective))
+    {
+        return fail(FSVRAdapterGate::FRAME_IDENTITY);
+    }
+    // Gate 2 [R1]: the headset/session gate, full stop.
+    if (!input.vr_active)
+    {
+        return fail(FSVRAdapterGate::VR_SESSION);
+    }
+    // Gate 3: positional master gate (spec section 3.4).
+    if (!input.positional_solve_enabled)
+    {
+        return fail(FSVRAdapterGate::POSITIONAL_MASTER);
+    }
+    // Gate 4 [R1]: per-solver enablement and per-solver positional
+    // sample validity, evaluated independently. P2-07B C6-E
+    // (CP-5 part 3): each domain's authority additionally
+    // requires that domain's scoped runtime-effective fact, so
+    // no authority forms on shadow decisions for its domain.
+    const bool spine_authority =
+        input.head_position_enabled && input.spine_sample_valid &&
+        input.spine_decisions_runtime_effective;
+    const bool arm_authority =
+        input.hand_position_enabled && input.arm_sample_valid &&
+        input.arm_decisions_runtime_effective;
+    if (!spine_authority && !arm_authority)
+    {
+        return fail(FSVRAdapterGate::NO_SOLVER);
+    }
+
+    result.applied = true;
+
+    FSVRAdapterSolverContext context;
+    context.plan = &input;
+    context.base_world_rotations = base_world_rotations;
+    context.base_world_positions = base_world_positions;
+    context.previous_targets = input.previous_targets;
+    // [R2 -- C6C7-03 transport] The caller-owned pole history
+    // rides beside previous_targets by the same mechanical copy.
+    context.previous_pole_valid[0] = input.previous_pole_valid[0];
+    context.previous_pole_valid[1] = input.previous_pole_valid[1];
+    context.previous_pole_world[0] = input.previous_pole_world[0];
+    context.previous_pole_world[1] = input.previous_pole_world[1];
+
+    // Committed state for the transaction: starts as the base
+    // pose and is updated joint by joint, parents first.
+    std::vector<LLQuaternion> committed_rotations = base_world_rotations;
+    std::vector<LLVector3> committed_positions = base_world_positions;
+    std::vector<LLQuaternion> committed_locals = result.resolved_locals;
+
+    auto parentFrame = [&](S32 index, LLQuaternion& out_rot, LLVector3& out_pos) {
+        const S32 parent = input.joints[index].parent_index;
+        if (parent >= 0)
+        {
+            out_rot = committed_rotations[parent];
+            out_pos = committed_positions[parent];
+        }
+        else
+        {
+            out_rot = input.root_world_rotation;
+            out_pos = input.root_world_position;
+        }
+    };
+
+    // One joint of a commit pass: honor the pass's target map for
+    // eligible joints of the pass's domains, otherwise carry the
+    // base local over the just-committed parents.
+    auto commitJoint = [&](S32 i,
+                           const std::map<S32, LLQuaternion>& targets,
+                           bool honor_targets) {
+        const FSVRAdapterJointInput& joint = input.joints[i];
+        LLQuaternion parent_rot;
+        LLVector3 parent_pos;
+        parentFrame(i, parent_rot, parent_pos);
+
+        bool wrote = false;
+        auto target_it = targets.find(i);
+        if (honor_targets && target_it != targets.end() &&
+            isJointEligible(input, joint, spine_authority, arm_authority))
+        {
+            LLQuaternion target = target_it->second;
+            target.normalize();
+            LLQuaternion parent_norm = parent_rot;
+            parent_norm.normalize();
+            // local = target_world * ~parent_world (C0 4.2.1).
+            LLQuaternion local = target * ~parent_norm;
+            committed_locals[i] = local;
+            committed_rotations[i] = target;
+            result.writes.push_back({i, local});
+            wrote = true;
+        }
+        if (!wrote)
+        {
+            LLQuaternion world = joint.base_local * parent_rot;
+            world.normalize();
+            committed_rotations[i] = world;
+            committed_locals[i] = joint.base_local;
+        }
+        // A joint's world position depends on its parent's world
+        // rotation, never on its own rotation.
+        committed_positions[i] = parent_pos + (joint.rest_offset * parent_rot);
+    };
+
+    // D6 order, step 1: run C6 against the base pose (brief
+    // section 3.4 step 2). C6 returns target worlds; it writes
+    // nothing.
+    std::map<S32, LLQuaternion> spine_targets;
+    if (spine_authority)
+    {
+        spine_solver.solveSpine(context, spine_targets);
+        result.spine_solver_invoked = true;
+        // P2-07B Fix 4 (CP-F4-3): retain the solver's
+        // returned target worlds verbatim on the result --
+        // here, immediately after the solve, before any
+        // clamping or commit-local conversion below.
+        // Instrumentation only; nothing reads the field
+        // back into the plan (F4-Z1).
+        result.solver_target_worlds = spine_targets;
+    }
+
+    // D6 order, step 2 (brief section 3.4 steps 3-4): commit the
+    // spine parent-first. Non-arm joints carry their base locals
+    // over the committed parents; arm joints are composed the same
+    // way for now, which is what resolves the shoulders from the
+    // solved spine.
+    for (S32 i = 0; i < count; ++i)
+    {
+        const FSVRAdapterDomain domain = input.joints[i].domain;
+        const bool is_arm = (domain == FSVRAdapterDomain::ARM_LEFT ||
+                             domain == FSVRAdapterDomain::ARM_RIGHT);
+        commitJoint(i, spine_targets, !is_arm &&
+                        domain == FSVRAdapterDomain::SPINE);
+    }
+
+    // The write-through arm phase for one side (boundary contract
+    // in the header): run the solver against a provisional host
+    // seeded from the transaction's committed state, then
+    // readback -> post-clamp -> commit, all inside the
+    // transaction. Returns true iff the write-through solver was
+    // actually invoked for the side -- a side that fails closed
+    // on the mandatory post-clamp (R2-01) or has no chain returns
+    // false, so the caller's invoked flags never claim a run
+    // that did not happen.
+    auto runWriteThroughSide = [&](FSVRAdapterSide side) {
+        const FSVRAdapterDomain side_domain =
+            (side == FSVRAdapterSide::LEFT) ? FSVRAdapterDomain::ARM_LEFT
+                                            : FSVRAdapterDomain::ARM_RIGHT;
+        FSVRAdapterArmOutcome& outcome =
+            (side == FSVRAdapterSide::LEFT) ? result.arm_outcome_left
+                                            : result.arm_outcome_right;
+
+        // The side's chain in list order (shoulder first, elbow
+        // last), and the wrist: the structural joint whose parent
+        // is the chain's last joint.
+        std::vector<S32> chain;
+        for (S32 i = 0; i < count; ++i)
+        {
+            if (input.joints[i].domain == side_domain)
+            {
+                chain.push_back(i);
+            }
+        }
+        if (chain.empty())
+        {
+            return false;
+        }
+        S32 wrist_index = -1;
+        for (S32 i = 0; i < count; ++i)
+        {
+            if (input.joints[i].parent_index == chain.back() &&
+                input.joints[i].domain != side_domain)
+            {
+                wrist_index = i;
+                break;
+            }
+        }
+
+        outcome.write_through_ran = true;
+        if (!post_clamp)
+        {
+            // R2-01 fail-closed: the post-clamp is mandatory for
+            // a write-through transaction (contract point (d)).
+            // Without it the side's write-through result is
+            // aborted before the solver runs -- nothing provisional
+            // exists, nothing reaches the commit, and the side
+            // keeps the pose step 2 already resolved for it. The
+            // outcome names the missing clamp; that outcome, on
+            // the plan result, is the diagnostic.
+            outcome.write_through_aborted = true;
+            outcome.abort_reason =
+                FSVRAdapterArmAbortReason::MISSING_POST_CLAMP;
+            return false;
+        }
+        PlanWriteThroughHost host(input, side_domain, committed_locals);
+        const FSVRAdapterWriteThroughOutcome wt =
+            write_through_solver->solveArmWriteThrough(context, side, host);
+        if (!wt.completed)
+        {
+            // Contract point (c): the provisional state is
+            // discarded entire. The side keeps the composition
+            // step 2 already resolved for it; nothing provisional
+            // reaches the commit or the resolved pose.
+            outcome.write_through_aborted = true;
+            outcome.abort_reason =
+                FSVRAdapterArmAbortReason::SOLVER_INCOMPLETE;
+            return true;
+        }
+
+        // Readback (contract point (d)): the provisional locals
+        // for the chain, and the worlds composed from them over
+        // the committed parents.
+        std::map<S32, LLQuaternion> readback_locals;
+        std::map<S32, LLQuaternion> readback_rotations;
+        std::map<S32, LLVector3> readback_positions;
+        {
+            std::vector<LLQuaternion> rb_rot = committed_rotations;
+            std::vector<LLVector3> rb_pos = committed_positions;
+            auto readbackCompose = [&](S32 i) {
+                const FSVRAdapterJointInput& joint = input.joints[i];
+                LLQuaternion parent_rot = input.root_world_rotation;
+                LLVector3 parent_pos = input.root_world_position;
+                if (joint.parent_index >= 0)
+                {
+                    parent_rot = rb_rot[joint.parent_index];
+                    parent_pos = rb_pos[joint.parent_index];
+                }
+                LLQuaternion local = joint.base_local;
+                auto it = readback_locals.find(i);
+                if (it != readback_locals.end())
+                {
+                    local = it->second;
+                }
+                LLQuaternion world = local * parent_rot;
+                world.normalize();
+                rb_rot[i] = world;
+                rb_pos[i] = parent_pos + (joint.rest_offset * parent_rot);
+                readback_rotations[i] = rb_rot[i];
+                readback_positions[i] = rb_pos[i];
+            };
+            for (S32 i : chain)
+            {
+                LLQuaternion local;
+                host.readProvisionalLocal(i, local);
+                readback_locals[i] = local;
+            }
+            for (S32 i : chain)
+            {
+                readbackCompose(i);
+            }
+            if (wrist_index >= 0)
+            {
+                readbackCompose(wrist_index);
+            }
+        }
+
+        // The post-RP3 clamp (C0 sections 5.2/5.3), invoked by the
+        // transaction on the readback, before commit -- the
+        // ordering is the transaction's guarantee (brief section
+        // 3.4). The clamp is guaranteed present here: a missing
+        // clamp failed the side closed above (R2-01).
+        post_clamp->clampArm(context, side, readback_rotations,
+                              readback_positions, readback_locals);
+
+        // Gate-5 rejection set for this pass, with the R2-02
+        // cascade: a joint the solver provisionally wrote is
+        // rejected when gate 5 does not admit it, and every
+        // provisionally written descendant of a rejected joint is
+        // rejected with it -- its readback local was computed
+        // against the provisional parent the commit did not take,
+        // so committing it would produce a world the solver never
+        // produced and the clamp never evaluated. The chain is in
+        // list order (parents before children), so a single pass
+        // propagates the cascade transitively. (The plain
+        // target-world path needs no cascade: commitJoint composes
+        // each local from the target against the parent's ACTUAL
+        // committed world, so a rejected parent cannot corrupt a
+        // descendant there.)
+        std::set<S32> rejected;
+        for (S32 i : chain)
+        {
+            if (!host.wasWritten(i))
+            {
+                continue;
+            }
+            bool reject =
+                !isJointEligible(input, input.joints[i],
+                                 spine_authority, arm_authority);
+            for (S32 p = input.joints[i].parent_index; !reject && p >= 0;
+                 p = input.joints[p].parent_index)
+            {
+                reject = rejected.find(p) != rejected.end();
+            }
+            if (reject)
+            {
+                rejected.insert(i);
+            }
+        }
+
+        // Commit the chain parent-first: joints the solver wrote
+        // and the rejection set admits take the (possibly clamped)
+        // readback local; everything else carries its base local
+        // over the just-committed parents, exactly as the target
+        // path does.
+        const size_t writes_before_side = result.writes.size();
+        for (S32 i : chain)
+        {
+            const FSVRAdapterJointInput& joint = input.joints[i];
+            LLQuaternion parent_rot;
+            LLVector3 parent_pos;
+            parentFrame(i, parent_rot, parent_pos);
+            if (host.wasWritten(i) && rejected.find(i) == rejected.end())
+            {
+                LLQuaternion local = readback_locals[i];
+                local.normalize();
+                committed_locals[i] = local;
+                LLQuaternion world = local * parent_rot;
+                world.normalize();
+                committed_rotations[i] = world;
+                result.writes.push_back({i, local});
+            }
+            else
+            {
+                LLQuaternion world = joint.base_local * parent_rot;
+                world.normalize();
+                committed_rotations[i] = world;
+                committed_locals[i] = joint.base_local;
+            }
+            committed_positions[i] =
+                parent_pos + (joint.rest_offset * parent_rot);
+        }
+
+        // The wrist rides on the committed elbow: recompose it so
+        // the resolved pose -- and the wrist error below -- reflect
+        // the final clamped rotations, not the pre-solve ones.
+        if (wrist_index >= 0)
+        {
+            const FSVRAdapterJointInput& wrist = input.joints[wrist_index];
+            LLQuaternion parent_rot;
+            LLVector3 parent_pos;
+            parentFrame(wrist_index, parent_rot, parent_pos);
+            LLQuaternion world = wrist.base_local * parent_rot;
+            world.normalize();
+            committed_rotations[wrist_index] = world;
+            committed_positions[wrist_index] =
+                parent_pos + (wrist.rest_offset * parent_rot);
+            if (wt.has_wrist_target)
+            {
+                outcome.wrist_error =
+                    (committed_positions[wrist_index] - wt.wrist_target_world)
+                        .length();
+                outcome.wrist_error_valid = true;
+            }
+        }
+
+        // [R2 -- C6C7-03 transport] Forward the solver's pole to
+        // the side's arm outcome only now: the side ran, was not
+        // aborted, its post-clamp ran, and its commit processing
+        // is complete, with at least one of its writes committed.
+        // Assigning this beside the solver's return (before the
+        // post-clamp and eligibility/commit processing) would
+        // expose a provisional pole for a side the transaction
+        // may still discard; the aborted paths above return
+        // before this point and forward nothing.
+        if (wt.has_pole && result.writes.size() > writes_before_side)
+        {
+            outcome.pole_valid = true;
+            outcome.pole_world = wt.pole_world;
+        }
+        return true;
+    };
+
+    // D6 order, step 3 (brief section 3.4 step 5): run C7 per side
+    // on the solved shoulders, then commit the arms parent-first.
+    // Hand targets never re-open the spine: the spine pass is
+    // already complete.
+    if (arm_authority)
+    {
+        const FSVRAdapterSide sides[2] = {FSVRAdapterSide::LEFT,
+                                          FSVRAdapterSide::RIGHT};
+        for (FSVRAdapterSide side : sides)
+        {
+            // The shoulder is the first joint of the side's arm
+            // domain in list order (its parent is the collar).
+            S32 shoulder_index = -1;
+            for (S32 i = 0; i < count; ++i)
+            {
+                const FSVRAdapterDomain domain = input.joints[i].domain;
+                if ((side == FSVRAdapterSide::LEFT &&
+                     domain == FSVRAdapterDomain::ARM_LEFT) ||
+                    (side == FSVRAdapterSide::RIGHT &&
+                     domain == FSVRAdapterDomain::ARM_RIGHT))
+                {
+                    shoulder_index = i;
+                    break;
+                }
+            }
+            if (shoulder_index < 0)
+            {
+                continue;
+            }
+
+            if (write_through_solver)
+            {
+                // The C7/RP3 boundary takes this side's arm phase;
+                // the plain target-world solver is not invoked.
+                // The invoked flag is set only when the solver
+                // actually ran for this side: a fail-closed abort
+                // (R2-01) returns before invocation and must not
+                // report itself invoked.
+                if (runWriteThroughSide(side))
+                {
+                    if (side == FSVRAdapterSide::LEFT)
+                    {
+                        result.arm_solver_invoked_left = true;
+                    }
+                    else
+                    {
+                        result.arm_solver_invoked_right = true;
+                    }
+                }
+                continue;
+            }
+
+            std::map<S32, LLQuaternion> arm_targets;
+            arm_solver.solveArm(context, side,
+                                committed_rotations[shoulder_index],
+                                committed_positions[shoulder_index],
+                                arm_targets);
+            if (side == FSVRAdapterSide::LEFT)
+            {
+                result.arm_solver_invoked_left = true;
+            }
+            else
+            {
+                result.arm_solver_invoked_right = true;
+            }
+
+            for (S32 i = 0; i < count; ++i)
+            {
+                const FSVRAdapterDomain domain = input.joints[i].domain;
+                const bool in_side =
+                    (side == FSVRAdapterSide::LEFT &&
+                     domain == FSVRAdapterDomain::ARM_LEFT) ||
+                    (side == FSVRAdapterSide::RIGHT &&
+                     domain == FSVRAdapterDomain::ARM_RIGHT);
+                if (in_side)
+                {
+                    commitJoint(i, arm_targets, true);
+                }
+            }
+        }
+    }
+
+    // P2-07B Fix 1 (CP-F1-1): head-group orientation
+    // reconciliation. Runs on every applied cycle, after the
+    // arm phase and immediately before finalization, so the
+    // committed write order is spine -> arms -> head-group.
+    // Head-group joints are neither ancestors nor descendants
+    // of any arm joint, so the placement cannot disturb arm
+    // results, and no later phase can invalidate the
+    // reconciliation. The positional solve may move the head
+    // group's worlds through its spine ancestors; it may not
+    // change the head group's orientations (INV-F1-01/02):
+    // the neck and head stage worlds are restored to their
+    // base-composed values by the commit pass's own
+    // target->local formula, under the limit cascade and the
+    // combined-bound selection below. When no spine commit
+    // moved an ancestor of the neck, the correction is the
+    // identity and the epsilon suppression emits nothing
+    // (S1-G5). When the transaction does not apply at all,
+    // computePlan has already returned -- whole-head
+    // switching is preserved structurally, not by a
+    // conditional (checklist 0.5).
+    {
+        S32 neck_index = -1;
+        S32 head_index = -1;
+        for (S32 i = 0; i < count; ++i)
+        {
+            if (input.joints[i].name == "mNeck")
+            {
+                neck_index = i;
+            }
+            else if (input.joints[i].name == "mHead")
+            {
+                head_index = i;
+            }
+        }
+        if (neck_index >= 0 && head_index >= 0)
+        {
+            const LLQuaternion& base_neck_world =
+                base_world_rotations[neck_index];
+            const LLQuaternion& base_head_world =
+                base_world_rotations[head_index];
+            LLQuaternion parent_neck_rot;
+            LLVector3 parent_neck_pos;
+            parentFrame(neck_index, parent_neck_rot,
+                        parent_neck_pos);
+            LLQuaternion parent_neck_norm = parent_neck_rot;
+            parent_neck_norm.normalize();
+
+            // Step 1 (neck stage): the corrected neck local
+            // by the commit pass's own formula (local =
+            // target * ~parent_world) with the target set to
+            // the neck's BASE world, capped at the head-group
+            // local cap (step 3). Recompose the neck world.
+            LLQuaternion cand_neck_local =
+                base_neck_world * ~parent_neck_norm;
+            cand_neck_local.normalize();
+            cand_neck_local.constrain(kHeadGroupLocalCapRad);
+            LLQuaternion cand_neck_world =
+                cand_neck_local * parent_neck_rot;
+            cand_neck_world.normalize();
+
+            // Step 2 (head stage): the corrected head local
+            // against the recomposed neck world, then the
+            // native operation itself -- constrain(
+            // HEAD_ROTATION_CONSTRAINT), the identical call
+            // and value the native path applies
+            // (llheadrotmotion.cpp:321; constant at :91 --
+            // the value is kHeadGroupLocalCapRad). Recompose
+            // the head world. In the uncapped case step 1
+            // restored the neck world to base exactly, so
+            // this returns the head local to its base value:
+            // the correction concentrates at the neck, and
+            // spill reaches the head local only when the
+            // neck cap refuses part of the correction.
+            LLQuaternion cand_head_local =
+                base_head_world * ~cand_neck_world;
+            cand_head_local.normalize();
+            cand_head_local.constrain(kHeadGroupLocalCapRad);
+            LLQuaternion cand_head_world =
+                cand_head_local * cand_neck_world;
+            cand_head_world.normalize();
+
+            // Step 5 [R3/R4]: combined-bound selection. The
+            // cascade bounds the two locals; it does not
+            // bound the quantity Rule 1 states -- the head's
+            // combined rotation relative to its basis. The
+            // basis is located by CP-F1-0 Q4's rule (mTorso,
+            // else mPelvis, else the plan root frame) and
+            // measured against the basis joint's BASE world
+            // -- the frame the native path composed this
+            // cycle's base pose against. The guarantee is
+            // the base-basis statement of INV-F1-03 [R4]
+            // (Q-H): fidelity to the native pre-solve
+            // constraint; no committed-torso bound is
+            // claimed.
+            S32 basis_index = -1;
+            for (S32 i = 0; i < count; ++i)
+            {
+                if (input.joints[i].name == "mTorso")
+                {
+                    basis_index = i;
+                    break;
+                }
+            }
+            if (basis_index < 0)
+            {
+                for (S32 i = 0; i < count; ++i)
+                {
+                    if (input.joints[i].name == "mPelvis")
+                    {
+                        basis_index = i;
+                        break;
+                    }
+                }
+            }
+            const LLQuaternion basis_base_world =
+                basis_index >= 0
+                    ? base_world_rotations[basis_index]
+                    : input.root_world_rotation;
+            LLQuaternion basis_norm = basis_base_world;
+            basis_norm.normalize();
+            const F32 theta_b = quaternionAngleRad(
+                base_head_world * ~basis_norm);
+            const F32 theta_c = quaternionAngleRad(
+                cand_head_world * ~basis_norm);
+
+            LLQuaternion final_neck_local = cand_neck_local;
+            LLQuaternion final_head_local = cand_head_local;
+            bool split_selected = false;
+            if (theta_c >
+                kHeadGroupLocalCapRad + kHeadGroupBoundTolRad)
+            {
+                // Bounded result: W*, the combined-legal
+                // target closest to base on the cascade's
+                // own residual arc, realized by the EVEN
+                // SPLIT -- the native distribution's own
+                // shape (NECK_LAG 0.5, llheadrotmotion.cpp:
+                // 358-359). Under the production convention
+                // (world = local * parent_world) the two
+                // halves must compose the total relative
+                // rotation T = W* * ~P [R4 -- FIX1-R3-01;
+                // the superseded order ~P * W* is a conjugate
+                // and does not recompose to W*].
+                LLQuaternion d =
+                    cand_head_world * ~base_head_world;
+                d.normalize();
+                const F32 rho_max = std::max(
+                    0.f, kHeadGroupLocalCapRad - theta_b);
+                LLQuaternion w_star =
+                    scaleQuaternionAngle(d, rho_max) *
+                    base_head_world;
+                w_star.normalize();
+                LLQuaternion t = w_star * ~parent_neck_norm;
+                t.normalize();
+                const F32 tau = quaternionAngleRad(t);
+                if (tau > 2.f * kHeadGroupLocalCapRad)
+                {
+                    // Refusal [R4 -- FIX1-R3-02]:
+                    // whole-transaction rejection. The
+                    // result returns to its entry state --
+                    // writes cleared entire (spine, arm and
+                    // head-group), the finalization copy
+                    // below does not run, so resolved_*
+                    // report the base composition -- and the
+                    // arm outcomes' committed claims are
+                    // retracted (a pole or wrist error
+                    // computed against a discarded commit
+                    // must not be adopted); the write-through
+                    // boundary's own abort records stand.
+                    // applied stays true and
+                    // first_failing_gate stays NONE: the
+                    // transaction ran. The refusal is named
+                    // by the result's head_group_refusal
+                    // field.
+                    result.writes.clear();
+                    result.arm_outcome_left.pole_valid = false;
+                    result.arm_outcome_left.wrist_error_valid =
+                        false;
+                    result.arm_outcome_right.pole_valid = false;
+                    result.arm_outcome_right.wrist_error_valid =
+                        false;
+                    result.head_group_refusal = true;
+                    return result;
+                }
+                const LLQuaternion half =
+                    scaleQuaternionAngle(t, tau * 0.5f);
+                final_neck_local = half;
+                final_head_local = half;
+                split_selected = true;
+            }
+
+            // Step 4 [R2 (ii)/R3]: epsilon/write evaluation
+            // of the FINAL pair (the cascade pair, or the
+            // selection's split pair), per stage, decided
+            // BEFORE any recomposition. A stage whose
+            // corrected local differs from its committed
+            // local by at least 1e-4 rad appends one write
+            // (neck before head) and updates the committed
+            // arrays; stage 2 forms its candidate against
+            // the post-decision neck world.
+            constexpr F32 kHeadGroupEpsilonRad = 1e-4f;
+            bool neck_emitted = false;
+            {
+                const F32 d_neck = quaternionAngleRad(
+                    final_neck_local *
+                    ~committed_locals[neck_index]);
+                if (d_neck >= kHeadGroupEpsilonRad)
+                {
+                    result.writes.push_back(
+                        {neck_index, final_neck_local});
+                    committed_locals[neck_index] =
+                        final_neck_local;
+                    neck_emitted = true;
+                }
+            }
+            if (!neck_emitted && !split_selected)
+            {
+                // Stage 1 was suppressed: the carried neck
+                // world stands, so the head candidate is
+                // re-formed against it [R2 (ii)] (the two
+                // neck worlds differ by less than the
+                // epsilon, so this is the same candidate at
+                // F32 class; the selection's split pair, by
+                // contrast, is the final pair as selected
+                // [R3] and is never re-formed).
+                LLQuaternion carried_neck_world =
+                    committed_rotations[neck_index];
+                carried_neck_world.normalize();
+                final_head_local =
+                    base_head_world * ~carried_neck_world;
+                final_head_local.normalize();
+                final_head_local.constrain(
+                    kHeadGroupLocalCapRad);
+            }
+            bool head_emitted = false;
+            {
+                const F32 d_head = quaternionAngleRad(
+                    final_head_local *
+                    ~committed_locals[head_index]);
+                if (d_head >= kHeadGroupEpsilonRad)
+                {
+                    result.writes.push_back(
+                        {head_index, final_head_local});
+                    committed_locals[head_index] =
+                        final_head_local;
+                    head_emitted = true;
+                }
+            }
+            if (neck_emitted || head_emitted)
+            {
+                // Recompose the emitted stages and every
+                // plan descendant of theirs, parent-first,
+                // by the commit pass's carry rule (a
+                // descendant's local is unchanged; its
+                // world follows its parent). The neck's own
+                // world position never changes -- its
+                // parent's world is untouched by this step;
+                // the head's world position changes only
+                // through the neck->head rest offset rotating
+                // with the corrected neck world.
+                std::vector<char> recompose(count, 0);
+                for (S32 i = 0; i < count; ++i)
+                {
+                    const bool self =
+                        (i == neck_index && neck_emitted) ||
+                        (i == head_index && head_emitted);
+                    const S32 parent =
+                        input.joints[i].parent_index;
+                    if (!self &&
+                        !(parent >= 0 && recompose[parent]))
+                    {
+                        continue;
+                    }
+                    recompose[i] = 1;
+                    LLQuaternion parent_rot =
+                        input.root_world_rotation;
+                    LLVector3 parent_pos =
+                        input.root_world_position;
+                    if (parent >= 0)
+                    {
+                        parent_rot = committed_rotations[parent];
+                        parent_pos = committed_positions[parent];
+                    }
+                    LLQuaternion world =
+                        committed_locals[i] * parent_rot;
+                    world.normalize();
+                    committed_rotations[i] = world;
+                    committed_positions[i] =
+                        parent_pos +
+                        (input.joints[i].rest_offset *
+                         parent_rot);
+                }
+            }
+        }
+    }
+
+    result.resolved_locals = committed_locals;
+    result.resolved_world_rotations = committed_rotations;
+    result.resolved_world_positions = committed_positions;
+    return result;
+}
+
+// static
+const char* FSVRAdapterApply::gateName(FSVRAdapterGate gate)
+{
+    switch (gate)
+    {
+    case FSVRAdapterGate::NONE:
+        return "none";
+    case FSVRAdapterGate::CYCLE:
+        return "cycle";
+    case FSVRAdapterGate::CONTEXT:
+        return "context";
+    case FSVRAdapterGate::FRAME_IDENTITY:
+        return "frame_identity";
+    case FSVRAdapterGate::VR_SESSION:
+        return "vr_session";
+    case FSVRAdapterGate::POSITIONAL_MASTER:
+        return "positional_master";
+    case FSVRAdapterGate::NO_SOLVER:
+        return "no_solver";
+    case FSVRAdapterGate::TOKEN:
+        return "token";
+    }
+    return "unknown";
+}
+
+// static
+const char* FSVRAdapterApply::armAbortReasonName(
+    FSVRAdapterArmAbortReason reason)
+{
+    switch (reason)
+    {
+    case FSVRAdapterArmAbortReason::NONE:
+        return "none";
+    case FSVRAdapterArmAbortReason::SOLVER_INCOMPLETE:
+        return "solver_incomplete";
+    case FSVRAdapterArmAbortReason::MISSING_POST_CLAMP:
+        return "missing_post_clamp";
+    }
+    return "unknown";
+}
+
+FSVRAdapterPlanResult FSVRAdapterApplyOnce::apply(
+    const FSVRAdapterPlanInput& input,
+    FSVRAdapterSpineSolver& spine_solver,
+    FSVRAdapterArmSolver& arm_solver)
+{
+    return apply(input, spine_solver, arm_solver, nullptr, nullptr);
+}
+
+FSVRAdapterPlanResult FSVRAdapterApplyOnce::apply(
+    const FSVRAdapterPlanInput& input,
+    FSVRAdapterSpineSolver& spine_solver,
+    FSVRAdapterArmSolver& arm_solver,
+    FSVRAdapterWriteThroughArmSolver* write_through_solver,
+    FSVRAdapterArmPostClamp* post_clamp)
+{
+    if (mHasToken && input.frame_token == mLastToken)
+    {
+        FSVRAdapterPlanResult result;
+        result.first_failing_gate = FSVRAdapterGate::TOKEN;
+        return result;
+    }
+    mHasToken = true;
+    mLastToken = input.frame_token;
+
+    FSVRAdapterPlanResult result = FSVRAdapterApply::computePlan(
+        input, spine_solver, arm_solver, write_through_solver, post_clamp);
+    if (result.applied)
+    {
+        ++mApplyCount;
+    }
+    return result;
+}
+
+#ifndef FSVR_ADAPTER_PLAN_ONLY
+
+// ---------------------------------------------------------------------------
+// Viewer glue. Everything below assembles the plan inputs from the
+// live viewer and performs the committed writes. It is excluded
+// from the standalone H1 harness (FSVR_ADAPTER_PLAN_ONLY), exactly
+// as the Stage-1 harness excludes the frame coordinator module.
+// ---------------------------------------------------------------------------
+
+#include "llcharacter.h"
+#include "llheadrotmotion.h"
+#include "lljoint.h"
+#include "llopenxrmanager.h"
+#include "llpose.h"
+#include "llopenxrtrace.h"
+#include "llvrarmsolver.h"
+#include "llvrcontinuity.h"
+#include "llvrboneregistry.h"
+#include "llvrspinesolver.h"
+#include "llvrtrackingarbitrator.h"
+#include "llvrtrackingframe.h"
+#include "llvrtrackingsettings.h"
+#include "llvoavatarself.h"
+#include "llagent.h"
+#include "llanimationstates.h"
+#include "llhudnametag.h"
+#include "llhudobject.h"
+#include "llviewerregion.h"
+#include "fscommon.h"
+
+#include <algorithm>
+#include <map>
+
+namespace
+{
+
+// C3 owns the constraint_adapter_id vocabulary (spec section
+// 1/C3). P2-07B C3 (CP-6) landed it: "spine_chain" (the spine
+// chain), "arm_left" / "arm_right" (shoulder/elbow/wrist per
+// side -- the mapper receives only the id string, so the side
+// lives in the string, DP-2). Empty and unrecognized ids still
+// map to NONE: the stub's conservative contract, preserved
+// verbatim (no domain, no writes). This fulfils the code
+// cross-check round 1 recorded clarification: registering bones
+// in the registry alone changed nothing here until this mapper
+// gained the real entries.
+FSVRAdapterDomain domainForAdapterId(const std::string& adapter_id)
+{
+    if (adapter_id == "spine_chain")
+    {
+        return FSVRAdapterDomain::SPINE;
+    }
+    if (adapter_id == "arm_left")
+    {
+        return FSVRAdapterDomain::ARM_LEFT;
+    }
+    if (adapter_id == "arm_right")
+    {
+        return FSVRAdapterDomain::ARM_RIGHT;
+    }
+    return FSVRAdapterDomain::NONE;
+}
+
+// ------------------------------------------------------------------
+// P2-07B DIAG-1 (brief sections 2.3 / 2.5 / 3 item 3):
+// the recorder's per-cycle consumer state. The headrot
+// capture and the blend record reach the glue through the
+// character's animation-data slots; the consumers enforce
+// the cycle-validity contract (current generation only,
+// per publishing instance). On a character change both
+// consumers reset, so no accepted generation can carry
+// across characters. The identity comparison itself --
+// consumed slot pointers vs the capture's published state
+// identities, same cycle, both generation-checked --
+// happens here at sample assembly; the raw pointers are
+// consumed here and passed no further.
+// ------------------------------------------------------------------
+LLCharacter* s_diag_consumer_character = nullptr;
+FSVRHeadRotConsumer s_diag_headrot_consumer;
+FSVRBlendObsConsumer s_diag_blend_consumer;
+
+// ------------------------------------------------------------------
+// P2-07B Fix 3: the live root write's authorization.
+// [FIX3-CODE-R1-03] gated the LLAgent::setPositionAgent
+// write while OQ-2 (the playspace boundary policy) was
+// undecided, because the offset math's absence of a
+// bound IS the follow-without-bound option, which the
+// brief requires be chosen knowingly, never selected by
+// implementation silence. [FIX3-CODE-R3] lands the
+// ruling: Leah chose STOP AT THE BOUND (2026-11-07).
+// The gate is therefore no longer a build constant; it
+// is the boundary policy's own validity, a snapshot
+// fact (FSVRRootFollowBoundMeters, derived in
+// llvrtrackingsettings.cpp): with a valid bound the
+// policy is in force, the consumed displacement is
+// radially clamped to it, and the write is live; with
+// the bound absent or invalid the policy is not in
+// force, the write stays gated off (never unbounded),
+// the standing composition keeps the shipped lean
+// behaviour [FIX3-CODE-R2-01], and the gate announces
+// itself once per establishment through the
+// root_follow_gated and root_follow_bound_invalid
+// bonelog events -- loud, not silent. The gate opens
+// because OQ-2 is now ruled, not by a silent flip.
+// ------------------------------------------------------------------
+
+void convertBlendJoint(const FSVRBlendObsJoint& in,
+                       FSVRBoneLogBlendJoint& out)
+{
+    out.generation = in.generation;
+    out.seed_local = in.seed_local;
+    out.rot_weight_sum = in.rot_weight_sum;
+    out.blended_rot = in.blended_rot;
+    out.added_rot = in.added_rot;
+    out.result_local = in.result_local;
+    out.slots.clear();
+    for (S32 i = 0; i < in.slot_count; ++i)
+    {
+        const FSVRBlendObsSlot& slot = in.slots[i];
+        FSVRBoneLogBlendSlot converted;
+        converted.additive = slot.additive;
+        converted.priority = slot.priority;
+        converted.weight = slot.weight;
+        converted.rotation = slot.rotation;
+        converted.has_rot_sum = slot.has_rot_sum;
+        converted.rot_sum_after = slot.rot_sum_after;
+        converted.delta = slot.delta;
+        converted.blended_after = slot.blended_after;
+        converted.added_after = slot.added_after;
+        converted.source_headrot = slot.source_headrot;
+        out.slots.push_back(converted);
+    }
+    out.source_integrity_failure = in.source_integrity_failure;
+}
+
+} // namespace
+
+void FSVRAdapterApplyForCharacter(LLCharacter* character, bool preview_cycle)
+{
+    if (!character)
+    {
+        return;
+    }
+
+    // P2-07B C8 (CP-1/CP-4/CP-5): service this cycle's
+    // continuity signals first, before anything reads them:
+    // drain the manager's finalized LOCAL-transition batches
+    // (routing each through the rebase decision; a Suspend
+    // invalidates the session neutral through C5's entry
+    // point) and sample the self avatar's skeleton rebuild
+    // generation (a change invalidates likewise). Placement
+    // is the contract: the plan input assembled below stamps
+    // the post-service continuity epoch, and C5's step hook
+    // at the tail reads C5's epoch advanced by the same
+    // service, so no cycle can assemble or step on
+    // pre-transition state. The service runs on published
+    // and bypass cycles alike; idle cost is one empty drain
+    // plus one integer load + compare.
+    FSVRContinuity::serviceCycleSignals();
+
+    const FSVRTrackingFrameDecisions* decisions =
+        FSVRTrackingCoordinator::currentDecisions();
+    if (!decisions && !FSVRCalibration::cycleWorkPending())
+    {
+        // Nothing published for this frame, and calibration
+        // has no work: nothing to process.
+        return;
+    }
+
+    // P2-07B C5 (CP-4 item 3): the pre-cycle staleness check
+    // runs before input assembly on both the decisions path
+    // and the bypass path, so a starved transaction aborts
+    // here rather than producing a hold cycle after a gap.
+    FSVRCalibration::preCycleCheck();
+
+    // P2-07B C6-E (C6E-CODE-R1-01): refresh C5's ICR-2
+    // sitting fact from THIS cycle's avatar signals before
+    // the assembly below copies the session view. Without
+    // this the view's sitting_signals_clear would be the
+    // value the post-apply step hook wrote LAST cycle, and
+    // E8 would judge the first sitting cycle by the previous
+    // cycle's standing state. The refresh is C5's own entry
+    // point and the fact's only writer remains the session
+    // machine's noteSittingSignals; the step hook at the
+    // tail of this function refreshes again from the same
+    // character through the same signal read.
+    FSVRCalibration::refreshSittingSignals(character);
+
+    const FSVRTrackingSettingsSnapshot& snapshot =
+        FSVRTrackingSettings::captureForFrame();
+
+    FSVRAdapterPlanInput input;
+    // On the no-decisions bypass path (CP-4 item 6) the
+    // token comes from the trace's current app frame token:
+    // the same fallback the coordinator itself uses when it
+    // has no pending token (llvrtrackingframe.cpp).
+    input.frame_token =
+        decisions ? decisions->app_frame_token
+                  : static_cast<U64>(LLOpenXRTrace::currentAppFrameToken());
+    // The hook is post-blend by construction (brief section 3.2);
+    // the cycle classification comes from production state: the
+    // Animation Preview flag the override read from the avatar,
+    // and the motion controller's paused flag (a paused controller
+    // reaches the hook only through FORCE_UPDATE).
+    input.blend_ran = true;
+    input.cycle = FSVRAdapterApply::classifyCycle(
+        preview_cycle, character->getMotionController().isPaused());
+    // The bridge exists only on LLVOAvatarSelf (DP-1), so reaching
+    // this function is the armed context.
+    input.context_armed = true;
+
+    // Gate 1 inputs. Decisions are current when the snapshot they
+    // were finalized against is still the captured snapshot
+    // (brief section 2.3: arbitration is finalized earlier in the
+    // same frame than the motion update). On the no-decisions
+    // bypass path (C5 CP-4 item 6) the three decisions fields
+    // are false and the per-bone decision loops below are
+    // skipped (the decision map stays empty, so every joint
+    // takes its no-decision defaults); the rest of the
+    // assembly is unchanged.
+    input.decisions_published = (decisions != nullptr);
+    input.decisions_current =
+        decisions && (snapshot.generation == decisions->settings_generation);
+    // The legacy all-bones form, retained as a recorded fact
+    // (C6-E CP-5 part 3): it no longer gates anything.
+    input.decisions_runtime_effective = false;
+    if (decisions)
+    {
+        input.decisions_runtime_effective = !decisions->bones.empty();
+        for (const FSVRBoneDecision& bone : decisions->bones)
+        {
+            if (bone.shadow_only)
+            {
+                input.decisions_runtime_effective = false;
+                break;
+            }
+        }
+        // Gate 1, scoped (P2-07B C6-E, CP-5 part 3):
+        // runtime-effective is tested per solver domain over
+        // the decisions the arbitrator emitted -- this glue
+        // reads the emitted shadow_only form through the
+        // arbitrator's pure derivations; it never reinterprets
+        // it. Each fact holds iff the published set contains
+        // the domain's decisions and none of them is
+        // shadow-only.
+        input.spine_decisions_runtime_effective =
+            spineDecisionsRuntimeEffective(*decisions);
+        input.arm_decisions_runtime_effective =
+            armDecisionsRuntimeEffective(*decisions);
+    }
+
+    // Gate 2 input (P2-07B C6-E, CP-1): the manager's own
+    // VR-mode fact -- the identical call the coordinator
+    // makes for the same fact (llvrtrackingframe.cpp). This
+    // discharges C4 brief DP-5's deferred half. It lands
+    // inert: gate 1 is evaluated before gate 2 and stays
+    // closed in every build without an authorization commit
+    // (CP-5), so the plan's output is unchanged in all
+    // production states (H10-12).
+    input.vr_active = LLOpenXRManager::instance().isVRModeActive();
+    // The six enablement/diagnostic fields are P2-07B C4
+    // (CP-6): they read the user's actual positional settings
+    // and diagnostic values from the frame snapshot captured
+    // above, so the adapter plans on them.
+    input.positional_solve_enabled = snapshot.diag_positional_solve;
+    input.head_position_enabled = snapshot.track_head_position;
+    input.hand_position_enabled = snapshot.track_hand_position;
+    // P2-07B C6-E (CP-2/CP-3): the spine sample-validity
+    // conjunction over this cycle's facts. The session view
+    // is read once, here, as a copy: E5/E6/E8 and the CP-4
+    // composition below all consume this same cycle's view.
+    // E9 is C5's transaction state, read once at population;
+    // the same read populates calibration_hold_active below
+    // (CP-3: one fact, one read, never latched).
+    const FSVRSessionNeutralView session_view =
+        FSVRCalibration::sessionNeutralView();
+    const bool calibration_active = FSVRCalibration::transactionActive();
+    // The cycle's ONE HMD position read (CP-4 step 1,
+    // DP-C6E-3): its bool is E7, and the same vector feeds
+    // the composition below, so the sample judged valid is
+    // the sample composed from -- never two reads that
+    // could straddle an adoption.
+    LLVector3 hmd_position_local;
+    const bool hmd_position_read =
+        LLOpenXRManager::instance().getHmdPosition(hmd_position_local);
+    FSVRSpineSampleInputs sample_inputs;
+    // P2-07B Stage 1 (CP-S1-4): E5 is scale-input validity
+    // -- the view carries a named scale source (a measured
+    // record validated at its producers, or the provisional
+    // baseline), and the snapshot's lean gain is inside its
+    // bounded domain. An invalid gain fails the cycle
+    // closed for EVERY scale source: the user who typed a
+    // broken value gets no positional spine -- the
+    // diagnosable state -- not a quietly different feel.
+    // (Pre-Stage-1 this field read the record's USABLE_*
+    // status; a sync-established neutral has no record to
+    // read, which is the redesign's whole point.)
+    sample_inputs.scale_input_valid =
+        session_view.scale_source != FSVRScaleSource::NONE &&
+        snapshot.lean_gain_valid;
+    sample_inputs.neutral_established = session_view.established;
+    sample_inputs.hmd_position_valid = hmd_position_read;
+    sample_inputs.sitting_signals_clear = session_view.sitting_signals_clear;
+    sample_inputs.calibration_in_progress = calibration_active;
+    input.spine_sample_valid = decideSpineSampleValid(sample_inputs);
+    // Section 7.4: a standing false, not a conjunction
+    // awaiting inputs -- no arm sample source exists in
+    // this component (Package C's fact).
+    input.arm_sample_valid = false;
+    input.bend_disabled_bones = snapshot.solver_bend_disabled_bones;
+    input.diag_bend_limits = snapshot.diag_bend_limits;
+    input.diag_full_chain_solve = snapshot.diag_full_chain_solve;
+    // C6/C7 (CP-7): the soft-preference diagnostic and the
+    // snapshot generation reach the plan from the same
+    // snapshot.
+    input.diag_soft_preference = snapshot.diag_soft_preference;
+    input.settings_generation = snapshot.generation;
+    // P2-07B C8 (CP-3): the continuity stamp, read once at
+    // input assembly from C8's router (post-service, above).
+    // The retirement predicate below compares it against the
+    // previous apply's stamp.
+    input.continuity_epoch = FSVRContinuity::continuityEpoch();
+
+    // P2-07B C5 (CP-4 item 2): the calibration hold flag.
+    // The apply point gains no second mode channel: the flag
+    // rides the plan input like every other field. P2-07B
+    // C6-E (CP-3): the value is the population block's single
+    // transactionActive() read, shared with E9 -- the same
+    // fact, read once.
+    input.calibration_hold_active = calibration_active;
+
+    // Build the plan joint list from the registry (OQ-7: C1
+    // iterates registry/decisions; it does not hard-code a bone
+    // list). Unregistered ancestors are pulled in as structural
+    // joints so the tree is complete under the pelvis root frame;
+    // composition always goes through real LLJoint parents, never
+    // registry parent strings.
+    LLJoint* root_joint = character->getRootJoint();
+    std::vector<LLJoint*> ordered;
+    std::map<LLJoint*, const FSVRTrackingBoneEntry*> entry_by_joint;
+    for (const FSVRTrackingBoneEntry& entry : FSVRBoneRegistry::entries())
+    {
+        if (entry.expected_joint_name.empty())
+        {
+            continue;
+        }
+        LLJoint* joint = character->getJoint(entry.expected_joint_name);
+        if (!joint || joint == root_joint)
+        {
+            continue;
+        }
+        entry_by_joint[joint] = &entry;
+        // Collect the chain from this joint up to (excluding) the
+        // root joint, then append any missing joints top-down so
+        // parents always precede children.
+        std::vector<LLJoint*> chain;
+        for (LLJoint* cursor = joint; cursor && cursor != root_joint;
+             cursor = cursor->getParent())
+        {
+            chain.push_back(cursor);
+        }
+        for (auto it = chain.rbegin(); it != chain.rend(); ++it)
+        {
+            if (std::find(ordered.begin(), ordered.end(), *it) == ordered.end())
+            {
+                ordered.push_back(*it);
+            }
+        }
+    }
+
+    std::map<LLJoint*, S32> index_by_joint;
+    for (S32 i = 0; i < static_cast<S32>(ordered.size()); ++i)
+    {
+        index_by_joint[ordered[i]] = i;
+    }
+
+    std::map<std::string, const FSVRBoneDecision*> decision_by_bone;
+    if (decisions)
+    {
+        for (const FSVRBoneDecision& bone : decisions->bones)
+        {
+            decision_by_bone[bone.bone_id] = &bone;
+        }
+    }
+
+    input.joints.reserve(ordered.size());
+    for (LLJoint* joint : ordered)
+    {
+        FSVRAdapterJointInput joint_input;
+        joint_input.name = joint->getName();
+        LLJoint* parent = joint->getParent();
+        auto parent_it = (parent && parent != root_joint)
+            ? index_by_joint.find(parent)
+            : index_by_joint.end();
+        joint_input.parent_index =
+            (parent_it != index_by_joint.end()) ? parent_it->second : -1;
+        joint_input.rest_offset = joint->getPosition();
+        joint_input.base_local = joint->getRotation();
+
+        auto entry_it = entry_by_joint.find(joint);
+        if (entry_it != entry_by_joint.end())
+        {
+            const FSVRTrackingBoneEntry& entry = *entry_it->second;
+            joint_input.in_registry = true;
+            joint_input.domain = domainForAdapterId(entry.constraint_adapter_id);
+            joint_input.disabled =
+                snapshot.disabled_bones.isBoneDisabled(entry.canonical_id);
+            auto decision_it = decision_by_bone.find(entry.canonical_id);
+            if (decision_it != decision_by_bone.end())
+            {
+                const FSVRBoneDecision& decision = *decision_it->second;
+                joint_input.decision_grants_base =
+                    decision.desired_decision == FSVRDecisionKind::TRACKED &&
+                    decision.desired_source == "HMD";
+            }
+        }
+        input.joints.push_back(joint_input);
+    }
+
+    // P2-07B Fix 4 (CP-F4-2): base provenance. The store is
+    // created at assembly -- ahead of this cycle's write
+    // pass below, so no adapter write of this ownership
+    // can precede its seeding (F4-S6) -- and seeded from
+    // the joints' current locals. Each cycle the
+    // classification rewrites every tracked joint's
+    // presented base to its animation-attributed local, so
+    // the plan is never presented the adapter's own prior
+    // commits as animation (INV-F4-01), while the write
+    // pass below still lands the commits on the live
+    // joints for rendering. Provenance is behaviour, not
+    // recording: it runs whether or not the bonelog is
+    // enabled. Lifecycle (brief section 2.5 [R3]): RESET
+    // only on character change and on skeleton reinit
+    // evidenced by the rebuild generation itself; KEEP
+    // across resync, settings change, frame-token gap,
+    // gate failure, head-group refusal and headset-off
+    // intervals -- none of those touch the store.
+    static FSVRBaseProvenanceStore s_provenance;
+    static LLCharacter* s_provenance_character = nullptr;
+    static U64 s_provenance_skeleton_gen = 0;
+    static bool s_provenance_have_skeleton_gen = false;
+    static FSVRBlendObsConsumer s_provenance_blend_consumer;
+    {
+        std::vector<FSVRBaseProvenanceEvent> provenance_events;
+        if (s_provenance_character != character)
+        {
+            // Character change: the incoming character's
+            // provenance starts from its own current pose.
+            // The FIRST bind is the store's creation --
+            // adopted silently (nothing was superseded, so
+            // no reset event); later changes reset loudly.
+            const bool first_bind =
+                (s_provenance_character == nullptr);
+            s_provenance_character = character;
+            s_provenance_blend_consumer = FSVRBlendObsConsumer();
+            s_provenance_have_skeleton_gen = false;
+            if (first_bind)
+            {
+                s_provenance.entries.clear();
+                s_provenance.dormant.clear();
+            }
+            else
+            {
+                FSVRAdapterApply::provenanceReset(
+                    s_provenance, input.joints,
+                    "character_change", provenance_events);
+            }
+        }
+        // Skeleton reinit, evidenced by the rebuild
+        // generation itself -- the C8/C5-shell read
+        // (llvrcalibration.cpp). The bonelog recorder's
+        // skeleton serial is a separate, recorder-owned
+        // signal and is never consulted for provenance.
+        const U64 prov_skeleton_gen =
+            gAgentAvatarp
+                ? gAgentAvatarp->getSkeletonRebuildGeneration()
+                : 0;
+        if (s_provenance_have_skeleton_gen &&
+            prov_skeleton_gen != s_provenance_skeleton_gen)
+        {
+            FSVRAdapterApply::provenanceReset(
+                s_provenance, input.joints, "skeleton_reinit",
+                provenance_events);
+        }
+        s_provenance_skeleton_gen = prov_skeleton_gen;
+        s_provenance_have_skeleton_gen = true;
+
+        // This cycle's blend classification, read from the
+        // same generation-validated record the DIAG-1 tail
+        // consumes (each consumer tracks its own accepted
+        // generation). A joint the record's current pass
+        // did not write is NO_WRITE; a joint outside the
+        // observed set carries no fact; a record that did
+        // not advance leaves every tracked joint's fact
+        // unavailable, which the seam fails closed on --
+        // never a silent NO_WRITE [R3 verdict safeguard].
+        FSVRBlendObsRecord* prov_blend_record =
+            static_cast<FSVRBlendObsRecord*>(
+                character->getAnimationData("FSVRBlendObs"));
+        const bool prov_record_valid =
+            prov_blend_record &&
+            s_provenance_blend_consumer.consumePass(
+                prov_blend_record);
+        std::vector<FSVRBaseBlendFact> prov_facts(
+            input.joints.size());
+        if (prov_record_valid)
+        {
+            for (size_t i = 0; i < input.joints.size(); ++i)
+            {
+                const FSVRBlendObsJoint* entry =
+                    fsvrBlendObsEntry(*prov_blend_record,
+                                      input.joints[i].name);
+                if (!entry)
+                {
+                    continue;
+                }
+                FSVRBaseBlendFact& fact = prov_facts[i];
+                fact.present = true;
+                if (!entry->written ||
+                    entry->generation !=
+                        prov_blend_record->generation)
+                {
+                    fact.blend_class =
+                        FSVRBaseBlendClass::NO_WRITE;
+                    continue;
+                }
+                fact.seed_local = entry->seed_local;
+                fact.added_rot = entry->added_rot;
+                fact.result_local = entry->result_local;
+                bool seed_discarded = false;
+                for (S32 s = 0; s < entry->slot_count; ++s)
+                {
+                    seed_discarded = seed_discarded ||
+                                     entry->slots[s].has_rot_sum;
+                }
+                fact.blend_class =
+                    seed_discarded
+                        ? FSVRBaseBlendClass::SEED_DISCARDED
+                        : FSVRBaseBlendClass::SEED_PRESERVED;
+            }
+        }
+        FSVRAdapterApply::provenanceAssembly(
+            s_provenance, input.joints, prov_facts,
+            prov_record_valid, provenance_events);
+        for (const FSVRBaseProvenanceEvent& prov_event :
+             provenance_events)
+        {
+            if (prov_event.kind ==
+                FSVRBaseProvenanceEventKind::RESET)
+            {
+                FSVRBoneLog::eventBaseProvenanceReset(
+                    prov_event.joint_name.empty()
+                        ? nullptr
+                        : prov_event.joint_name.c_str(),
+                    prov_event.reason.c_str());
+            }
+            else
+            {
+                FSVRBoneLog::eventBaseProvenanceUnclassified(
+                    prov_event.joint_name.c_str(),
+                    prov_event.divergence_deg);
+            }
+        }
+    }
+
+    // P2-07B Fix 3 R5 (brief sections 2.1-2.2; plan P1):
+    // the cycle's avatar state, sampled from the live self
+    // avatar at this apply point -- after updateCharacter's
+    // parent reconciliation for the same frame (plan
+    // section 1.3), so the facts read here are the frame's
+    // reconciled facts. The classification is the pure
+    // fsvrClassifyAvatarState; this block only gathers its
+    // inputs. An UNKNOWN classification earns exactly one
+    // bounded re-read (plan P1): a transient mid-update
+    // read is the only ambiguity a re-read can settle, and
+    // a still-unknown second read stands. The state --
+    // never the sync's flavour stamp -- is what behaviour
+    // selection consumes from here on.
+    static FSVRAvatarStateTracker s_avatar_state_tracker;
+    // The frame the sample belongs to, captured BEFORE
+    // the first avatar-state read [FIX3-R5-CODE-R2-01]:
+    // the freshness guard below compares against this
+    // stamp, so a frame boundary crossed DURING sampling
+    // is detected, not just one after it.
+    const U64 sample_frame = LLFrameTimer::getFrameCount();
+    // The lifecycle identity [FIX3-R5-CODE-03]: a home
+    // base, a watch expectation and a tracked posture
+    // belong to one avatar lifecycle. A character change,
+    // a skeleton rebuild or a fresh install retires the
+    // tracked posture here (before it is read) and the
+    // watch + home base at their blocks below, so a
+    // reconstructed avatar standing in the same posture
+    // as its predecessor can never inherit its home base
+    // through a STANDING -> STANDING non-transition.
+    static FSVRGlueLifecycleKey s_lifecycle_key;
+    static bool s_lifecycle_known = false;
+    bool lifecycle_changed = false;
+    {
+        FSVRGlueLifecycleKey key_now;
+        key_now.character = character;
+        key_now.skeleton_generation =
+            gAgentAvatarp.notNull()
+                ? gAgentAvatarp->getSkeletonRebuildGeneration()
+                : 0;
+        key_now.install_generation = session_view.install_generation;
+        if (!s_lifecycle_known)
+        {
+            s_lifecycle_key = key_now;
+            s_lifecycle_known = true;
+        }
+        else if (key_now != s_lifecycle_key)
+        {
+            s_lifecycle_key = key_now;
+            lifecycle_changed = true;
+            s_avatar_state_tracker.reset();
+        }
+    }
+    FSVRAvatarPostureState avatar_state =
+        FSVRAvatarPostureState::UNKNOWN;
+    {
+        auto sample_avatar_state = []() {
+            FSVRAvatarStateSample s;
+            if (gAgentAvatarp.notNull() && gAgentAvatarp->isValid())
+            {
+                s.avatar_valid = true;
+                s.sitting_flag = gAgentAvatarp->isSitting();
+                // getParent() is the xform parent; the
+                // viewer's own reconciliation casts it to
+                // the object (llvoavatar.cpp's sitOnObject
+                // call), and so does the sampler.
+                LLViewerObject* parent =
+                    (LLViewerObject*)gAgentAvatarp->getParent();
+                s.parent_present = (parent != nullptr);
+                s.parent_is_object = parent && parent->isRoot();
+                LLMotion* ground_motion =
+                    gAgentAvatarp->getMotionController().findMotion(
+                        ANIM_AGENT_SIT_GROUND_CONSTRAINED);
+                if (!ground_motion ||
+                    gAgentAvatarp->getMotionController()
+                        .isMotionLoading(ground_motion))
+                {
+                    // No motion yet, or the motion is still
+                    // loading: the stock guard's own
+                    // distinction (llvoavatar.cpp's
+                    // reconciliation), read as UNKNOWN --
+                    // never folded into ACTIVE or INACTIVE.
+                    s.ground_motion = FSVRGroundMotion::UNKNOWN;
+                }
+                else
+                {
+                    s.ground_motion =
+                        gAgentAvatarp->isMotionActive(
+                            ANIM_AGENT_SIT_GROUND_CONSTRAINED)
+                            ? FSVRGroundMotion::ACTIVE
+                            : FSVRGroundMotion::INACTIVE;
+                }
+            }
+            return fsvrClassifyAvatarState(s);
+        };
+        avatar_state = sample_avatar_state();
+        if (avatar_state == FSVRAvatarPostureState::UNKNOWN)
+        {
+            avatar_state = sample_avatar_state();
+        }
+    }
+    const FSVRAvatarPostureState avatar_state_prev =
+        s_avatar_state_tracker.update(avatar_state, sample_frame);
+    // The stale-sample contract (plan P1; [FIX3-R5-CODE-05],
+    // ordering corrected [FIX3-R5-CODE-R2-01]): the tracker
+    // is stamped with the frame captured BEFORE sampling
+    // began, and the guard re-reads the frame after
+    // classification (including the bounded re-read). A
+    // frame boundary crossed at any point during sampling
+    // or classification makes the sample describe a frame
+    // other than the one being applied to: it is rejected,
+    // the state becomes UNKNOWN (fail closed, neither
+    // behaviour authorized), the rejection is recorded,
+    // and the tracker records it too.
+    if (!s_avatar_state_tracker.fresh(
+            LLFrameTimer::getFrameCount()))
+    {
+        FSVRBoneLog::eventAvatarStateStaleSample();
+        avatar_state = FSVRAvatarPostureState::UNKNOWN;
+        s_avatar_state_tracker.update(
+            avatar_state, LLFrameTimer::getFrameCount());
+    }
+    // The transition record and the in-world diagnostic
+    // (plan P5; brief sections 8.1-8.2): on the edge only,
+    // and only inside an established VR session -- the
+    // tracker itself runs unconditionally, but its record
+    // is a VR diagnostic. The chat line is the validation
+    // label: the current avatar state, announced as it
+    // changes; an UNKNOWN entry announces the fail-closed
+    // consequence with it (fail loud, section 2.4).
+    if (session_view.established &&
+        avatar_state_prev != avatar_state)
+    {
+        FSVRBoneLog::eventAvatarStateChanged(
+            fsvrAvatarPostureStateName(avatar_state_prev),
+            fsvrAvatarPostureStateName(avatar_state));
+        if (avatar_state == FSVRAvatarPostureState::UNKNOWN ||
+            avatar_state == FSVRAvatarPostureState::INVALID)
+        {
+            FSCommon::report_to_nearby_chat(llformat(
+                "VR: avatar state %s -- posture behaviours off",
+                fsvrAvatarPostureStateName(avatar_state)));
+        }
+        else
+        {
+            FSCommon::report_to_nearby_chat(llformat(
+                "VR: avatar state %s",
+                fsvrAvatarPostureStateName(avatar_state)));
+        }
+    }
+
+    // P2-07B Fix 3 (brief sections 2.2/2.5/2.6): the
+    // cycle's Fix 3 facts and the standing root
+    // application. The behaviour is determined here, from
+    // the same session view copy the composition below
+    // consumes, so a cycle can never pair one flavour's
+    // neutral with the other's behaviour (F3-P2's pairing
+    // invariant): behaviour and neutral are read from one
+    // view, atomically for the cycle.
+    FSVRFix3CycleInputs fix3_inputs;
+    fix3_inputs.posture_swap = snapshot.posture_swap;
+    fix3_inputs.head_position_enabled =
+        snapshot.track_head_position;
+    // [FIX3-CODE-R1-02] The lean gain's validity rides
+    // the inputs beside its pinned value (which the
+    // composition receives as its lean_gain argument):
+    // the factor decision fails closed on it.
+    fix3_inputs.lean_gain_valid = snapshot.lean_gain_valid;
+    fix3_inputs.root_gain = snapshot.root_gain;
+    fix3_inputs.root_gain_valid = snapshot.root_gain_valid;
+    // [FIX3-CODE-R1-01] The manual ratio states are the
+    // snapshot's per-channel derivations over the global
+    // settings FSVRManualLeanRatio / FSVRManualRootRatio,
+    // mapped through fsvrManualRatioState (the pinned 0
+    // of an unset or invalid value is never consumed as
+    // a ratio). The two channels map independently.
+    fix3_inputs.manual_lean = fsvrManualRatioState(
+        snapshot.manual_lean_set, snapshot.manual_lean_invalid);
+    fix3_inputs.manual_lean_ratio = snapshot.manual_lean_ratio;
+    fix3_inputs.manual_root = fsvrManualRatioState(
+        snapshot.manual_root_set, snapshot.manual_root_invalid);
+    fix3_inputs.manual_root_ratio = snapshot.manual_root_ratio;
+    // [FIX3-CODE-R3] The boundary policy's facts ride
+    // the inputs from the same snapshot: the bound's
+    // carried value (0 when invalid) and its validity,
+    // which is the policy-in-force fact the step's
+    // clamp, the step's live flag and the composition's
+    // suppression all read -- one derivation, consumed
+    // identically everywhere.
+    fix3_inputs.root_follow_bound_m = snapshot.root_follow_bound_m;
+    fix3_inputs.root_follow_bound_valid =
+        snapshot.root_follow_bound_valid;
+    // P2-07B Fix 3 R5: the sampled avatar state rides the
+    // inputs (present, always, in production), and the
+    // plan's recorded behaviour derives through the one
+    // cycle-behaviour function the seams use, so the
+    // record can never disagree with the composition.
+    fix3_inputs.avatar_state = avatar_state;
+    fix3_inputs.avatar_state_present = true;
+    // The detector's measured-band readiness
+    // [FIX3-R5-CODE-02], from the settings snapshot.
+    fix3_inputs.detector_proven = snapshot.teleport_detector_proven;
+    input.posture_behaviour =
+        fsvrCycleBehaviour(session_view, fix3_inputs);
+    input.posture_behaviour_present = true;
+    // The sampled state also rides the plan input to the
+    // record (brief section 8.1); the plan reads it not.
+    input.avatar_state = avatar_state;
+    input.avatar_state_present = true;
+    // FSVRPostureSwap's configured value is recorded with
+    // its inert status under R5 (plan P4): configured from
+    // the snapshot, effective nowhere.
+    input.posture_swap_configured = snapshot.posture_swap;
+    input.posture_swap_inert = true;
+
+    // The standing root application (brief section 2.2
+    // item 4; OQ-5 as ruled by Leah 2026-11-07: TRUE
+    // in-world movement). The offset is applied BEFORE
+    // the root frame is populated below, through the
+    // viewer's genuine agent movement channel --
+    // LLAgent::setPositionAgent, the frame-agent write
+    // every agent update to the simulator is built from,
+    // so the avatar genuinely relocates and other viewers
+    // see it move. It is NOT a render offset and NOT a
+    // solver output (Amendment 03 item 5). The applied
+    // position is absolute -- the agent anchor captured
+    // for this establishment plus the cycle's computed
+    // offset (OQ-1's ruled follow form (b)) -- never a
+    // per-cycle delta, so re-applying a cycle's offset is
+    // a no-op and no drift can accrue (F3-R5). The anchor
+    // is keyed to the neutral's install generation: a
+    // re-sync re-anchors (section 0.1 of the brief: no
+    // pre-sync root state survives a sync), and an
+    // invalidated establishment drops it.
+    // Eligibility is the cycle's own authorization facts,
+    // all of them: a Gate-1-authorized build (candidate
+    // or above -- in a NONE build the offset is computed
+    // and recorded by the composition below but never
+    // applied, exactly as the head target is composed and
+    // recorded but never written), the E5-E9 positional
+    // validity conjunction (which includes E8's
+    // seat-anchored suppression, brief section 0.8, and
+    // E9's calibration exclusion), the Head position
+    // toggle (section 0.4), the spine domain's gate-1
+    // decision fact, and an ordinary cycle kind.
+    // [FIX3-CODE-R3] One further condition stands
+    // between the computed offset and the write: the
+    // boundary policy must be in force. OQ-2 is now
+    // ruled (STOP AT THE BOUND), so the condition is the
+    // bound's validity in the snapshot: a valid bound
+    // opens the write (the step's offset is already the
+    // clamped one); an absent or invalid bound keeps the
+    // write gated off -- the cycle announces the gate
+    // and its cause once per establishment
+    // (root_follow_gated, root_follow_bound_invalid) and
+    // writes nothing, and the composition below keeps
+    // the shipped lean behaviour for the cycle
+    // [FIX3-CODE-R2-01]. The write decision reads the
+    // step's own live flag, the one pure fact the step
+    // computed from these same inputs. The anchor state
+    // below is deliberately NOT advanced while the gate
+    // is closed, so the establishment that eventually
+    // opens it anchors from the agent's position at that
+    // time, not from a position the gated cycles read.
+    // P2-07B Fix 3 R5 (brief sections 3.1/4.3; plan P3):
+    // the teleport watch and the home-base lifecycle. The
+    // watch is fed every glue cycle -- before the root
+    // step, per its contract -- so its expectation tracks
+    // the agent even through cycles the gates close. A
+    // fresh sync (a new install generation) is the one act
+    // that clears a suspension and resets the watch. The
+    // home base is invalidated by: a discontinuity, the
+    // avatar sitting down, and (by the lazy establishment
+    // below reading the CURRENT position) the avatar
+    // standing up -- a fresh home base on every stand, no
+    // jump from a stale base (Leah's 2026-11-08 ruling).
+    static FSVRTeleportWatch s_teleport_watch;
+    static FSVRTeleportEventTracker s_teleport_events;
+    static U32 s_teleport_watch_generation = 0;
+    bool teleport_suspended = false;
+    bool home_base_invalid = false;
+    const char* home_base_invalid_reason = nullptr;
+    {
+        // The ending generation's labeled band evidence,
+        // recorded before a reset retires it
+        // [FIX3-R5-CODE-02 / CODE-R2-02 / CODE-R3-2A].
+        auto emit_band_evidence = []() {
+            if (s_teleport_watch.max_continuity_m > 0.f ||
+                s_teleport_watch.teleport_count > 0 ||
+                s_teleport_watch.unexplained_count > 0 ||
+                s_teleport_events.events_completed > 0 ||
+                s_teleport_events.events_incomplete > 0 ||
+                s_teleport_events.incompleteAtEnd() > 0)
+            {
+                FSVRBoneLog::eventDetectorBandObservation(
+                    s_teleport_watch.max_continuity_m,
+                    s_teleport_watch.teleport_step_max_m,
+                    s_teleport_watch.teleport_min_m,
+                    s_teleport_watch.teleport_count,
+                    s_teleport_watch.unexplained_count,
+                    s_teleport_watch.unexplained_max_m,
+                    s_teleport_events.event_min_m,
+                    s_teleport_events.event_max_m,
+                    s_teleport_events.events_completed,
+                    s_teleport_events.events_incomplete +
+                        s_teleport_events.incompleteAtEnd());
+            }
+        };
+        if (!session_view.established)
+        {
+            emit_band_evidence();
+            s_teleport_watch.reset();
+            s_teleport_events.reset();
+            s_teleport_watch_generation = 0;
+        }
+        else if (s_teleport_watch_generation !=
+                 session_view.install_generation)
+        {
+            emit_band_evidence();
+            s_teleport_watch.reset();
+            s_teleport_events.reset();
+            s_teleport_watch_generation =
+                session_view.install_generation;
+            // A fresh sync is also the validation label's
+            // session-start line (plan P5): the state the
+            // session begins in, announced once per sync.
+            FSCommon::report_to_nearby_chat(llformat(
+                "VR: avatar state %s",
+                fsvrAvatarPostureStateName(avatar_state)));
+        }
+        if (session_view.established)
+        {
+            if (lifecycle_changed)
+            {
+                // The avatar this cycle belongs to is not
+                // the one the watch and home base were
+                // built for [FIX3-R5-CODE-03]: retire both
+                // before the watch judges anything.
+                s_teleport_watch.reset();
+                s_teleport_events.reset();
+                home_base_invalid = true;
+                if (!home_base_invalid_reason)
+                {
+                    home_base_invalid_reason = "reconstruction";
+                }
+            }
+            LLViewerRegion* region = gAgent.getRegion();
+            const U64 region_id = region ? region->getHandle() : 0;
+            const bool was_suspended = s_teleport_watch.suspended;
+            // The evidence label [FIX3-R5-CODE-R2-02]: the
+            // viewer's own teleport state -- a source
+            // independent of the watch's threshold -- says
+            // whether this cycle's movement belongs to a
+            // known teleport.
+            const bool known_teleport =
+                gAgent.getTeleportState() !=
+                LLAgent::TELEPORT_NONE;
+            // Whole-event measurement [FIX3-R5-CODE-R3-2A]:
+            // the tracker sees the same label and position;
+            // a completion is recorded as it happens.
+            {
+                F32 event_net = 0.f;
+                if (s_teleport_events.observe(
+                        known_teleport, gAgent.getPositionAgent(),
+                        event_net))
+                {
+                    FSVRBoneLog::eventTeleportEventMeasured(
+                        event_net);
+                }
+            }
+            if (s_teleport_watch.observe(
+                    gAgent.getPositionAgent(), region_id,
+                    FSVR_TELEPORT_PROVISIONAL_EPSILON_M,
+                    known_teleport) ==
+                FSVRWatchVerdict::DISCONTINUITY)
+            {
+                home_base_invalid = true;
+                home_base_invalid_reason =
+                    s_teleport_watch.last_cause ==
+                            FSVRWatchCause::REGION
+                        ? "region"
+                        : "teleport";
+            }
+            teleport_suspended = s_teleport_watch.suspended;
+            if (!was_suspended && teleport_suspended)
+            {
+                // The suspension edge (plan P5): the cause
+                // and the effect, recorded once, and the
+                // user told in-world -- a suspension that
+                // only a fresh sync clears must never be
+                // silent. The cause is reported as itself
+                // [FIX3-R5-CODE-R3-2B]: a region change is
+                // not a suspected teleport.
+                if (s_teleport_watch.last_cause ==
+                    FSVRWatchCause::REGION)
+                {
+                    FSVRBoneLog::eventRegionDiscontinuity(
+                        s_teleport_watch.last_discontinuity_m);
+                    FSVRBoneLog::eventRootFollowSuspended(
+                        "region");
+                    FSCommon::report_to_nearby_chat(
+                        "VR: region changed -- root follow "
+                        "suspended until you sync again");
+                }
+                else
+                {
+                    FSVRBoneLog::eventTeleportSuspected(
+                        s_teleport_watch.last_discontinuity_m);
+                    FSVRBoneLog::eventRootFollowSuspended(
+                        "teleport");
+                    FSCommon::report_to_nearby_chat(
+                        "VR: teleport suspected -- root follow "
+                        "suspended until you sync again");
+                }
+            }
+        }
+        if (avatar_state_prev == FSVRAvatarPostureState::STANDING &&
+            fsvrAvatarStateIsSitting(avatar_state))
+        {
+            home_base_invalid = true;
+            if (!home_base_invalid_reason)
+            {
+                home_base_invalid_reason = "sitting";
+            }
+        }
+        // The cycle's suspension fact rides the plan input
+        // to the record (brief section 8.1).
+        input.root_follow_suspended = teleport_suspended;
+        // And the cycle inputs: the composition and the
+        // root step read the same fact for the fall-through
+        // (suspension withholds the write and the standing
+        // suppression, never the lean).
+        fix3_inputs.root_follow_suspended = teleport_suspended;
+    }
+    const bool standing_entry =
+        avatar_state == FSVRAvatarPostureState::STANDING &&
+        avatar_state_prev != FSVRAvatarPostureState::STANDING;
+
+    LLVector3 root_move_delta = LLVector3::zero;
+    bool root_wrote = false;
+    // The one root-write eligibility decision, computed
+    // once at function scope: the anchor block consumes
+    // it to write, and the in-world indicator derives its
+    // ROOT line from it [FIX3-R5-CODE-R2-03] -- the
+    // indicator never reconstructs its own version.
+    const bool root_move_eligible =
+        session_view.established &&
+        snapshot.stage2_constraint_authorized &&
+        input.spine_sample_valid &&
+        input.head_position_enabled &&
+        input.spine_decisions_runtime_effective &&
+        input.cycle == FSVRAdapterCycleKind::NORMAL &&
+        !teleport_suspended &&
+        snapshot.teleport_detector_proven;
+    {
+        static bool s_root_anchor_valid = false;
+        static U32 s_root_anchor_generation = 0;
+        static LLVector3 s_root_anchor_agent = LLVector3::zero;
+        if (!session_view.established || home_base_invalid ||
+            standing_entry)
+        {
+            // The invalidation record (plan P5): only a
+            // base that existed can be invalidated, and the
+            // reason rides with it -- a session loss, a
+            // teleport, or the avatar sitting down. A
+            // standing entry is a refresh, not an
+            // invalidation: its record is the establishment
+            // that follows.
+            if (s_root_anchor_valid)
+            {
+                const char* reason =
+                    !session_view.established ? "session"
+                                              : home_base_invalid_reason;
+                if (reason)
+                {
+                    FSVRBoneLog::eventHomeBaseInvalidated(reason);
+                }
+            }
+            s_root_anchor_valid = false;
+        }
+        if (root_move_eligible)
+        {
+            const FSVRStandingRootStep root_step =
+                fsvrComputeStandingRootStep(
+                    session_view, hmd_position_local,
+                    session_view.anchor_forward_yaw_rad,
+                    root_joint ? root_joint->getWorldRotation()
+                               : LLQuaternion(),
+                    fix3_inputs);
+            if (root_step.offset_valid)
+            {
+                if (!root_step.live)
+                {
+                    // [FIX3-CODE-R3] The boundary policy
+                    // is not in force (the bound is absent
+                    // or invalid): the offset was computed
+                    // and will be recorded by the
+                    // composition below, but the agent
+                    // write does not happen -- root-follow
+                    // never runs unbounded. Announce the
+                    // gate and its cause once per
+                    // establishment (edge-latched on the
+                    // install generation, in the
+                    // scale-parameter events' idiom): a
+                    // gate that fires every frame is a
+                    // silent gate. Nothing is applied, so
+                    // root_move_delta stays zero, the
+                    // transaction composes over the
+                    // unmoved frame, and the composition
+                    // keeps the shipped lean behaviour for
+                    // the standing user [FIX3-CODE-R2-01]
+                    // -- the gate is distinguishable in
+                    // the record by these two events, the
+                    // recorded offset, and the preserved
+                    // lean target alike.
+                    static bool s_root_gated_announced = false;
+                    static U32 s_root_gated_generation = 0;
+                    if (!s_root_gated_announced ||
+                        s_root_gated_generation !=
+                            session_view.install_generation)
+                    {
+                        FSVRBoneLog::eventRootFollowGated();
+                        FSVRBoneLog::eventRootFollowBoundInvalid();
+                        s_root_gated_announced = true;
+                        s_root_gated_generation =
+                            session_view.install_generation;
+                    }
+                }
+                else
+                {
+                    if (!s_root_anchor_valid ||
+                        s_root_anchor_generation !=
+                            session_view.install_generation)
+                    {
+                        s_root_anchor_agent =
+                            gAgent.getPositionAgent();
+                        s_root_anchor_generation =
+                            session_view.install_generation;
+                        s_root_anchor_valid = true;
+                        // The establishment record (plan
+                        // P5): a home base now exists, from
+                        // the agent's position at this
+                        // moment, under this generation.
+                        FSVRBoneLog::eventHomeBaseEstablished(
+                            s_root_anchor_generation);
+                    }
+                    const LLVector3 before =
+                        gAgent.getPositionAgent();
+                    const LLVector3 target =
+                        s_root_anchor_agent + root_step.root_offset;
+                    // The offset is finite by the step's own
+                    // guard, and the anchor is the agent's own
+                    // read: setPositionAgent's finite contract
+                    // is honoured.
+                    if (!(target == before))
+                    {
+                        gAgent.setPositionAgent(target);
+                        // The watch's expectation updates
+                        // atomically with the write (plan P3
+                        // contract point 2), so the adapter's
+                        // own movement never trips it.
+                        s_teleport_watch.noteWrite(target);
+                        root_wrote = true;
+                    }
+                    root_move_delta = target - before;
+                }
+            }
+        }
+        // The cycle's home-base facts ride the plan input
+        // to the record (brief section 8.1), read from the
+        // anchor store at the end of its own block.
+        input.home_base_valid = s_root_anchor_valid;
+        input.home_base_generation = s_root_anchor_generation;
+    }
+
+    // The watch's no-write bookkeeping (plan P3 contract
+    // point 1): a cycle that wrote nothing leaves the
+    // expectation at the position sampled at its end, so
+    // ordinary movement through unwritten cycles never
+    // accumulates into a false discontinuity.
+    if (!root_wrote && session_view.established)
+    {
+        s_teleport_watch.noteNoWrite(gAgent.getPositionAgent());
+    }
+
+    // The detector-unproven announcement [FIX3-R5-CODE-02]:
+    // standing in an established session while the
+    // detector's bands are unmeasured means root-follow is
+    // off for a reason the user must be able to see --
+    // recorded and announced once per install generation,
+    // never silently degraded (Leah's no-silent-fallbacks
+    // rule).
+    {
+        static U32 s_detector_unproven_announced_gen = 0;
+        if (session_view.established &&
+            avatar_state == FSVRAvatarPostureState::STANDING &&
+            !snapshot.teleport_detector_proven &&
+            s_detector_unproven_announced_gen !=
+                session_view.install_generation)
+        {
+            s_detector_unproven_announced_gen =
+                session_view.install_generation;
+            FSVRBoneLog::eventRootFollowDetectorUnproven();
+            FSCommon::report_to_nearby_chat(
+                "VR: root follow off -- teleport safety "
+                "check not proven yet");
+        }
+    }
+
+    // The persistent in-world indicator (brief section
+    // 8.2; [FIX3-R5-CODE-04]): three lines above the
+    // avatar, formatted purely from the facts this cycle
+    // consumed (fsvrFormatIndicatorLines) -- the
+    // indicator infers nothing itself. Present only
+    // inside an established session and only while its
+    // toggle is on; the text is rewritten only when it
+    // changes, the position follows the avatar.
+    {
+        static LLPointer<LLHUDNameTag> s_indicator_tag;
+        static std::string s_indicator_text;
+        const bool indicator_wanted =
+            session_view.established &&
+            snapshot.show_posture_indicator &&
+            gAgentAvatarp.notNull();
+        if (indicator_wanted)
+        {
+            FSVRIndicatorFacts facts;
+            facts.avatar_state = avatar_state;
+            facts.behaviour = input.posture_behaviour;
+            facts.session_established = true;
+            facts.root_follow_suspended = teleport_suspended;
+            facts.detector_proven =
+                snapshot.teleport_detector_proven;
+            facts.head_position_on = input.head_position_enabled;
+            facts.root_follow_bound_valid =
+                snapshot.root_follow_bound_valid;
+            // Derived from the production decision itself
+            // [FIX3-R5-CODE-R2-03]: the same eligibility
+            // conjunction the anchor block writes under,
+            // plus the home base those writes consume.
+            facts.root_writes_eligible =
+                root_move_eligible && input.home_base_valid;
+            const FSVRIndicatorLines lines =
+                fsvrFormatIndicatorLines(facts);
+            const std::string text = lines.avatar_line + "\n" +
+                lines.behaviour_line + "\n" + lines.root_line;
+            if (s_indicator_tag.isNull())
+            {
+                s_indicator_tag = static_cast<LLHUDNameTag*>(
+                    LLHUDObject::addHUDObject(
+                        LLHUDObject::LL_HUD_NAME_TAG));
+                s_indicator_tag->setSourceObject(gAgentAvatarp);
+                s_indicator_tag->setDoFade(false);
+                s_indicator_tag->setZCompare(false);
+                s_indicator_tag->setMaxLines(3);
+                s_indicator_text.clear();
+            }
+            if (text != s_indicator_text)
+            {
+                s_indicator_text = text;
+                s_indicator_tag->clearString();
+                s_indicator_tag->addLine(lines.avatar_line,
+                                         LLColor4::white);
+                s_indicator_tag->addLine(lines.behaviour_line,
+                                         LLColor4::white);
+                s_indicator_tag->addLine(lines.root_line,
+                                         LLColor4::white);
+            }
+            s_indicator_tag->setPositionAgent(
+                gAgentAvatarp->getWorldPosition() +
+                LLVector3(0.f, 0.f, 2.2f));
+        }
+        else if (s_indicator_tag.notNull())
+        {
+            s_indicator_tag->markDead();
+            s_indicator_tag = nullptr;
+            s_indicator_text.clear();
+        }
+    }
+
+    // The transaction root frame is the pelvis world. These are
+    // the joint's cached world values at apply time; solver target
+    // worlds are expressed in this same frame, which is the frame
+    // the coordinator/solver side works in. (Freshness of the root
+    // frame itself is a C6/C7 integration property; Package A
+    // produces no writes regardless. The pre-runtime-enable
+    // verification obligation for this frame is recorded at
+    // FSVRAdapterPlanInput::root_world_rotation in the header.)
+    // P2-07B Fix 3 (brief section 2.2 item 4): the cached
+    // values predate this cycle's root application (the
+    // skeleton has not yet composed over the moved agent),
+    // so the frame the transaction composes over is the
+    // moved frame explicitly -- cached position plus the
+    // applied delta. Base composition, targets, solver and
+    // camera then all read the one moved root frame in the
+    // one pose transaction (OQ-4's condition A).
+    if (root_joint)
+    {
+        input.root_world_rotation = root_joint->getWorldRotation();
+        input.root_world_position = root_joint->getWorldPosition();
+    }
+    input.root_world_position += root_move_delta;
+
+    // P2-07B C6-E (CP-4): the per-cycle head-target block.
+    // Composition is gated on the E5-E9 conjunction only
+    // (DP-C6E-8): the block is composed whenever the
+    // conjunction holds, whether or not gates 1-4 will pass
+    // this cycle -- the transaction's gates decide use;
+    // validity describes the inputs. It rides the root
+    // frame populated immediately above, so displacement
+    // and neutral are never composed against different
+    // poses. head_target_valid is assigned every cycle,
+    // never latched: a lapsed cycle leaves it false and the
+    // target fields at their defaults, unread (solveSpine
+    // guards on the flag). The wrist block is written false
+    // explicitly, every cycle (section 7.4).
+    // P2-07B Fix 3: the composition runs with the cycle's
+    // Fix 3 fact set, and the plan input carries its
+    // determinations (the behaviour, set above from the
+    // same pure function, and the computed root offset)
+    // to the result for the record. fix3_result keeps its
+    // defaults when the conjunction short-circuits the
+    // composition, so the offset fields below are assigned
+    // unconditionally and never latched.
+    FSVRFix3CompositionResult fix3_result;
+    input.head_target_valid =
+        input.spine_sample_valid &&
+        composeHeadTargetBlock(session_view, hmd_position_local,
+                               session_view.anchor_forward_yaw_rad,
+                               input.root_world_rotation,
+                               input.root_world_position,
+                               snapshot.diag_force_unit_scale,
+                               snapshot.lean_gain,
+                               input.head_target_world,
+                               input.cornea_offset_head_local,
+                               &fix3_inputs, &fix3_result);
+    input.root_offset_present = fix3_result.root_offset_valid;
+    input.root_offset = fix3_result.root_offset;
+    input.wrist_target_valid[0] = false;
+    input.wrist_target_valid[1] = false;
+
+    // P2-07B Fix 3 (brief section 2.4): the
+    // scale_parameter_invalid events, edge-latched per
+    // parameter -- an invalid value announces itself once
+    // when it takes effect, not once per cycle (an alarm
+    // that fires every frame is a silent alarm).
+    // [FIX3-CODE-R1-04] The typed standing eye height is
+    // deliberately NOT an event source here: neither
+    // channel's factor consumes the value while OQ-7's
+    // usable-length references are unresolved, so its
+    // invalidity is not a channel failure and is
+    // reported against no channel. The snapshot keeps
+    // carrying the typed value and its validity state;
+    // if a future validated factor consumes it, that
+    // factor's channel takes the fail-closed behaviour
+    // (and this block its event) then.
+    {
+        static bool s_lean_gain_bad = false;
+        static bool s_root_gain_bad = false;
+        static bool s_lean_channel_bad = false;
+        static bool s_root_channel_bad = false;
+        if (!snapshot.lean_gain_valid && !s_lean_gain_bad)
+        {
+            FSVRBoneLog::eventScaleParameterInvalid("lean");
+        }
+        s_lean_gain_bad = !snapshot.lean_gain_valid;
+        if (!snapshot.root_gain_valid && !s_root_gain_bad)
+        {
+            FSVRBoneLog::eventScaleParameterInvalid("root");
+        }
+        s_root_gain_bad = !snapshot.root_gain_valid;
+        if (fix3_result.lean_scale_invalid && !s_lean_channel_bad)
+        {
+            FSVRBoneLog::eventScaleParameterInvalid("lean");
+        }
+        s_lean_channel_bad = fix3_result.lean_scale_invalid;
+        if (fix3_result.root_scale_invalid && !s_root_channel_bad)
+        {
+            FSVRBoneLog::eventScaleParameterInvalid("root");
+        }
+        s_root_channel_bad = fix3_result.root_scale_invalid;
+    }
+
+    // One apply-once instance and the solvers for the process
+    // (the self avatar is unique). C6/C7 (CP-7): the real
+    // solvers sit in the slots -- C6 in the spine slot, C7 in
+    // the write-through slot with its mandatory post-clamp; the
+    // plain target-world arm slot stays the null solver (with a
+    // write-through solver supplied it is never invoked).
+    static FSVRAdapterApplyOnce s_apply_once;
+    static FSVRSpineSolver s_spine_solver;
+    static FSVRAdapterNullArmSolver s_plain_arm_solver;
+    static FSVRArmSolver s_arm_solver;
+    static FSVRArmPostClamp s_arm_post_clamp;
+
+    // Continuity bookkeeping (CP-7/DP-4): the glue owns the
+    // cross-cycle history the pure plan cannot hold -- the last
+    // committed target map and, per side, the adopted pole --
+    // each stamped with the frame token and settings generation
+    // it was produced under. The solvers stay pure: history
+    // reaches them only as plan inputs.
+    static std::map<S32, LLQuaternion> s_previous_targets;
+    static bool s_have_previous = false;
+    static U64 s_previous_token = 0;
+    static U64 s_previous_settings_generation = 0;
+    // P2-07B C8 (CP-3): the continuity epoch the previous
+    // apply's inputs were stamped with, refreshed on the
+    // same paths that refresh the token/generation stamps.
+    static U64 s_previous_continuity_epoch = 0;
+    // P2-07B Stage 1 (CP-S1-2, S1-BRIEF-R1-01): the session
+    // view's installation generation the stored history was
+    // produced under, refreshed on the same paths. A
+    // resync advances the view's generation, the predicate
+    // below sees the mismatch, and history earned under the
+    // old anchor retires before the next solve.
+    static U64 s_previous_install_generation = 0;
+    static bool s_pole_valid[2] = {false, false};
+    static LLVector3 s_pole_world[2] = {LLVector3::zero,
+                                        LLVector3::zero};
+
+    // Retirement is evaluated before each apply, whether or not
+    // a side will be invoked: history carries only when the
+    // previous apply's token is the immediate predecessor (a gap
+    // is a tracking loss, an authority lapse, or a
+    // non-invocation) and the settings generation is unchanged.
+    // Anything else retires BOTH histories entire here, at the
+    // glue, with no invocation [R2 -- C6C7-CODE-03: retirement
+    // is applied BEFORE the transaction, separate from the
+    // aborted-side preservation on the success path below --
+    // previously the stored target map survived a discontinuity
+    // and the success path rebuilt from it, resurrecting stale
+    // membership with non-solved poses].
+    // P2-07B C8 (CP-3): the predicate itself is
+    // FSVRAdapterApply::continuityCarries (plan TU, H8-
+    // fixtured); the epoch term retires both histories here
+    // when a LOCAL transition or a skeleton reinit landed
+    // between the two applies -- events that produce neither
+    // a token gap nor a settings-generation change.
+    const bool continuity_carries = FSVRAdapterApply::continuityCarries(
+        s_have_previous, input.frame_token, s_previous_token,
+        input.settings_generation, s_previous_settings_generation,
+        input.continuity_epoch, s_previous_continuity_epoch,
+        session_view.install_generation, s_previous_install_generation);
+    if (!continuity_carries)
+    {
+        s_previous_targets.clear();
+        s_pole_valid[0] = false;
+        s_pole_valid[1] = false;
+    }
+    // Per-side retirement [R2 -- C6C7-CODE-03]: a side that
+    // loses its authority this cycle -- no wrist target, or the
+    // arm authority off -- retires its pole and its share of
+    // the target map here, even when the other side stays
+    // active and the cycle's continuity as a whole carries; a
+    // dead side's pole no longer persists indefinitely beside
+    // a live one. (Package A production never populates wrist
+    // targets, so this is inert until Packages B/C supply
+    // them.)
+    {
+        const bool arm_authority =
+            input.hand_position_enabled && input.arm_sample_valid;
+        const FSVRAdapterDomain side_domains[2] = {
+            FSVRAdapterDomain::ARM_LEFT, FSVRAdapterDomain::ARM_RIGHT};
+        for (S32 s = 0; s < 2; ++s)
+        {
+            if (arm_authority && input.wrist_target_valid[s])
+            {
+                continue;
+            }
+            s_pole_valid[s] = false;
+            for (auto it = s_previous_targets.begin();
+                 it != s_previous_targets.end();)
+            {
+                if (it->first >= 0 &&
+                    it->first < static_cast<S32>(input.joints.size()) &&
+                    input.joints[it->first].domain == side_domains[s])
+                {
+                    it = s_previous_targets.erase(it);
+                }
+                else
+                {
+                    ++it;
+                }
+            }
+        }
+    }
+    if (continuity_carries)
+    {
+        input.previous_targets = s_previous_targets;
+        for (S32 s = 0; s < 2; ++s)
+        {
+            if (s_pole_valid[s])
+            {
+                input.previous_pole_valid[s] = true;
+                input.previous_pole_world[s] = s_pole_world[s];
+            }
+        }
+    }
+
+    const FSVRAdapterPlanResult result = s_apply_once.apply(
+        input, s_spine_solver, s_plain_arm_solver, &s_arm_solver,
+        &s_arm_post_clamp);
+
+    if (result.first_failing_gate == FSVRAdapterGate::TOKEN)
+    {
+        // A duplicate token: the apply did not happen; the
+        // bookkeeping stands exactly as it was.
+    }
+    else if (result.first_failing_gate == FSVRAdapterGate::NONE)
+    {
+        // Store the committed-domain target worlds as the new
+        // history, and adopt each side's pole only where the
+        // side's outcome carries one: by construction that means
+        // the side ran, was not aborted, its post-clamp ran, and
+        // its result was committed. An aborted or discarded side
+        // updates no history: neither its pole state nor its
+        // share of previous_targets changes on account of this
+        // call ([R2] lifecycle), so the new map starts from the
+        // (post-retirement) stored one and refreshes ONLY the
+        // joints this cycle actually committed [R2 --
+        // C6C7-CODE-03: entries for joints not written this
+        // cycle keep their stored values -- refreshing them
+        // from the resolved pose would replace a solved history
+        // with the joint's base composition, a non-solved pose].
+        std::map<S32, LLQuaternion> new_targets = s_previous_targets;
+        auto side_aborted = [&](FSVRAdapterDomain domain) {
+            if (domain == FSVRAdapterDomain::ARM_LEFT)
+            {
+                return result.arm_outcome_left.write_through_aborted;
+            }
+            if (domain == FSVRAdapterDomain::ARM_RIGHT)
+            {
+                return result.arm_outcome_right.write_through_aborted;
+            }
+            return false;
+        };
+        auto refresh = [&](S32 joint_index) {
+            if (joint_index >= 0 &&
+                joint_index <
+                    static_cast<S32>(
+                        result.resolved_world_rotations.size()) &&
+                !side_aborted(input.joints[joint_index].domain))
+            {
+                new_targets[joint_index] =
+                    result.resolved_world_rotations[joint_index];
+            }
+        };
+        for (const FSVRAdapterWrite& write : result.writes)
+        {
+            refresh(write.joint_index);
+        }
+        s_previous_targets = new_targets;
+        s_previous_token = input.frame_token;
+        s_previous_settings_generation = input.settings_generation;
+        s_previous_continuity_epoch = input.continuity_epoch;
+        s_previous_install_generation = session_view.install_generation;
+        s_have_previous = true;
+        if (result.arm_outcome_left.pole_valid)
+        {
+            s_pole_valid[0] = true;
+            s_pole_world[0] = result.arm_outcome_left.pole_world;
+        }
+        if (result.arm_outcome_right.pole_valid)
+        {
+            s_pole_valid[1] = true;
+            s_pole_world[1] = result.arm_outcome_right.pole_world;
+        }
+    }
+    else
+    {
+        // A pre-solver gate failed: no solver ran, so the stored
+        // targets are stale and both poles retire (the sides'
+        // authority lapsed this cycle). The token stamp still
+        // advances, so the next cycle's contiguity is judged
+        // against this apply and finds an empty map.
+        s_previous_targets.clear();
+        s_previous_token = input.frame_token;
+        s_previous_settings_generation = input.settings_generation;
+        s_previous_continuity_epoch = input.continuity_epoch;
+        s_previous_install_generation = session_view.install_generation;
+        s_have_previous = true;
+        s_pole_valid[0] = false;
+        s_pole_valid[1] = false;
+    }
+
+    // The committed writes: C1 is the sole owner of the final
+    // committed output. Locals only, via setRotation -- never
+    // setWorldRotation (brief section 2.6).
+    for (const FSVRAdapterWrite& write : result.writes)
+    {
+        if (write.joint_index >= 0 &&
+            write.joint_index < static_cast<S32>(ordered.size()))
+        {
+            ordered[write.joint_index]->setRotation(write.local);
+        }
+    }
+
+    // P2-07B Fix 4 (CP-F4-2): the writes are on the
+    // skeleton now; refresh the provenance store's commit
+    // and lineage state for exactly the writes applied
+    // (the result's write list verbatim -- gate-failed,
+    // token-suppressed and refused results carry empty
+    // write lists and refresh nothing, and a hold cycle's
+    // identity writes DO refresh, as section 2.5 rules).
+    FSVRAdapterApply::provenanceCommitWrites(
+        s_provenance, input.joints, result.writes);
+
+    // P2-07B C5 (CP-4 item 4): the post-apply step hook. The
+    // transaction and session machines advance on this
+    // cycle's plan input and plan result plus the shell's
+    // fresh reads (manager samples, avatar signals, eye
+    // state, read at step time, once, inside the module's
+    // shell). When neither machine has work the hook is two
+    // flag reads.
+    FSVRCalibration::stepFromAdapterCycle(character, input, result);
+
+    // P2-07B DIAG-1 (brief section 3 item 3): assemble the
+    // recorder's headrot + blend inputs for this cycle.
+    // Both arrive through the character's animation-data
+    // slots (D-2 R-a publication; the motion controller's
+    // blend-record publication) and are consumed under the
+    // cycle-validity contract: current generation only, per
+    // publishing instance. The identity comparison --
+    // consumed slot pointers vs the capture's published
+    // state identities -- is performed here, on stamped
+    // COPIES of the blend entries; the raw pointers are
+    // consumed here and passed no further (only the
+    // semantic source marker reaches the recorder). No
+    // identity, no attribution: without a valid
+    // current-cycle capture the stamp identity is null and
+    // no slot is marked. All of it is skipped when the
+    // recorder is disabled.
+    const FSVRHeadRotCapture* diag_capture = nullptr;
+    FSVRBoneLogHeadRotSample diag_headrot;
+    FSVRBoneLogBlendSample diag_blend;
+    bool diag_have_headrot = false;
+    bool diag_have_blend = false;
+    if (FSVRBoneLog::enabled())
+    {
+        if (s_diag_consumer_character != character)
+        {
+            s_diag_consumer_character = character;
+            s_diag_headrot_consumer = FSVRHeadRotConsumer();
+            s_diag_blend_consumer = FSVRBlendObsConsumer();
+        }
+        const FSVRHeadRotCapture* published_capture =
+            static_cast<const FSVRHeadRotCapture*>(
+                character->getAnimationData("FSVRHeadRotCapture"));
+        diag_capture =
+            s_diag_headrot_consumer.accept(published_capture);
+        if (diag_capture)
+        {
+            diag_headrot.neck_state = diag_capture->neck_state;
+            diag_headrot.head_state = diag_capture->head_state;
+            diag_headrot.last_head_rot_before =
+                diag_capture->last_head_rot_before;
+            diag_headrot.last_head_rot_after =
+                diag_capture->last_head_rot_after;
+            diag_headrot.instant = diag_capture->instant;
+            diag_headrot.generation = diag_capture->generation;
+            diag_have_headrot = true;
+        }
+        FSVRBlendObsRecord* blend_record =
+            static_cast<FSVRBlendObsRecord*>(
+                character->getAnimationData("FSVRBlendObs"));
+        if (blend_record &&
+            s_diag_blend_consumer.consumePass(blend_record))
+        {
+            for (S32 which = 0; which < 2; ++which)
+            {
+                const FSVRBlendObsJoint* entry =
+                    s_diag_blend_consumer.entryFor(*blend_record,
+                                                   which);
+                if (!entry)
+                {
+                    continue;
+                }
+                FSVRBlendObsJoint stamped = *entry;
+                fsvrStampBlendObsSource(
+                    stamped,
+                    which == 0
+                        ? (diag_capture
+                               ? diag_capture->neck_state_id
+                               : nullptr)
+                        : (diag_capture
+                               ? diag_capture->head_state_id
+                               : nullptr));
+                // CODE-R1-01 (brief section 2.5):
+                // independent consistency validation of
+                // the identity-attributed slots against
+                // this cycle's published ask and the
+                // motion's effective mode captured at
+                // publication. A mismatch flags the
+                // entry's record-integrity failure in the
+                // record; the identity attribution stands,
+                // no slot is re-matched by value, and
+                // nothing is written back.
+                if (diag_capture)
+                {
+                    fsvrValidateBlendObsSource(
+                        stamped,
+                        which == 0
+                            ? diag_capture->neck_state
+                            : diag_capture->head_state,
+                        diag_capture->priority,
+                        diag_capture->additive);
+                }
+                if (which == 0)
+                {
+                    diag_blend.neck_present = true;
+                    convertBlendJoint(stamped, diag_blend.neck);
+                }
+                else
+                {
+                    diag_blend.head_present = true;
+                    convertBlendJoint(stamped, diag_blend.head);
+                }
+                diag_have_blend = true;
+            }
+        }
+    }
+
+    // P2-07B feel-regrounding diagnostic: the per-cycle
+    // motion sample (FS_VR_BONELOG). Taken here, at the
+    // tail, so the skeleton the recorder reads carries
+    // this cycle's committed writes and the step hook --
+    // including any sync it executed -- has already run.
+    // Observation-only: the recorder early-outs on its
+    // cached env bool when disabled and writes nothing
+    // back, ever.
+    FSVRBoneLog::sampleCycle(
+        character, input, result,
+        hmd_position_read, hmd_position_local,
+        diag_have_headrot ? &diag_headrot : nullptr,
+        diag_have_blend ? &diag_blend : nullptr);
+}
+
+#endif // FSVR_ADAPTER_PLAN_ONLY

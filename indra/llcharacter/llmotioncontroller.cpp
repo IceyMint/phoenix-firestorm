@@ -903,6 +903,34 @@ void LLMotionController::updateMotions(bool force_update)
         else
         {
             mPoseBlender.blendAndApply();
+
+            // P2-07B DIAG-1 (brief section 3 item 6):
+            // publish the blend observation record's
+            // pointer into the character's animation-data
+            // slot, on this same non-quantum pass, before
+            // the adapter apply below reads it through the
+            // glue. One-time slot store; the record itself
+            // is the pose blender's member. No change to
+            // update ordering or to the quantum branch.
+            if (mCharacter && !mDiagBlendObsPublished)
+            {
+                mCharacter->setAnimationData(
+                    "FSVRBlendObs",
+                    &mPoseBlender.blendObsRecord());
+                mDiagBlendObsPublished = true;
+            }
+
+            // P2-07B C1: Stage-2 adapter apply point (spec
+            // section 1/C1, amended G1). Placement inside this
+            // branch is the structural gate: the paused branch
+            // above, the hidden path, and the same-quantum early
+            // return never reach here. No-op unless the character
+            // is the self avatar (applyVRAdapterPostBlend is
+            // overridden only by LLVOAvatarSelf).
+            if (mCharacter)
+            {
+                mCharacter->applyVRAdapterPostBlend();
+            }
         }
     }
 

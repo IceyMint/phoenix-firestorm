@@ -1,3 +1,18 @@
+#ifdef FSVR_C2_POSITION_ONLY
+// P2-07B C2 (brief CP-2): standalone H2 harness build. Only the
+// pure position-adoption helper further down is compiled;
+// everything else in this file is viewer/OpenXR-coupled and
+// excluded by the matching guards.
+#include "v3math.h"
+#ifdef FSVR_C3_HAND_ONLY
+// P2-07B C3: the H3 harness build additionally compiles the
+// pure hand-adoption helper region (which carries quaternions).
+#include "llquaternion.h"
+#endif
+
+#include <cmath>
+#include <cstdint>
+#else
 #include "llviewerprecompiledheaders.h"
 
 #include "llopenxrmanager.h"
@@ -41,8 +56,10 @@
 #include <sstream>
 #include <string>
 #include <vector>
-#endif
+#endif // LL_LINUX && LL_X11
+#endif // !FSVR_C2_POSITION_ONLY
 
+#ifndef FSVR_C2_POSITION_ONLY
 namespace
 {
 constexpr const char* OPENXR_MONO_ENV = "FS_OPENXR_MONO";
@@ -210,6 +227,280 @@ bool xr_diag_frame_loop_is_legacy()
     // cadence lock may engage.
     return !LLOpenXRManager::instance().isPacedFrameLoopSelected();
 }
+
+#endif // FSVR_C2_POSITION_ONLY
+
+#ifdef FSVR_C2_POSITION_ONLY
+namespace
+{
+#endif
+
+// P2-07B C2 (brief CP-2): the pure HMD-position adoption decision.
+// This file cannot link into the offline H2 harness, so the
+// adoption DECISION -- which position, what usability, what
+// stamp -- lives in this small pure function over plain values,
+// in the factoring style C1 set for
+// FSVRAdapterApply::computePlan; adopt_located_views() further
+// down is a thin caller that feeds it the located views and
+// stores its result in the impl (CP-3). The standalone harness
+// compiles ONLY this region of the file (FSVR_C2_POSITION_ONLY);
+// it sits in the file-scope anonymous namespace, ahead of the
+// OpenXR-coupled regions, so the guard regions stay balanced.
+struct FSVRHmdPositionAdoption
+{
+    // DP-1 fusion of the usable views' positions: the mean (the
+    // cyclopean midpoint); with exactly one usable view, that
+    // view's position as-is. Zero when no view's position was
+    // usable, so no fused value is ever published as usable.
+    LLVector3 position = LLVector3::zero;
+    // CP-2 [R1]/[R2]: at least one view supplied a usable
+    // (all-coordinates-finite) position. The caller stores this
+    // in adopted_position_valid; it is the PositionUsable term
+    // of the three-term validity predicate (CP-1 [R2]).
+    bool position_usable = false;
+    // The sample's position-tracked bit, carried through
+    // unchanged (the caller extracts it from the view-state
+    // flags; the extraction stays with the OpenXR-coupled code).
+    bool position_tracked = false;
+    // The stamp the stored state binds to (CP-3): the locate
+    // generation and predicted display time passed in, echoed
+    // back so the binding is part of the decision itself and
+    // the harness can check it.
+    unsigned long long locate_generation = 0;
+    long long predicted_display_time_ns = 0;
+};
+
+FSVRHmdPositionAdoption decide_hmd_position_adoption(
+    const LLVector3* view_positions,
+    uint32_t view_count,
+    bool position_tracked,
+    unsigned long long locate_generation,
+    long long predicted_display_time_ns)
+{
+    FSVRHmdPositionAdoption result;
+    result.position_tracked = position_tracked;
+    result.locate_generation = locate_generation;
+    result.predicted_display_time_ns = predicted_display_time_ns;
+
+    // CP-2 [R1]: position usability is decided per view,
+    // independently of orientation usability -- the orientation
+    // accumulation's view count is a caller-supplied extent, not
+    // a per-view position predicate, and is never consulted
+    // here. A view's position is usable only if all three
+    // coordinates are finite (NaN / +-inf rejected); only usable
+    // positions enter the DP-1 fusion.
+    LLVector3 accumulated = LLVector3::zero;
+    uint32_t usable_positions = 0;
+    for (uint32_t i = 0; i < view_count; ++i)
+    {
+        const LLVector3& view_position = view_positions[i];
+        if (std::isfinite(view_position.mV[0]) &&
+            std::isfinite(view_position.mV[1]) &&
+            std::isfinite(view_position.mV[2]))
+        {
+            accumulated += view_position;
+            ++usable_positions;
+        }
+    }
+    if (usable_positions > 0)
+    {
+        const F32 count = static_cast<F32>(usable_positions);
+        result.position.set(accumulated.mV[0] / count,
+                            accumulated.mV[1] / count,
+                            accumulated.mV[2] / count);
+        result.position_usable = true;
+    }
+    return result;
+}
+
+// CP-1 [R2]: the complete position-validity predicate, shared by
+// the CP-5 accessor and the CP-6 eye-frame decision below so the
+// two can never drift apart. PositionValid = SampleValid &&
+// PositionUsable && PositionTracked (spec section 5: a
+// valid-but-inferred position is unusable).
+bool hmd_position_publishable(bool sample_valid,
+                              bool position_usable,
+                              bool position_tracked)
+{
+    return sample_valid && position_usable && position_tracked;
+}
+
+// CP-6: the eye-frame freeze's position decision. The adopted
+// sample is accepted only when its locate generation IS the
+// frame's locate generation -- the same discipline the freeze
+// applies to the FOV sample. On any mismatch (or a zero frame
+// generation, which names no locate) the frame publishes
+// invalid and NO position: never a position from a different
+// locate.
+struct FSVREyeFramePosition
+{
+    LLVector3 position = LLVector3::zero;
+    bool valid = false;
+};
+
+FSVREyeFramePosition decide_eye_frame_position(
+    bool sample_valid,
+    bool position_usable,
+    bool position_tracked,
+    unsigned long long adopted_locate_generation,
+    unsigned long long frame_locate_generation,
+    const LLVector3& adopted_position)
+{
+    FSVREyeFramePosition result;
+    if (frame_locate_generation != 0 &&
+        adopted_locate_generation == frame_locate_generation &&
+        hmd_position_publishable(sample_valid, position_usable, position_tracked))
+    {
+        result.position = adopted_position;
+        result.valid = true;
+    }
+    return result;
+}
+
+#if !defined(FSVR_C2_POSITION_ONLY) || defined(FSVR_C3_HAND_ONLY)
+// ---------------------------------------------------------------------------
+// P2-07B C3 (brief CP-3): the pure hand-adoption decision, in the
+// C2 mould. decide_hand_adoption() takes one hand's located joint
+// set as plain values (viewer math types + raw location-flag
+// words; no OpenXR types) and decides what adoption stores: the
+// joint set verbatim, the hand-active flag, and the wrist
+// POSITION channel's usability (hand_usable). The caller
+// (locate_and_adopt_hands, OpenXR-coupled, further down) converts
+// the runtime's XrHandJointLocationEXT set into these plain
+// values and stores the result verbatim -- the AMEND-02 lesson
+// from C2: a usability outcome decided inside a helper cannot be
+// reconstructed from sample-level flags.
+//
+// The location-flag bit values mirror XrSpaceLocationFlags
+// (openxr.h) because the offline H3 harness compiles this region
+// without OpenXR headers; the caller glue static_asserts the
+// mirror against the real constants in the viewer build.
+// ---------------------------------------------------------------------------
+constexpr U32 FSVR_HAND_LOCATION_ORIENTATION_VALID_BIT = 0x00000001;
+constexpr U32 FSVR_HAND_LOCATION_POSITION_VALID_BIT = 0x00000002;
+constexpr U32 FSVR_HAND_LOCATION_ORIENTATION_TRACKED_BIT = 0x00000004;
+constexpr U32 FSVR_HAND_LOCATION_POSITION_TRACKED_BIT = 0x00000008;
+// XR_HAND_JOINT_WRIST_EXT (openxr.h: the joint the wrist
+// predicates read; PALM is 0) and XR_HAND_JOINT_COUNT_EXT.
+constexpr uint32_t FSVR_HAND_JOINT_WRIST_INDEX = 1;
+constexpr uint32_t FSVR_HAND_JOINT_COUNT = 26;
+
+struct FSVRHandJointSample
+{
+    LLVector3 position = LLVector3::zero;
+    LLQuaternion orientation;
+    U32 location_flags = 0;
+};
+
+// Per-joint, per-channel usability (brief section 2.5): a
+// joint's position is usable only while its own POSITION_VALID
+// and POSITION_TRACKED bits are both set and its coordinates are
+// finite; orientation likewise with its own two bits and a
+// finite quaternion. The channels are independent by
+// construction (spec section 6.2, mixed sourcing).
+bool hand_joint_position_usable(U32 location_flags, const LLVector3& position)
+{
+    return (location_flags & FSVR_HAND_LOCATION_POSITION_VALID_BIT) != 0 &&
+           (location_flags & FSVR_HAND_LOCATION_POSITION_TRACKED_BIT) != 0 &&
+           std::isfinite(position.mV[0]) &&
+           std::isfinite(position.mV[1]) &&
+           std::isfinite(position.mV[2]);
+}
+
+bool hand_joint_orientation_usable(U32 location_flags, const LLQuaternion& orientation)
+{
+    return (location_flags & FSVR_HAND_LOCATION_ORIENTATION_VALID_BIT) != 0 &&
+           (location_flags & FSVR_HAND_LOCATION_ORIENTATION_TRACKED_BIT) != 0 &&
+           std::isfinite(orientation.mQ[0]) &&
+           std::isfinite(orientation.mQ[1]) &&
+           std::isfinite(orientation.mQ[2]) &&
+           std::isfinite(orientation.mQ[3]);
+}
+
+struct FSVRHandAdoption
+{
+    // The located joint set, carried verbatim (poses raw LOCAL,
+    // flags uninterpreted -- consumers derive per-joint validity
+    // from the flags, brief section 2.6).
+    FSVRHandJointSample joints[FSVR_HAND_JOINT_COUNT];
+    bool is_active = false;
+    // CP-3 [R1 -- C3-03]: the wrist POSITION channel's usability
+    // and nothing else: active && wrist position bits && finite
+    // wrist position. It must NEVER gate the orientation
+    // channel; orientation usability is
+    // hand_joint_orientation_usable over the wrist joint,
+    // computed wherever CP-4 defines it.
+    bool hand_usable = false;
+    // The stamp echoes (CP-3: hand state is stamped BY the HMD
+    // sample's generation/time -- one locate, one stamp).
+    unsigned long long locate_generation = 0;
+    long long predicted_display_time_ns = 0;
+};
+
+FSVRHandAdoption decide_hand_adoption(
+    const FSVRHandJointSample* joint_locations,
+    uint32_t joint_count,
+    bool is_active,
+    unsigned long long locate_generation,
+    long long predicted_display_time_ns)
+{
+    FSVRHandAdoption result;
+    result.is_active = is_active;
+    result.locate_generation = locate_generation;
+    result.predicted_display_time_ns = predicted_display_time_ns;
+    if (joint_locations)
+    {
+        const uint32_t copied = joint_count < FSVR_HAND_JOINT_COUNT
+                                    ? joint_count
+                                    : FSVR_HAND_JOINT_COUNT;
+        for (uint32_t j = 0; j < copied; ++j)
+        {
+            result.joints[j] = joint_locations[j];
+        }
+    }
+    if (is_active && joint_locations &&
+        joint_count > FSVR_HAND_JOINT_WRIST_INDEX)
+    {
+        const FSVRHandJointSample& wrist =
+            joint_locations[FSVR_HAND_JOINT_WRIST_INDEX];
+        result.hand_usable =
+            hand_joint_position_usable(wrist.location_flags, wrist.position);
+    }
+    return result;
+}
+
+// CP-4: the wrist publication predicates. These ARE the
+// arbitrator's per-channel predicates (CP-9 [R1] consumes
+// exactly these outcomes via CP-8's fields) -- no second
+// formulation of either channel's validity may appear
+// downstream. The position predicate re-derives the wrist bits
+// from the stored flags while the helper-decided usability
+// (stored as adopted_hand_valid) carries the finiteness term,
+// exactly C2's split.
+bool hand_wrist_position_publishable(bool sample_valid,
+                                     bool adopted_hand_valid,
+                                     U32 wrist_location_flags)
+{
+    return sample_valid && adopted_hand_valid &&
+           (wrist_location_flags & FSVR_HAND_LOCATION_POSITION_VALID_BIT) != 0 &&
+           (wrist_location_flags & FSVR_HAND_LOCATION_POSITION_TRACKED_BIT) != 0;
+}
+
+bool hand_wrist_orientation_publishable(bool sample_valid,
+                                        bool hand_active,
+                                        U32 wrist_location_flags,
+                                        const LLQuaternion& wrist_orientation)
+{
+    return sample_valid && hand_active &&
+           hand_joint_orientation_usable(wrist_location_flags, wrist_orientation);
+}
+#endif // !FSVR_C2_POSITION_ONLY || FSVR_C3_HAND_ONLY
+
+#ifdef FSVR_C2_POSITION_ONLY
+} // namespace
+#endif
+
+#ifndef FSVR_C2_POSITION_ONLY
 }
 
 /*static*/ bool LLOpenXRManager::coherentOpticsEnabled()
@@ -1140,6 +1431,56 @@ struct LLOpenXRManagerImpl
     long long adopted_sample_time_ns = 0;
     bool adopted_sample_orientation_tracked = false;
     bool adopted_sample_valid = false;
+    // P2-07B C2 (brief CP-1): the adopted HMD position of the SAME
+    // locate the stamp above names -- raw LOCAL components
+    // (OpenXR metres), the DP-1 fusion of the usable views as
+    // decided by the CP-2 helper. adopted_position_valid stores
+    // the helper's per-view usability outcome as state ([R2]: it
+    // is the PositionUsable term of PositionValid = SampleValid
+    // && PositionUsable && PositionTracked, which no sample-level
+    // flag can reconstruct); adopted_sample_position_tracked is
+    // the sample's POSITION_TRACKED bit. Every write that clears
+    // adopted_sample_valid also clears both flags and zeroes the
+    // position (CP-4 [R1][R2]), so no stale position can outlive
+    // its sample.
+    LLVector3 adopted_sample_position = LLVector3::zero;
+    bool adopted_sample_position_tracked = false;
+    bool adopted_position_valid = false;
+    // P2-07B C3 (brief CP-1/CP-2): hand-tracking capability
+    // state. hand_tracking_extension_present records CP-1's
+    // negotiation outcome; hand_tracking_system_supports is the
+    // DP-3 system-properties probe's veto term;
+    // hand_tracking_pfns_loaded records CP-2's entry-point load.
+    // hand_tracking_available stores the [R1 -- C3-A1] four-term
+    // conjunction (extension && PFNs && system supports && at
+    // least one tracker created); hand_tracker_created is
+    // per-hand (a hand whose creation failed is simply never
+    // located). Absence of any term never disables VR
+    // (fail-soft: section 2.1's VIEW precedent, NOT the OpenGL
+    // extension's fatal policy).
+    bool hand_tracking_extension_present = false;
+    bool hand_tracking_system_supports = false;
+    bool hand_tracking_pfns_loaded = false;
+    bool hand_tracking_available = false;
+    PFN_xrCreateHandTrackerEXT create_hand_tracker = nullptr;
+    PFN_xrDestroyHandTrackerEXT destroy_hand_tracker = nullptr;
+    PFN_xrLocateHandJointsEXT locate_hand_joints = nullptr;
+    XrHandTrackerEXT hand_trackers[2] = {XR_NULL_HANDLE, XR_NULL_HANDLE};
+    bool hand_tracker_created[2] = {false, false};
+    // P2-07B C3 (brief CP-3): the adopted hand state of the SAME
+    // locate the stamp above names (no separate generation/time
+    // fields -- one locate, one stamp). Per hand (0 = left,
+    // 1 = right): the located 26-joint set and its flags, the
+    // hand-active flag, and adopted_hand_valid -- the CP-3
+    // helper's hand_usable outcome stored verbatim, read ONLY
+    // as wrist-position-channel state (CP-3 [R1]). Every write
+    // that clears adopted_sample_valid clears both hands'
+    // adopted_hand_valid/active and zeroes the wrist entries in
+    // the same write (CP-3 invalidation mirror).
+    FSVRHandJointSample adopted_sample_hand_joints[2][FSVR_HAND_JOINT_COUNT];
+    U32 adopted_sample_hand_flags[2][FSVR_HAND_JOINT_COUNT] = {};
+    bool adopted_sample_hand_active[2] = {false, false};
+    bool adopted_hand_valid[2] = {false, false};
     unsigned long long head_consumed_sample_time_ns = 0;
     bool head_consumed_sample_orientation_tracked = false;
     bool head_consumed_sample_valid = false;
@@ -1168,6 +1509,15 @@ struct LLOpenXRManagerImpl
     // the queue under any generation. Bounded by the event
     // count of one manager lifetime.
     std::set<std::pair<unsigned long long, long long>> finalized_local_transitions;
+    // P2-07B C8 (CP-1): the finalization fan-out observer.
+    // Owned here, beside the queue it observes; the take and
+    // retire paths below append each call's finalized
+    // non-stale keys to it, and the session machinery pulls
+    // them back out through
+    // LLOpenXRManager::drainFinalizedLocalTransitionBatches().
+    // The manager never calls out through it: no callback, no
+    // registration, no pointer to session state.
+    FSVRFinalizationObserver finalization_observer;
     bool runtime_authenticated = false;
     std::string runtime_name;
     std::string runtime_version;
@@ -1347,6 +1697,26 @@ bool LLOpenXRManager::isSessionRunning() const
 #endif
 }
 
+// P2-07B C3 (CP-3): hand invalidation, defined at global scope
+// ahead of its earliest mirror sites (instance loss inside
+// initialize() below, and the adoption-failure branch of
+// adopt_located_views); the hand-locate glue itself sits after
+// adopt_located_views, inside that function's anonymous
+// namespace. Clears the per-hand adopted state only -- the
+// caller owns the adopted_sample_* triple it mirrors (CP-3).
+void clear_adopted_hand_state(LLOpenXRManagerImpl& impl)
+{
+    for (int side = 0; side < 2; ++side)
+    {
+        impl.adopted_hand_valid[side] = false;
+        impl.adopted_sample_hand_active[side] = false;
+        impl.adopted_sample_hand_joints[side]
+            [FSVR_HAND_JOINT_WRIST_INDEX] = FSVRHandJointSample{};
+        impl.adopted_sample_hand_flags[side]
+            [FSVR_HAND_JOINT_WRIST_INDEX] = 0;
+    }
+}
+
 bool LLOpenXRManager::initialize()
 {
     if (mDisabled)
@@ -1402,14 +1772,24 @@ bool LLOpenXRManager::initialize()
     }
 
     bool has_opengl_extension = false;
+    bool has_hand_tracking_extension = false;
     for (const auto& extension : extension_props)
     {
         if (std::strcmp(extension.extensionName, XR_KHR_OPENGL_ENABLE_EXTENSION_NAME) == 0)
         {
             has_opengl_extension = true;
-            break;
+        }
+        // P2-07B C3 (CP-1): hand tracking is negotiated
+        // fail-soft -- recorded here, enabled below iff exposed,
+        // and never fatal when absent (a runtime without it is a
+        // degraded configuration, not a broken viewer; section
+        // 2.1's VIEW precedent, not the OpenGL policy).
+        if (std::strcmp(extension.extensionName, XR_EXT_HAND_TRACKING_EXTENSION_NAME) == 0)
+        {
+            has_hand_tracking_extension = true;
         }
     }
+    mImpl->hand_tracking_extension_present = has_hand_tracking_extension;
 
     if (!has_opengl_extension)
     {
@@ -1418,7 +1798,11 @@ bool LLOpenXRManager::initialize()
         return false;
     }
 
-    const char* enabled_extensions[] = { XR_KHR_OPENGL_ENABLE_EXTENSION_NAME };
+    // P2-07B C3 (CP-1): the hand-tracking name is appended iff
+    // the runtime exposed it; the OpenGL name is always enabled.
+    const char* enabled_extensions[] = { XR_KHR_OPENGL_ENABLE_EXTENSION_NAME,
+                                         XR_EXT_HAND_TRACKING_EXTENSION_NAME };
+    const uint32_t enabled_extension_count = has_hand_tracking_extension ? 2 : 1;
 
     XrInstanceCreateInfo instance_info{};
     instance_info.type = XR_TYPE_INSTANCE_CREATE_INFO;
@@ -1427,7 +1811,7 @@ bool LLOpenXRManager::initialize()
     instance_info.applicationInfo.applicationVersion = 1;
     instance_info.applicationInfo.engineVersion = 1;
     instance_info.applicationInfo.apiVersion = XR_CURRENT_API_VERSION;
-    instance_info.enabledExtensionCount = 1;
+    instance_info.enabledExtensionCount = enabled_extension_count;
     instance_info.enabledExtensionNames = enabled_extensions;
 
     result = xrCreateInstance(&instance_info, &mImpl->instance);
@@ -1517,6 +1901,36 @@ bool LLOpenXRManager::initialize()
 
     openxr_info("xrGetSystem succeeded.");
 
+    // P2-07B C3 (CP-2 / DP-3): the hand-tracking system-
+    // properties probe -- the SystemSupports term of the [R1]
+    // capability conjunction, queried only when the extension
+    // was negotiated. Its negative is a VETO term: it overrides
+    // successful tracker creation below. A failed query is
+    // treated as no endorsement (fail-soft), never as an
+    // initialization failure.
+    if (mImpl->hand_tracking_extension_present)
+    {
+        XrSystemProperties system_properties{};
+        system_properties.type = XR_TYPE_SYSTEM_PROPERTIES;
+        XrSystemHandTrackingPropertiesEXT hand_properties{};
+        hand_properties.type = XR_TYPE_SYSTEM_HAND_TRACKING_PROPERTIES_EXT;
+        system_properties.next = &hand_properties;
+        const XrResult properties_result =
+            xrGetSystemProperties(mImpl->instance, mImpl->system_id, &system_properties);
+        if (XR_SUCCEEDED(properties_result))
+        {
+            mImpl->hand_tracking_system_supports =
+                hand_properties.supportsHandTracking != XR_FALSE;
+        }
+        else
+        {
+            openxr_warn("xrGetSystemProperties (hand-tracking probe) failed: " +
+                        format_xr_result(mImpl->instance, properties_result));
+        }
+        openxr_info("P2-07B C3: hand-tracking system support = " +
+                    std::string(mImpl->hand_tracking_system_supports ? "true" : "false"));
+    }
+
     result = xrGetInstanceProcAddr(
         mImpl->instance,
         "xrGetOpenGLGraphicsRequirementsKHR",
@@ -1552,6 +1966,31 @@ bool LLOpenXRManager::initialize()
                         << XR_VERSION_MINOR(requirements.maxApiVersionSupported) << '.'
                         << XR_VERSION_PATCH(requirements.maxApiVersionSupported);
         openxr_info(requirement_msg.str());
+    }
+
+    // P2-07B C3 (CP-2): load the hand-tracking entry points via
+    // xrGetInstanceProcAddr (the header declares the prototypes
+    // only under XR_EXTENSION_PROTOTYPES, which the viewer build
+    // does not define -- the get_gl_requirements precedent
+    // above). Only when the extension was negotiated. Any null
+    // PFN leaves capability off with a warning; initialization
+    // continues (fail-soft, unlike the fatal GL load above).
+    if (mImpl->hand_tracking_extension_present)
+    {
+        xrGetInstanceProcAddr(mImpl->instance, "xrCreateHandTrackerEXT",
+            reinterpret_cast<PFN_xrVoidFunction*>(&mImpl->create_hand_tracker));
+        xrGetInstanceProcAddr(mImpl->instance, "xrDestroyHandTrackerEXT",
+            reinterpret_cast<PFN_xrVoidFunction*>(&mImpl->destroy_hand_tracker));
+        xrGetInstanceProcAddr(mImpl->instance, "xrLocateHandJointsEXT",
+            reinterpret_cast<PFN_xrVoidFunction*>(&mImpl->locate_hand_joints));
+        mImpl->hand_tracking_pfns_loaded =
+            mImpl->create_hand_tracker != nullptr &&
+            mImpl->destroy_hand_tracker != nullptr &&
+            mImpl->locate_hand_joints != nullptr;
+        if (!mImpl->hand_tracking_pfns_loaded)
+        {
+            openxr_warn("P2-07B C3: hand-tracking entry points unavailable; hand tracking off.");
+        }
     }
 
     Display* x_display = LLWindowSDL::get_SDL_Display();
@@ -1693,6 +2132,46 @@ bool LLOpenXRManager::initialize()
             openxr_warn("P2-05a: VIEW space creation failed; diagnostic unavailable, LOCAL arm retained.");
         }
     }
+
+    // P2-07B C3 (CP-2): create one hand tracker per hand against
+    // the session (trackers bind to the session handle, not to a
+    // begin cycle, so they are created once here and survive
+    // begin/end cycles; OQ-3 records the contingency move if a
+    // runtime demands creation at first begin). A hand whose
+    // creation fails stays XR_NULL_HANDLE and is simply never
+    // located; partial success is a real state and every
+    // downstream consumer is per-hand. The capability fact is
+    // the [R1] four-term conjunction, computed once both
+    // creations have been attempted.
+    if (mImpl->hand_tracking_pfns_loaded)
+    {
+        static const XrHandEXT kTrackerHands[2] = {XR_HAND_LEFT_EXT, XR_HAND_RIGHT_EXT};
+        for (int side = 0; side < 2; ++side)
+        {
+            XrHandTrackerCreateInfoEXT create_info{};
+            create_info.type = XR_TYPE_HAND_TRACKER_CREATE_INFO_EXT;
+            create_info.hand = kTrackerHands[side];
+            create_info.handJointSet = XR_HAND_JOINT_SET_DEFAULT_EXT;
+            const XrResult create_result = mImpl->create_hand_tracker(
+                mImpl->session, &create_info, &mImpl->hand_trackers[side]);
+            if (XR_SUCCEEDED(create_result) && mImpl->hand_trackers[side] != XR_NULL_HANDLE)
+            {
+                mImpl->hand_tracker_created[side] = true;
+            }
+            else
+            {
+                mImpl->hand_trackers[side] = XR_NULL_HANDLE;
+                openxr_warn("P2-07B C3: hand tracker creation failed for hand " +
+                            std::to_string(side) + ": " +
+                            format_xr_result(mImpl->instance, create_result));
+            }
+        }
+    }
+    mImpl->hand_tracking_available =
+        mImpl->hand_tracking_extension_present &&
+        mImpl->hand_tracking_pfns_loaded &&
+        mImpl->hand_tracking_system_supports &&
+        (mImpl->hand_tracker_created[0] || mImpl->hand_tracker_created[1]);
 
     // P2-04b (D5'): with the session and its LOCAL space created
     // under the authenticated pinned runtime, continuity is
@@ -1918,6 +2397,13 @@ void LLOpenXRManager::processEvents()
             mImpl->has_hmd_up = false;
             mImpl->adopted_sample_valid = false;
             mImpl->head_consumed_sample_valid = false;
+            // P2-07B C2 (CP-4 [R1][R2]): position invalidated
+            // with the sample.
+            mImpl->adopted_sample_position = LLVector3::zero;
+            mImpl->adopted_sample_position_tracked = false;
+            mImpl->adopted_position_valid = false;
+            // P2-07B C3 (CP-3): hand state invalidated with the sample.
+            clear_adopted_hand_state(*mImpl);
             mDisabled = true;
             return;
         }
@@ -2282,6 +2768,12 @@ bool LLOpenXRManager::takeNewestEligibleLocalTransition(long long sample_time_ns
     std::deque<LLLocalSpaceTransition> keep;
     LLLocalSpaceTransition newest;
     bool found = false;
+    // P2-07B C8 (CP-1): this call's finalized non-stale keys,
+    // collected for the fan-out below -- superseded keys in
+    // displacement order, the consumed-newest key last.
+    // Stale-epoch drops are never collected: they belong to a
+    // dead session generation and signal nothing.
+    std::vector<FSVRFinalizedTransitionKey> finalized_keys;
     for (const auto& transition : mImpl->pending_local_transitions)
     {
         if (transition.incarnation != mImpl->incarnation ||
@@ -2305,6 +2797,13 @@ bool LLOpenXRManager::takeNewestEligibleLocalTransition(long long sample_time_ns
                 mImpl->finalized_local_transitions.insert(
                     std::make_pair(newest.incarnation, newest.change_time_ns));
                 ++superseded_count;
+                // P2-07B C8 (CP-1): the displaced newest is
+                // finalized as superseded by this call.
+                FSVRFinalizedTransitionKey key;
+                key.incarnation = newest.incarnation;
+                key.generation = newest.generation;
+                key.change_time_ns = newest.change_time_ns;
+                finalized_keys.push_back(key);
                 newest = transition;
             }
             else if (found)
@@ -2314,6 +2813,12 @@ bool LLOpenXRManager::takeNewestEligibleLocalTransition(long long sample_time_ns
                 mImpl->finalized_local_transitions.insert(
                     std::make_pair(transition.incarnation, transition.change_time_ns));
                 ++superseded_count;
+                // P2-07B C8 (CP-1): superseded by this call.
+                FSVRFinalizedTransitionKey key;
+                key.incarnation = transition.incarnation;
+                key.generation = transition.generation;
+                key.change_time_ns = transition.change_time_ns;
+                finalized_keys.push_back(key);
             }
             else
             {
@@ -2332,6 +2837,22 @@ bool LLOpenXRManager::takeNewestEligibleLocalTransition(long long sample_time_ns
         mImpl->finalized_local_transitions.insert(
             std::make_pair(newest.incarnation, newest.change_time_ns));
         out_transition = newest;
+        // P2-07B C8 (CP-1): the consumed-newest key completes
+        // this call's batch.
+        FSVRFinalizedTransitionKey key;
+        key.incarnation = newest.incarnation;
+        key.generation = newest.generation;
+        key.change_time_ns = newest.change_time_ns;
+        finalized_keys.push_back(key);
+    }
+    if (!finalized_keys.empty())
+    {
+        // P2-07B C8 (CP-1): one fan-out presentation per
+        // finalizing call, after the queue and the finalized
+        // set have reached their post-call state. Observation
+        // only -- nothing above reads the observer, and this
+        // call mutates nothing but the observer's own buffer.
+        mImpl->finalization_observer.noteFinalizedBatch(finalized_keys);
     }
     return found;
 #else
@@ -2355,6 +2876,10 @@ void LLOpenXRManager::retireEligibleLocalTransitions(long long sample_time_ns, c
     }
     const std::string reason_str = reason ? reason : "retired";
     std::deque<LLLocalSpaceTransition> keep;
+    // P2-07B C8 (CP-1): this call's finalized non-stale keys
+    // (the retired ones), for the fan-out below. Stale-epoch
+    // drops are never collected.
+    std::vector<FSVRFinalizedTransitionKey> finalized_keys;
     for (const auto& transition : mImpl->pending_local_transitions)
     {
         if (transition.incarnation != mImpl->incarnation ||
@@ -2370,6 +2895,15 @@ void LLOpenXRManager::retireEligibleLocalTransitions(long long sample_time_ns, c
             emit_local_transition_record(reason_str.c_str(), transition, "");
             mImpl->finalized_local_transitions.insert(
                 std::make_pair(transition.incarnation, transition.change_time_ns));
+            // P2-07B C8 (CP-1): retired by this call. A
+            // transition retired on the not-feeding path
+            // redefined LOCAL exactly as much as an applied
+            // one did, so it is presented identically.
+            FSVRFinalizedTransitionKey key;
+            key.incarnation = transition.incarnation;
+            key.generation = transition.generation;
+            key.change_time_ns = transition.change_time_ns;
+            finalized_keys.push_back(key);
         }
         else
         {
@@ -2377,6 +2911,12 @@ void LLOpenXRManager::retireEligibleLocalTransitions(long long sample_time_ns, c
         }
     }
     mImpl->pending_local_transitions.swap(keep);
+    if (!finalized_keys.empty())
+    {
+        // P2-07B C8 (CP-1): one fan-out presentation per
+        // finalizing call. Observation only.
+        mImpl->finalization_observer.noteFinalizedBatch(finalized_keys);
+    }
 #else
     (void)sample_time_ns;
     (void)reason;
@@ -2389,6 +2929,16 @@ unsigned long long LLOpenXRManager::pendingLocalTransitionCount() const
     return mImpl ? static_cast<unsigned long long>(mImpl->pending_local_transitions.size()) : 0;
 #else
     return 0;
+#endif
+}
+
+std::vector<FSVRFinalizedBatch> LLOpenXRManager::drainFinalizedLocalTransitionBatches()
+{
+#if LL_LINUX && LL_X11
+    return mImpl ? mImpl->finalization_observer.drainBatches()
+                 : std::vector<FSVRFinalizedBatch>();
+#else
+    return std::vector<FSVRFinalizedBatch>();
 #endif
 }
 
@@ -3292,11 +3842,49 @@ unsigned long long adopt_located_views(LLOpenXRManagerImpl& impl,
         impl.adopted_sample_orientation_tracked =
             (view_state_flags & XR_VIEW_STATE_ORIENTATION_TRACKED_BIT) != 0;
         impl.adopted_sample_valid = true;
+        // P2-07B C2 (CP-3): adopt the located views' LOCAL
+        // position from THIS locate, in the same block, under
+        // the same generation/time stamp as the orientation
+        // above. The within-locate binding is the whole
+        // guarantee (brief section 1.1 [R1]: it confers NO
+        // comparability across a LOCAL transition -- C8 owns
+        // that seam). The decision is the CP-2 pure helper's;
+        // the raw LOCAL components are carried across
+        // uninterpreted, exactly as the orientation path carries
+        // raw quaternion components (section 2.4).
+        {
+            std::vector<LLVector3> view_positions;
+            view_positions.reserve(usable_view_count);
+            for (uint32_t i = 0; i < usable_view_count; ++i)
+            {
+                const XrVector3f& p = views[i].pose.position;
+                view_positions.emplace_back(p.x, p.y, p.z);
+            }
+            const FSVRHmdPositionAdoption position_adoption =
+                decide_hmd_position_adoption(
+                    view_positions.data(),
+                    static_cast<uint32_t>(view_positions.size()),
+                    (view_state_flags & XR_VIEW_STATE_POSITION_TRACKED_BIT) != 0,
+                    this_locate_generation,
+                    predicted_display_time_ns);
+            impl.adopted_sample_position = position_adoption.position;
+            impl.adopted_sample_position_tracked = position_adoption.position_tracked;
+            impl.adopted_position_valid = position_adoption.position_usable;
+        }
     }
     else
     {
         impl.has_hmd_forward = false;
         impl.adopted_sample_valid = false;
+        // P2-07B C2 (CP-3 failure branch / CP-4 [R1][R2]): the
+        // position dies with the sample -- tracked and
+        // usability flags cleared, stored position zeroed, so
+        // the accessor can never serve a stale position.
+        impl.adopted_sample_position = LLVector3::zero;
+        impl.adopted_sample_position_tracked = false;
+        impl.adopted_position_valid = false;
+        // P2-07B C3 (CP-3): hand state invalidated with the sample.
+        clear_adopted_hand_state(impl);
     }
 
     if (usable_view_count > 0 && accumulated_up.normalize() > 0.f)
@@ -3311,6 +3899,89 @@ unsigned long long adopt_located_views(LLOpenXRManagerImpl& impl,
 
     return this_locate_generation;
 }
+
+// P2-07B C3 (CP-3): locate both hands against the LOCAL space
+// at the views' predicted display time and adopt the result
+// beside the HMD sample. Called immediately after
+// adopt_located_views() in each production path (paced and
+// legacy -- never at the P2-05a diagnostic locate), only when
+// that adoption succeeded, so hand state and the HMD sample are
+// one locate's output: same space object, same timestamp
+// argument, same generation (the adoption stamps itself from
+// the generation the view adoption just minted -- no separate
+// stamp exists). A failed locate call adopts "inactive" for
+// that hand; it is not an error path.
+void locate_and_adopt_hands(LLOpenXRManagerImpl& impl,
+                            long long predicted_display_time_ns)
+{
+    // The pure region's flag mirror, checked against the real
+    // header constants in the build that has them.
+    static_assert(FSVR_HAND_LOCATION_ORIENTATION_VALID_BIT == XR_SPACE_LOCATION_ORIENTATION_VALID_BIT, "C3 flag mirror drift");
+    static_assert(FSVR_HAND_LOCATION_POSITION_VALID_BIT == XR_SPACE_LOCATION_POSITION_VALID_BIT, "C3 flag mirror drift");
+    static_assert(FSVR_HAND_LOCATION_ORIENTATION_TRACKED_BIT == XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT, "C3 flag mirror drift");
+    static_assert(FSVR_HAND_LOCATION_POSITION_TRACKED_BIT == XR_SPACE_LOCATION_POSITION_TRACKED_BIT, "C3 flag mirror drift");
+    static_assert(FSVR_HAND_JOINT_COUNT == XR_HAND_JOINT_COUNT_EXT, "C3 joint count drift");
+    static_assert(FSVR_HAND_JOINT_WRIST_INDEX == XR_HAND_JOINT_WRIST_EXT, "C3 wrist index drift");
+
+    if (!impl.hand_tracking_available || !impl.locate_hand_joints)
+    {
+        return;
+    }
+    for (int side = 0; side < 2; ++side)
+    {
+        const XrHandTrackerEXT tracker = impl.hand_trackers[side];
+        if (tracker == XR_NULL_HANDLE || !impl.hand_tracker_created[side])
+        {
+            continue;
+        }
+        XrHandJointLocationEXT joint_locations[XR_HAND_JOINT_COUNT_EXT];
+        XrHandJointLocationsEXT locations{};
+        locations.type = XR_TYPE_HAND_JOINT_LOCATIONS_EXT;
+        locations.jointCount = XR_HAND_JOINT_COUNT_EXT;
+        locations.jointLocations = joint_locations;
+        XrHandJointsLocateInfoEXT locate_info{};
+        locate_info.type = XR_TYPE_HAND_JOINTS_LOCATE_INFO_EXT;
+        locate_info.baseSpace = impl.app_space;
+        locate_info.time = static_cast<XrTime>(predicted_display_time_ns);
+
+        const XrResult locate_result =
+            impl.locate_hand_joints(tracker, &locate_info, &locations);
+        FSVRHandJointSample samples[FSVR_HAND_JOINT_COUNT];
+        bool is_active = false;
+        if (XR_SUCCEEDED(locate_result))
+        {
+            is_active = locations.isActive != XR_FALSE;
+            for (uint32_t j = 0; j < FSVR_HAND_JOINT_COUNT; ++j)
+            {
+                const XrHandJointLocationEXT& located = joint_locations[j];
+                samples[j].position.set(located.pose.position.x,
+                                        located.pose.position.y,
+                                        located.pose.position.z);
+                samples[j].orientation = LLQuaternion(located.pose.orientation.x,
+                                                      located.pose.orientation.y,
+                                                      located.pose.orientation.z,
+                                                      located.pose.orientation.w);
+                samples[j].location_flags = static_cast<U32>(located.locationFlags);
+            }
+        }
+        const FSVRHandAdoption adoption = decide_hand_adoption(
+            samples, FSVR_HAND_JOINT_COUNT, is_active,
+            impl.adopted_sample_locate_generation, predicted_display_time_ns);
+        for (uint32_t j = 0; j < FSVR_HAND_JOINT_COUNT; ++j)
+        {
+            impl.adopted_sample_hand_joints[side][j] = adoption.joints[j];
+            impl.adopted_sample_hand_flags[side][j] = adoption.joints[j].location_flags;
+        }
+        impl.adopted_sample_hand_active[side] = adoption.is_active;
+        impl.adopted_hand_valid[side] = adoption.hand_usable;
+    }
+}
+
+// P2-07B C3 (CP-3): the hand half of the CP-4 invalidation
+// mirror is clear_adopted_hand_state, defined at global scope
+// ahead of initialize() -- its earliest mirror sites (instance
+// loss there, and the adoption-failure branch above) precede
+// this anonymous namespace.
 
 // P2-02: build the xr_submit trace collector for a paced frame from
 // its XRFrameContext (used by the zero-layer ends and the begin /
@@ -3900,6 +4571,14 @@ void LLOpenXRManager::submitFrameMonoImpl(const LLRect& source_rect, bool paced)
         this_locate_generation = adopt_located_views(*mImpl, mImpl->views, usable_view_count,
                                                      static_cast<long long>(frame_state.predictedDisplayTime),
                                                      static_cast<unsigned int>(view_state.viewStateFlags));
+        // P2-07B C3 (CP-3): hands ride this locate, inheriting
+        // the legacy path's one-iteration lag identically (OQ-2
+        // -- the lag is recorded, not repaired).
+        if (this_locate_generation > 0 && mImpl->adopted_sample_valid)
+        {
+            locate_and_adopt_hands(*mImpl,
+                                   static_cast<long long>(frame_state.predictedDisplayTime));
+        }
         if (this_locate_generation > 0)
         {
             xr_trace.has_located_generation = true;
@@ -4918,6 +5597,13 @@ void LLOpenXRManager::beginPacedFrame()
         // session_running && has_hmd_forward).
         mImpl->adopted_sample_valid = false;
         mImpl->head_consumed_sample_valid = false;
+        // P2-07B C2 (CP-4 [R1][R2]): position invalidated with
+        // the sample.
+        mImpl->adopted_sample_position = LLVector3::zero;
+        mImpl->adopted_sample_position_tracked = false;
+        mImpl->adopted_position_valid = false;
+        // P2-07B C3 (CP-3): hand state invalidated with the sample.
+        clear_adopted_hand_state(*mImpl);
         mImpl->has_hmd_forward = false;
         mImpl->has_hmd_up = false;
         openxr_warn("xrWaitFrame failed (paced loop): " + format_xr_result(mImpl->instance, wait_result));
@@ -4958,6 +5644,13 @@ void LLOpenXRManager::beginPacedFrame()
         // part of the snapshot this exit retires.
         mImpl->adopted_sample_valid = false;
         mImpl->head_consumed_sample_valid = false;
+        // P2-07B C2 (CP-4 [R1][R2]): position invalidated with
+        // the sample.
+        mImpl->adopted_sample_position = LLVector3::zero;
+        mImpl->adopted_sample_position_tracked = false;
+        mImpl->adopted_position_valid = false;
+        // P2-07B C3 (CP-3): hand state invalidated with the sample.
+        clear_adopted_hand_state(*mImpl);
         frame_ctx.pending_end_status = "skipped_should_render";
         return;
     }
@@ -4971,6 +5664,13 @@ void LLOpenXRManager::beginPacedFrame()
         mImpl->has_hmd_up = false;
         mImpl->adopted_sample_valid = false;
         mImpl->head_consumed_sample_valid = false;
+        // P2-07B C2 (CP-4 [R1][R2]): position invalidated with
+        // the sample.
+        mImpl->adopted_sample_position = LLVector3::zero;
+        mImpl->adopted_sample_position_tracked = false;
+        mImpl->adopted_position_valid = false;
+        // P2-07B C3 (CP-3): hand state invalidated with the sample.
+        clear_adopted_hand_state(*mImpl);
         frame_ctx.pending_end_status = "locate_failed";
         return;
     }
@@ -5014,6 +5714,13 @@ void LLOpenXRManager::beginPacedFrame()
         // consumed against it.
         mImpl->adopted_sample_valid = false;
         mImpl->head_consumed_sample_valid = false;
+        // P2-07B C2 (CP-4 [R1][R2]): position invalidated with
+        // the sample.
+        mImpl->adopted_sample_position = LLVector3::zero;
+        mImpl->adopted_sample_position_tracked = false;
+        mImpl->adopted_position_valid = false;
+        // P2-07B C3 (CP-3): hand state invalidated with the sample.
+        clear_adopted_hand_state(*mImpl);
         frame_ctx.pending_end_status = "locate_failed";
         return;
     }
@@ -5039,6 +5746,13 @@ void LLOpenXRManager::beginPacedFrame()
         mImpl->has_hmd_up = false;
         mImpl->adopted_sample_valid = false;
         mImpl->head_consumed_sample_valid = false;
+        // P2-07B C2 (CP-4 [R1][R2]): position invalidated with
+        // the sample.
+        mImpl->adopted_sample_position = LLVector3::zero;
+        mImpl->adopted_sample_position_tracked = false;
+        mImpl->adopted_position_valid = false;
+        // P2-07B C3 (CP-3): hand state invalidated with the sample.
+        clear_adopted_hand_state(*mImpl);
         mImpl->has_left_eye_vertical_fov = false;
         mImpl->has_left_eye_aspect = false;
         mImpl->left_eye_fov_sample.valid = false;
@@ -5056,6 +5770,14 @@ void LLOpenXRManager::beginPacedFrame()
                                                        static_cast<long long>(frame_ctx.frame_state.predictedDisplayTime),
                                                        static_cast<unsigned int>(frame_ctx.view_state.viewStateFlags));
     frame_ctx.views_valid = frame_ctx.located_generation > 0;
+    // P2-07B C3 (CP-3): hands ride this locate (same space, same
+    // predicted display time, same generation) when the view
+    // adoption succeeded.
+    if (frame_ctx.located_generation > 0 && mImpl->adopted_sample_valid)
+    {
+        locate_and_adopt_hands(*mImpl,
+                               static_cast<long long>(frame_ctx.frame_state.predictedDisplayTime));
+    }
 #endif
 }
 
@@ -5084,6 +5806,24 @@ static void freeze_avatar_eye_frame(LLOpenXRManagerImpl& impl,
         (long long)frame_ctx.frame_state.predictedDisplayTime;
     eye.view_state_flags = (unsigned int)frame_ctx.view_state.viewStateFlags;
     eye.coherent_optics = LLOpenXRManager::coherentOpticsEnabled();
+
+    // P2-07B C2 (CP-6): freeze the adopted HMD position under
+    // the same generation discipline the FOV check below
+    // enforces: the adopted sample must BE this frame's locate.
+    // The decision is the CP-2 helper's, over the same
+    // three-term predicate the CP-5 accessor uses; on mismatch
+    // the frame publishes invalid and no position.
+    {
+        const FSVREyeFramePosition frame_position = decide_eye_frame_position(
+            impl.adopted_sample_valid,
+            impl.adopted_position_valid,
+            impl.adopted_sample_position_tracked,
+            impl.adopted_sample_locate_generation,
+            frame_ctx.located_generation,
+            impl.adopted_sample_position);
+        eye.hmd_position_local = frame_position.position;
+        eye.hmd_position_valid = frame_position.valid;
+    }
 
     if (!frame_ctx.pending_end_status.empty())
     {
@@ -5586,6 +6326,155 @@ bool LLOpenXRManager::getHmdUp(LLVector3& out_up) const
 #endif
 }
 
+bool LLOpenXRManager::getHmdPosition(LLVector3& out_position) const
+{
+#if LL_LINUX && LL_X11
+    // P2-07B C2 (CP-5): the adopted HMD position (raw LOCAL
+    // components, OpenXR metres) of the CURRENT adopted sample,
+    // served only while the complete three-term predicate holds
+    // (CP-1 [R2]: sample valid && position usable && position
+    // tracked -- spec section 5's genuinely-tracked rule).
+    // Validity is derived from the current sample, never latched,
+    // so a later invalidation retires the position in the same
+    // write (CP-4). Unlike getHmdForward, NO consumed-side copy
+    // is stamped: no consumer with a P2-04b-style interlock is
+    // named for position (brief OQ-2). On false the out-param is
+    // untouched, mirroring getHmdForward.
+    if (!mImpl || !mImpl->session_running ||
+        !hmd_position_publishable(mImpl->adopted_sample_valid,
+                                  mImpl->adopted_position_valid,
+                                  mImpl->adopted_sample_position_tracked))
+    {
+        return false;
+    }
+
+    out_position = mImpl->adopted_sample_position;
+    return true;
+#else
+    (void)out_position;
+    return false;
+#endif
+}
+
+bool LLOpenXRManager::getHandTrackingAvailable() const
+{
+#if LL_LINUX && LL_X11
+    // P2-07B C3 (CP-4): CP-2's capability fact -- the [R1]
+    // four-term conjunction stored at initialize(). No sample
+    // dependency.
+    return mImpl && mImpl->hand_tracking_available;
+#else
+    return false;
+#endif
+}
+
+bool LLOpenXRManager::getWristPosition(bool right_hand, LLVector3& out_position) const
+{
+#if LL_LINUX && LL_X11
+    // P2-07B C3 (CP-4): the adopted wrist position (raw LOCAL
+    // components, OpenXR metres) of the CURRENT adopted sample,
+    // served only while the complete position predicate holds:
+    // sample valid && the CP-3 helper's wrist-position usability
+    // && POSITION_VALID && POSITION_TRACKED re-derived from the
+    // stored wrist flags. The predicate lives in exactly one
+    // expression (hand_wrist_position_publishable), shared with
+    // the arbitrator via CP-8's fields. On false the out-param
+    // is untouched, mirroring getHmdPosition.
+    if (!mImpl || !mImpl->session_running)
+    {
+        return false;
+    }
+    const int side = right_hand ? 1 : 0;
+    const U32 wrist_flags =
+        mImpl->adopted_sample_hand_flags[side][FSVR_HAND_JOINT_WRIST_INDEX];
+    if (!hand_wrist_position_publishable(mImpl->adopted_sample_valid,
+                                         mImpl->adopted_hand_valid[side],
+                                         wrist_flags))
+    {
+        return false;
+    }
+    out_position =
+        mImpl->adopted_sample_hand_joints[side][FSVR_HAND_JOINT_WRIST_INDEX].position;
+    return true;
+#else
+    (void)right_hand;
+    (void)out_position;
+    return false;
+#endif
+}
+
+bool LLOpenXRManager::getWristOrientation(bool right_hand, LLQuaternion& out_orientation) const
+{
+#if LL_LINUX && LL_X11
+    // P2-07B C3 (CP-4): the orientation twin of getWristPosition
+    // -- INDEPENDENT of the position predicate (spec section 6.2
+    // mixed sourcing): sample valid && hand active &&
+    // ORIENTATION_VALID && ORIENTATION_TRACKED && finite
+    // quaternion, via hand_wrist_orientation_publishable. A hand
+    // whose wrist position is unusable can still serve a
+    // genuinely-tracked wrist orientation (CP-3 [R1]).
+    if (!mImpl || !mImpl->session_running)
+    {
+        return false;
+    }
+    const int side = right_hand ? 1 : 0;
+    const FSVRHandJointSample& wrist =
+        mImpl->adopted_sample_hand_joints[side][FSVR_HAND_JOINT_WRIST_INDEX];
+    if (!hand_wrist_orientation_publishable(mImpl->adopted_sample_valid,
+                                            mImpl->adopted_sample_hand_active[side],
+                                            wrist.location_flags,
+                                            wrist.orientation))
+    {
+        return false;
+    }
+    out_orientation = wrist.orientation;
+    return true;
+#else
+    (void)right_hand;
+    (void)out_orientation;
+    return false;
+#endif
+}
+
+bool LLOpenXRManager::getHandJoint(bool right_hand, U32 joint_index,
+                                   LLVector3& out_position,
+                                   LLQuaternion& out_orientation,
+                                   U32& out_location_flags) const
+{
+#if LL_LINUX && LL_X11
+    // P2-07B C3 (CP-4): the full-set read (DP-5 publication).
+    // The sample/active gates are applied here; per-joint
+    // validity is the CALLER's predicate over the returned flags
+    // (section 2.5) -- which is also how CP-8 builds the frame
+    // input's validity masks ([R1]: the coordinator reads all 26
+    // joints per hand through this accessor at fill time; no
+    // additional manager surface exists for the masks).
+    if (!mImpl || !mImpl->session_running || !mImpl->adopted_sample_valid ||
+        joint_index >= FSVR_HAND_JOINT_COUNT)
+    {
+        return false;
+    }
+    const int side = right_hand ? 1 : 0;
+    if (!mImpl->adopted_sample_hand_active[side])
+    {
+        return false;
+    }
+    const FSVRHandJointSample& joint =
+        mImpl->adopted_sample_hand_joints[side][joint_index];
+    out_position = joint.position;
+    out_orientation = joint.orientation;
+    out_location_flags = joint.location_flags;
+    return true;
+#else
+    (void)right_hand;
+    (void)joint_index;
+    (void)out_position;
+    (void)out_orientation;
+    (void)out_location_flags;
+    return false;
+#endif
+}
+
 bool LLOpenXRManager::getLeftEyeVerticalFov(F32& out_vertical_fov_radians) const
 {
 #if LL_LINUX && LL_X11
@@ -5760,6 +6649,20 @@ void LLOpenXRManager::shutdown()
     }
     mImpl->swapchains.clear();
 
+    // P2-07B C3 (CP-2): hand trackers are session children --
+    // destroyed before the spaces and the session itself.
+    if (mImpl->destroy_hand_tracker)
+    {
+        for (int side = 0; side < 2; ++side)
+        {
+            if (mImpl->hand_trackers[side] != XR_NULL_HANDLE)
+            {
+                mImpl->destroy_hand_tracker(mImpl->hand_trackers[side]);
+                mImpl->hand_trackers[side] = XR_NULL_HANDLE;
+            }
+        }
+    }
+
     if (mImpl->view_space != XR_NULL_HANDLE)
     {
         xrDestroySpace(mImpl->view_space);
@@ -5789,3 +6692,5 @@ void LLOpenXRManager::shutdown()
 
     mImpl.reset();
 }
+
+#endif // FSVR_C2_POSITION_ONLY

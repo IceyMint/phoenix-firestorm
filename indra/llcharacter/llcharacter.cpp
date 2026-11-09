@@ -75,6 +75,16 @@ LLCharacter::~LLCharacter()
 
 
 //-----------------------------------------------------------------------------
+// applyVRAdapterPostBlend()
+//-----------------------------------------------------------------------------
+// P2-07B C1: default no-op. Only LLVOAvatarSelf overrides this
+// (DP-1 [R3]); every other character is unaffected, which is what
+// makes the motion-controller hook self-only in effect.
+void LLCharacter::applyVRAdapterPostBlend()
+{
+}
+
+//-----------------------------------------------------------------------------
 // getJoint()
 //-----------------------------------------------------------------------------
 LLJoint* LLCharacter::getJoint(std::string_view name)

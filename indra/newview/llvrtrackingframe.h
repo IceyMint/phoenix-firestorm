@@ -49,7 +49,61 @@ struct FSVRTrackingFrameInput
     LLVector3 look_direction = LLVector3::zero;
     bool avatar_valid = false;
     U64 registry_generation = 0;
+    // P2-07B C3 (CP-7): HMD position of the consumed sample
+    // (the C2 carriage, assigned to C3 by C2's OQ-1).
+    LLVector3 hmd_position = LLVector3::zero;
+    bool hmd_position_valid = false;
+    // P2-07B C3 (CP-7): per-hand wrist sample of the same
+    // locate (index 0 = left, 1 = right). Position and
+    // orientation are represented independently (spec section
+    // 6.2, mixed sourcing; DP-4 carries both).
+    LLVector3 wrist_position[2] = {LLVector3::zero, LLVector3::zero};
+    LLQuaternion wrist_orientation[2];
+    bool wrist_position_valid[2] = {false, false};
+    bool wrist_orientation_valid[2] = {false, false};
+    // Hand located & active this frame (the shared gate both
+    // validity masks hang from).
+    bool hand_sample_present[2] = {false, false};
+    // CP-2's capability fact (the four-term conjunction).
+    bool hand_tracking_available = false;
+    // P2-07B C3 [R1 -- C3-02]: per-joint VALIDITY for each hand
+    // (validity only -- no per-joint pose data; DP-5 stands).
+    // Bit j (0..25) = XR hand joint j, per the registry's index
+    // mapping. A set bit means that joint's channel was
+    // VALID && TRACKED in the adopted locate (the
+    // genuinely-tracked predicate). Both masks are zero
+    // whenever hand_sample_present[side] is false; their
+    // generation is this struct's locate_generation (the hand
+    // state IS the HMD sample's locate -- no second stamp).
+    U32 hand_position_tracked_mask[2] = {0, 0};
+    U32 hand_orientation_tracked_mask[2] = {0, 0};
 };
+
+// P2-07B C3 [R2 -- C3-R2-02]: per-joint validity-mask
+// construction (CP-8). Pure: plain flag words in, masks out; no
+// manager state, no OpenXR calls. joint_location_flags[j] is
+// CP-4 getHandJoint's out_location_flags for joint j of ONE
+// hand; the joint count is XR_HAND_JOINT_COUNT_EXT (26),
+// restated here because this header carries no OpenXR types.
+// Bit j of a mask is set iff word j carries BOTH that channel's
+// VALID and TRACKED bits (XrSpaceLocationFlags values:
+// orientation 0x01/0x04, position 0x02/0x08); each channel is
+// computed from its own bit pair only -- the channels are
+// independent by construction. An all-zero flag array (the
+// inactive/absent hand's shape) yields {0, 0} by construction,
+// not by a special case at the call site. Bits for joints no
+// bone maps to (PALM 0, the METACARPALs 2/6/11/16/21, the
+// finger TIPs 10/15/20/25) are computed and retained verbatim;
+// the helper assigns bits to no bone (bone assignment happens
+// only in the arbitrator, via the registry's index table). The
+// coordinator fill calls this once per present hand; no inline
+// mask assembly exists anywhere.
+struct FSVRHandValidityMasks
+{
+    U32 position_mask = 0;
+    U32 orientation_mask = 0;
+};
+FSVRHandValidityMasks buildHandValidityMasks(const U32 joint_location_flags[26]);
 
 enum class FSVRStateValue
 {
@@ -88,8 +142,20 @@ struct FSVRBoneDecision
 {
     std::string bone_id;
     FSVRSourceStates source_states;
-    std::string desired_source; // "HMD", "animation" or "none"
+    std::string desired_source; // "HMD", "hand_tracking",
+    // "body_estimation", "animation" or "none"
     FSVRDecisionKind desired_decision = FSVRDecisionKind::UNAVAILABLE;
+    // P2-07B C3 [R1 -- C3-03]: for hand-branch bones the desired
+    // side is decided PER CHANNEL (position and orientation
+    // degrade independently -- spec section 6.2 mixed sourcing
+    // at the decision layer); desired_source / desired_decision
+    // above then mirror the POSITION channel (the channel
+    // wrist-target consumers read). For every other branch both
+    // channel fields mirror the single decision.
+    std::string desired_position_source;
+    FSVRDecisionKind desired_position_decision = FSVRDecisionKind::UNAVAILABLE;
+    std::string desired_orientation_source;
+    FSVRDecisionKind desired_orientation_decision = FSVRDecisionKind::UNAVAILABLE;
     std::string applied_source;
     FSVRDecisionKind applied_decision = FSVRDecisionKind::UNAVAILABLE;
     std::string fallback_reason;

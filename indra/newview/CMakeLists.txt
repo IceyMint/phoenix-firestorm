@@ -216,7 +216,14 @@ set(viewer_SOURCE_FILES
     llagentaccess.cpp
     llagentbenefits.cpp
     llagentcamera.cpp
+    llvradapterapply.cpp
+    llvrarmsolver.cpp
+    llvrbonelog.cpp
     llvrboneregistry.cpp
+    llvrcalibration.cpp
+    llvrcontinuity.cpp
+    llvrjointlimits.cpp
+    llvrspinesolver.cpp
     llvrtrackingarbitrator.cpp
     llvrtrackingframe.cpp
     llvrtrackingsettings.cpp
@@ -1070,7 +1077,14 @@ set(viewer_HEADER_FILES
     llagentaccess.h
     llagentbenefits.h
     llagentcamera.h
+    llvradapterapply.h
+    llvrarmsolver.h
+    llvrbonelog.h
     llvrboneregistry.h
+    llvrcalibration.h
+    llvrcontinuity.h
+    llvrjointlimits.h
+    llvrspinesolver.h
     llvrtrackingarbitrator.h
     llvrtrackingframe.h
     llvrtrackingsettings.h

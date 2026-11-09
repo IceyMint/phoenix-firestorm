@@ -137,6 +137,7 @@ public:
     //--------------------------------------------------------------------
 public:
     /*virtual*/ bool    updateCharacter(LLAgent &agent);
+    /*virtual*/ void    applyVRAdapterPostBlend();
     /*virtual*/ void    idleUpdateTractorBeam();
     bool                checkStuckAppearance();
 

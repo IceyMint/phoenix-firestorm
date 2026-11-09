@@ -27,6 +27,7 @@
 #include "llviewerprecompiledheaders.h"
 
 #include "llvoavatarself.h"
+#include "llvradapterapply.h"
 #include "llvoavatar.h"
 
 #include "pipeline.h"
@@ -986,6 +987,17 @@ LLVOAvatarSelf::~LLVOAvatarSelf()
  ** End LLVOAvatarSelf Constructor routines
  **                                                                             **
  *********************************************************************************/
+
+// virtual
+void LLVOAvatarSelf::applyVRAdapterPostBlend()
+{
+    // P2-07B C1 (DP-1 [R3]): forward to the Stage-2 adapter apply.
+    // mSpecialRenderMode == 1 is the Animation Preview state
+    // (LLVOAvatar::updateCharacter); the apply's gates treat a
+    // preview cycle as a no-op, proven by the H1 harness cases
+    // rather than assumed (brief section 4 [R1]).
+    FSVRAdapterApplyForCharacter(this, mSpecialRenderMode == 1);
+}
 
 // virtual
 bool LLVOAvatarSelf::updateCharacter(LLAgent &agent)

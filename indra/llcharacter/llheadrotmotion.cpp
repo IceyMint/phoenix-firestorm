@@ -132,6 +132,16 @@ LLHeadRotMotion::LLHeadRotMotion(const LLUUID &id) :
 //-----------------------------------------------------------------------------
 LLHeadRotMotion::~LLHeadRotMotion()
 {
+    // P2-07B DIAG-1 (brief section 2.3 protection 3): a
+    // destroyed motion leaves no stale sample -- remove
+    // the animation-data slot while the character lives
+    // and invalidate the capture.
+    if (mCharacter && mDiagCaptureRegistered)
+    {
+        mCharacter->removeAnimationData("FSVRHeadRotCapture");
+        mDiagCaptureRegistered = false;
+    }
+    mDiagCapture.invalidate();
 }
 
 LLJoint::JointPriority LLHeadRotMotion::getPriority()
@@ -336,6 +346,10 @@ bool LLHeadRotMotion::onUpdate(F32 time, U8* joint_mask)
         mTorsoState->setRotation( nlerp(torso_slerp_amt, mTorsoState->getRotation(), torso_rot_local) );
     }
 
+    // P2-07B DIAG-1: the lag seed's pre-smoothing value,
+    // for the capture's last_head_rot_before field.
+    const LLQuaternion diag_last_head_rot_before = mLastHeadRot;
+
     if (instant_viewpoint_override_head_rot)
     {
         mLastHeadRot = head_rot_local;
@@ -357,6 +371,39 @@ bool LLHeadRotMotion::onUpdate(F32 time, U8* joint_mask)
         }
         mNeckState->setRotation( nlerp(NECK_LAG, LLQuaternion::DEFAULT, head_rot_local) );
         mHeadState->setRotation( nlerp(1.f - NECK_LAG, LLQuaternion::DEFAULT, head_rot_local));
+
+        // P2-07B DIAG-1 (brief section 2.3, D-2 = R-a):
+        // publish this cycle's ask -- the values just
+        // written to the joint states, the lag seed around
+        // the smoothing, and the two state identities (in
+        // memory only) -- through the character's
+        // animation-data slot. The slot pointer is stored
+        // once; per-cycle updates mutate the struct in
+        // place. No value the motion consumes is written.
+        if (mCharacter && !mDiagCaptureRegistered)
+        {
+            mCharacter->setAnimationData("FSVRHeadRotCapture",
+                                         &mDiagCapture);
+            mDiagCaptureRegistered = true;
+        }
+        mDiagCapture.publish(mNeckState->getRotation(),
+                             mHeadState->getRotation(),
+                             diag_last_head_rot_before,
+                             mLastHeadRot,
+                             instant_viewpoint_override_head_rot,
+                             mNeckState.get(),
+                             mHeadState.get(),
+                             // CODE-R1-01: this cycle's
+                             // effective blend mode, for
+                             // the section 2.5 consistency
+                             // validation. The headrot
+                             // states carry USE_MOTION_PRIORITY
+                             // (lljointstate.h), so the
+                             // blender's slot priority for
+                             // them is exactly this value.
+                             (S32)getPriority(),
+                             getBlendType() ==
+                                 LLMotion::ADDITIVE_BLEND);
     }
 
     return true;
@@ -368,6 +415,9 @@ bool LLHeadRotMotion::onUpdate(F32 time, U8* joint_mask)
 //-----------------------------------------------------------------------------
 void LLHeadRotMotion::onDeactivate()
 {
+    // P2-07B DIAG-1 (brief section 2.3 protection 3): an
+    // inactive motion leaves no current sample.
+    mDiagCapture.invalidate();
 }
 
 

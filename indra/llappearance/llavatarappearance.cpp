@@ -708,6 +708,14 @@ bool LLAvatarAppearance::allocateCharacterJoints( S32 num )
 //-----------------------------------------------------------------------------
 bool LLAvatarAppearance::buildSkeleton(const LLAvatarSkeletonInfo *info)
 {
+    // P2-07B C8 (CP-5, AMEND-C8-R1-01): the rebuild generation
+    // advances at funnel entry, before any work a partial or
+    // failed build could leave half-done -- a failed build has
+    // already re-imposed partial skeleton-file locals, and
+    // conservative invalidation is the correct response. This
+    // increment is the one hook CP-5 places in llappearance.
+    ++mSkeletonRebuildGeneration;
+
     LL_DEBUGS("BVH") << "numBones " << info->mNumBones << " numCollisionVolumes " << info->mNumCollisionVolumes << LL_ENDL;
 
     // allocate joints

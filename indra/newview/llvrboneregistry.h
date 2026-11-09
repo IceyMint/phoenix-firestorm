@@ -35,6 +35,12 @@ struct FSVRTrackingBoneEntry
     std::string registration_phase;
     std::string target_space;
     std::string constraint_adapter_id;
+    // P2-07B C3 [R1 -- C3-02]: the XR hand joint this bone maps
+    // to (XR_HAND_JOINT_*_EXT ordinal), so the arbitrator's
+    // per-joint validity-mask lookup is defined. -1 for every
+    // entry that is not a finger bone (the wrist's arbitration
+    // consults its own validity fields, not the mask).
+    S32 xr_hand_joint_index = -1;
     enum class AuditStatus
     {
         UNVERIFIED,
@@ -68,8 +74,10 @@ public:
     static std::set<std::string> knownIds();
 
     // Computes all four rollups against the effective disabled set.
-    // HEAD is the only implemented rollup in P2-07a; the others are
-    // reported as not implemented rather than pretending to work.
+    // P2-07B C3 (CP-5): a rollup is implemented iff it has
+    // registered members (replacing the P2-07a HEAD-only
+    // hardcode); a group with no members (LOWER_BODY) still
+    // reports not implemented rather than pretending to work.
     static std::vector<FSVRRollupState> computeRollups(
         const std::set<std::string>& known_disabled_ids);
 

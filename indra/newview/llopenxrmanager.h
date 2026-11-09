@@ -12,6 +12,7 @@
 #include "llrect.h"
 #include "v3math.h"
 #include "llquaternion.h"
+#include "llvrcontinuity.h"
 
 #include <memory>
 #include <string>
@@ -51,6 +52,15 @@ struct LLXRAvatarEyeFrame
     unsigned long long head_consumed_pose_generation = 0;
     long long predicted_display_time_xr_ns = 0;
     unsigned int view_state_flags = 0;
+    // P2-07B C2 (CP-6): the adopted HMD position of this frame's
+    // locate (raw LOCAL components, OpenXR metres), frozen under
+    // the same generation discipline as the FOV sample:
+    // hmd_position_valid holds only when the adopted sample IS
+    // this frame's locate and the complete predicate (sample
+    // valid && position usable && position tracked) holds; on
+    // any mismatch the position is zero and the flag false.
+    LLVector3 hmd_position_local;
+    bool hmd_position_valid = false;
     // The located left-eye FOV sample as frozen at the seam, plus
     // the derived vertical FOV the desktop-path override consumes.
     LLXRLeftEyeFovSample fov_sample;
@@ -190,6 +200,28 @@ public:
     bool hasOpenPacedFrame() const;
     bool getHmdForward(LLVector3& out_forward) const;
     bool getHmdUp(LLVector3& out_up) const;
+    // P2-07B C2 (CP-5): the adopted HMD position (raw LOCAL
+    // components, OpenXR metres) of the current adopted locate;
+    // true only while the adopted sample is valid, its position
+    // was usable, and its position was genuinely tracked. No
+    // consumed-side stamp is recorded (brief OQ-2).
+    bool getHmdPosition(LLVector3& out_position) const;
+    // P2-07B C3 (CP-4): hand-tracking publication, mirroring
+    // getHmdPosition's contract (false leaves out-params
+    // untouched; no consumed-side stamp recorded).
+    // getHandTrackingAvailable is CP-2's capability fact (the
+    // four-term conjunction); the wrist accessors serve the
+    // adopted wrist pose of the current adopted sample under
+    // INDEPENDENT per-channel predicates (spec section 6.2,
+    // mixed sourcing); getHandJoint serves the full located
+    // joint set under the sample/active gates, with per-joint
+    // validity left to the caller's predicate over the returned
+    // flags.
+    bool getHandTrackingAvailable() const;
+    bool getWristPosition(bool right_hand, LLVector3& out_position) const;
+    bool getWristOrientation(bool right_hand, LLQuaternion& out_orientation) const;
+    bool getHandJoint(bool right_hand, U32 joint_index, LLVector3& out_position,
+                      LLQuaternion& out_orientation, U32& out_location_flags) const;
     bool getLeftEyeVerticalFov(F32& out_vertical_fov_radians) const;
     bool getLeftEyeFovSample(LLXRLeftEyeFovSample& out_sample) const;
     bool getLeftEyeAspect(F32& out_aspect) const;
@@ -287,6 +319,14 @@ public:
     void retireEligibleLocalTransitions(long long sample_time_ns, const char* reason);
     // P2-04b: queued-transition diagnostics.
     unsigned long long pendingLocalTransitionCount() const;
+    // P2-07B C8 (CP-1): pull-only drain of the finalized
+    // LOCAL transition batches recorded by the finalization
+    // fan-out (FSVRFinalizationObserver, a member of the
+    // impl). Returns the accumulated batches and clears the
+    // buffer; empty when nothing finalized since the last
+    // drain. Observation only: no queue state is read or
+    // mutated here beyond the observer's own buffer.
+    std::vector<FSVRFinalizedBatch> drainFinalizedLocalTransitionBatches();
     void shutdown();
 
 private:

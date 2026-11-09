@@ -204,6 +204,11 @@ protected:
 
     LLCharacter         *mCharacter;
 
+    // P2-07B DIAG-1 (brief section 3 item 6): the blend
+    // observation record's animation-data slot is published
+    // once, on the first non-quantum pass.
+    bool                mDiagBlendObsPublished = false;
+
 //  Life cycle of an animation:
 //
 //  Animations are instantiated and immediately put in the mAllMotions map for their entire lifetime.

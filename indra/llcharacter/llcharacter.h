@@ -78,6 +78,14 @@ public:
     // subclasses may optimize/cache results.
     virtual LLJoint* getJoint(std::string_view name);
 
+    // P2-07B C1: Stage-2 adapter apply point. LLMotionController
+    // calls this immediately after the pose blend, exactly once
+    // per non-quantum motion cycle. The default implementation
+    // does nothing; LLVOAvatarSelf overrides it to run the adapter
+    // apply (indra/newview/llvradapterapply). DP-1 [R3]: this
+    // virtual is the llcharacter<->newview invocation boundary.
+    virtual void applyVRAdapterPostBlend();
+
     // get the position of the character
     virtual LLVector3 getCharacterPosition() = 0;
 
