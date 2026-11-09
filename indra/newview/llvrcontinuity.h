@@ -66,6 +66,9 @@ struct FSVRFinalizedTransitionKey
     long long change_time_ns = 0;
     bool has_origin_transform = false;
     LLMatrix4 origin_transform; // old LOCAL -> new LOCAL, raw OpenXR axes
+    // Yaw-only evidence NEVER authorizes positional rebasing.
+    bool has_yaw_bridge = false;
+    F32 old_to_new_yaw = 0.f;
     F32 body_turn_rad = 0.f; // accepted LLAgent yaw; annotated by camera
 };
 
@@ -200,6 +203,25 @@ bool fsvrLocalOriginTransform(const LLVector3& position,
 FSVRTransitionEvidence fsvrComposeLocalTransitions(const FSVRFinalizedBatch& batch);
 F32 fsvrRebasedYaw(F32 yaw, const LLMatrix4& old_to_new);
 F32 fsvrHeadYawDelta(F32 yaw, F32 base);
+// Viewer-only diagnostics; no persistent body-follow behavior.
+void fsvrBeginRecenterHeadingAudit(F32 target, long long change_time_ns);
+void fsvrRecordRecenterRenderedHeading();
+struct FSVRRecenterHeadingPlan {
+    bool valid = false;
+    F32 physical_turn = 0.f;
+    F32 agent_heading = 0.f;
+    F32 root_heading = 0.f;
+    F32 target_heading = 0.f;
+    F32 agent_turn = 0.f;
+};
+FSVRRecenterHeadingPlan fsvrPlanRecenterHeading(F32 hmd_yaw, F32 old_base, F32 yaw_shift,
+    const LLQuaternion& root, const LLVector3& agent_forward);
+LLQuaternion fsvrRootYawAligned(const LLQuaternion& root, F32 target);
+F32 fsvrRecenterBodyTurn(F32 hmd_yaw, F32 old_base, F32 old_to_new_yaw);
+bool fsvrStageAnchorEligible(long long before_time, unsigned long long before_generation,
+    long long change_time, unsigned long long generation, long long stage_fence);
+bool fsvrStageYawBridge(const LLQuaternion& before, const LLQuaternion& after, F32& yaw);
+bool fsvrTransitionYaw(const FSVRFinalizedBatch& batch, F32& yaw);
 
 FSVRRebaseResult decideRebase(const FSVRTransitionEvidence& evidence,
                               const LLVector3& session_anchor_local);

@@ -58,14 +58,21 @@ def main():
             objects.append(compile_source('indra/newview/' + name + '.cpp', name, pure))
         for name in ['m4math', 'v3math', 'v4math', 'm3math', 'llquaternion']:
             objects.append(compile_source('indra/llmath/' + name + '.cpp', name))
+        fixture = output / 'libopenxr_wivrn.so'
+        fixture_source = output / 'runtime_fixture.cpp'
+        fixture_source.write_text('extern "C" int runtime_fixture() { return 1; }\n')
+        subprocess.run([options.cxx, '-shared', '-fPIC', str(fixture_source), '-o', str(fixture)], check=True)
+        config = output / 'config'
+        (config / 'openxr/1').mkdir(parents=True, exist_ok=True)
+        (config / 'openxr/1/active_runtime.json').unlink(missing_ok=True)
         executable = output / 'recenter_test'
         subprocess.run([options.cxx, *flags,
                         str(repo / 'indra/newview/tests/recenter/recenter_test.cpp'),
-                        *objects, '-Wl,--gc-sections', '-o', str(executable)], check=True)
-        subprocess.run([str(executable)], check=True)
+                        *objects, str(build / 'packages/lib/release/libboost_json-mt-x64.a'), '-ldl', '-Wl,--gc-sections', '-o', str(executable)], check=True)
+        subprocess.run([str(executable), str(config), str(fixture)], check=True)
         if options.compile_viewer:
             for name in ['llvrcontinuity', 'llvrcalibration', 'llopenxrmanager',
-                         'llagentcamera', 'llvradapterapply']:
+                         'llagentcamera', 'llvradapterapply', 'llviewerdisplay']:
                 compile_source('indra/newview/' + name + '.cpp', name + '_viewer')
                 print(name + ': production object compiled', flush=True)
 

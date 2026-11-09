@@ -175,6 +175,82 @@ F32 fsvrRebasedYaw(F32 yaw, const LLMatrix4& old_to_new)
     return atan2f(forward.mV[VX], -forward.mV[VZ]);
 }
 
+FSVRRecenterHeadingPlan fsvrPlanRecenterHeading(F32 hmd_yaw, F32 old_base, F32 yaw_shift,
+    const LLQuaternion& root, const LLVector3& agent_forward)
+{
+    FSVRRecenterHeadingPlan plan;
+    const LLVector3 forward = LLVector3::x_axis * root;
+    F64 norm = 0.;
+    for (int i = 0; i < 4; ++i) norm += F64(root.mQ[i]) * root.mQ[i];
+    if (!std::isfinite(norm) || fabs(norm - 1.) > .001 || !std::isfinite(hmd_yaw) || !std::isfinite(old_base) || !std::isfinite(yaw_shift) ||
+        !forward.isFinite() || !agent_forward.isFinite() ||
+        forward.mV[VX]*forward.mV[VX] + forward.mV[VY]*forward.mV[VY] < .001f ||
+        agent_forward.mV[VX]*agent_forward.mV[VX] + agent_forward.mV[VY]*agent_forward.mV[VY] < .001f)
+        return plan;
+    plan.physical_turn = fsvrRecenterBodyTurn(hmd_yaw, old_base, yaw_shift);
+    plan.agent_heading = atan2f(agent_forward.mV[VY], agent_forward.mV[VX]);
+    plan.root_heading = atan2f(forward.mV[VY], forward.mV[VX]);
+    plan.target_heading = fsvrHeadYawDelta(plan.root_heading + plan.physical_turn, 0.f);
+    plan.agent_turn = fsvrHeadYawDelta(plan.target_heading, plan.agent_heading);
+    plan.valid = true;
+    return plan;
+}
+
+LLQuaternion fsvrRootYawAligned(const LLQuaternion& root, F32 target)
+{
+    const LLVector3 forward = LLVector3::x_axis * root;
+    const F32 heading = atan2f(forward.mV[VY], forward.mV[VX]);
+    return root * LLQuaternion(fsvrHeadYawDelta(target, heading), LLVector3::z_axis);
+}
+
+F32 fsvrRecenterBodyTurn(F32 hmd_yaw, F32 old_base, F32 old_to_new_yaw)
+{
+    return -fsvrHeadYawDelta(hmd_yaw - old_to_new_yaw, old_base);
+}
+
+bool fsvrStageAnchorEligible(long long before_time, unsigned long long before_generation,
+    long long change_time, unsigned long long generation, long long stage_fence)
+{
+    return before_time > stage_fence && before_time < change_time &&
+        change_time - before_time <= 250000000LL && before_generation == generation;
+}
+
+// LOCAL orientations in a common stable STAGE; head motion is absent.
+bool fsvrStageYawBridge(const LLQuaternion& before, const LLQuaternion& after, F32& yaw)
+{
+    LLMatrix4 old_stage_to_local, new_stage_to_local;
+    if (!fsvrLocalOriginTransform(LLVector3::zero, before, old_stage_to_local) ||
+        !fsvrLocalOriginTransform(LLVector3::zero, after, new_stage_to_local)) return false;
+    old_stage_to_local.invert();
+    old_stage_to_local *= new_stage_to_local;
+    yaw = fsvrRebasedYaw(0.f, old_stage_to_local);
+    return std::isfinite(yaw);
+}
+
+bool fsvrTransitionYaw(const FSVRFinalizedBatch& batch, F32& yaw)
+{
+    if (batch.empty()) return false;
+    auto ordered = batch;
+    std::sort(ordered.begin(), ordered.end(), [](const FSVRFinalizedTransitionKey& a,
+                                               const FSVRFinalizedTransitionKey& b) {
+        return a.change_time_ns < b.change_time_ns;
+    });
+    yaw = 0.f;
+    long long last = 0;
+    for (const auto& key : ordered)
+    {
+        if (key.incarnation != ordered.front().incarnation ||
+            key.generation != ordered.front().generation || key.change_time_ns <= last)
+            return false;
+        if (key.has_origin_transform) yaw = fsvrRebasedYaw(yaw, key.origin_transform);
+        else if (key.has_yaw_bridge && std::isfinite(key.old_to_new_yaw))
+            yaw = fsvrHeadYawDelta(yaw + key.old_to_new_yaw, 0.f);
+        else return false;
+        last = key.change_time_ns;
+    }
+    return true;
+}
+
 bool fsvrLocalOriginTransform(const LLVector3& position,
                               const LLQuaternion& orientation, LLMatrix4& out)
 {

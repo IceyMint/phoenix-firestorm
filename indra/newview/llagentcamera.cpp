@@ -1925,12 +1925,18 @@ void LLAgentCamera::updateLookAt(const S32 mouse_x, const S32 mouse_y)
                 {
                     const F32 base_in_previous_space = sViewpointOverrideHmdBaseYaw;
                     const bool transform_valid = transition.has_origin_transform;
+                    const bool yaw_valid = transform_valid || transition.has_yaw_bridge;
                     if (transform_valid)
                     {
                         // LOCAL already changed, even if the landing/body gate
                         // rejects recenter. Keep the old forward in the new frame.
                         sViewpointOverrideHmdBaseYaw = fsvrRebasedYaw(
                             base_in_previous_space, transition.origin_transform);
+                    }
+                    else if (transition.has_yaw_bridge)
+                    {
+                        sViewpointOverrideHmdBaseYaw = fsvrHeadYawDelta(
+                            base_in_previous_space + transition.old_to_new_yaw, 0.f);
                     }
                     else
                     {
@@ -1939,27 +1945,37 @@ void LLAgentCamera::updateLookAt(const S32 mouse_x, const S32 mouse_y)
                     }
                     const F32 landing_rad = fabsf(wrapAnglePi(hmd_yaw));
                     const F32 landing_deg = landing_rad * (180.f / F_PI);
-                    if (transform_valid && landing_rad <= VIEWPOINT_OVERRIDE_RECENTER_LANDING_TOLERANCE)
+                    if (yaw_valid && landing_rad <= VIEWPOINT_OVERRIDE_RECENTER_LANDING_TOLERANCE)
                     {
                         const F32 old_base_yaw = base_in_previous_space;
                         const F32 old_base_pitch = sViewpointOverrideHmdBasePitch;
                         const F32 old_base_roll = sViewpointOverrideHmdBaseRoll;
                         // Reconstruct the consumed HMD facing in the previous
                         // frame, including any nonzero post-change landing yaw.
-                        LLMatrix4 new_to_old = transition.origin_transform;
-                        new_to_old.invert();
-                        const F32 old_facing = fsvrRebasedYaw(hmd_yaw, new_to_old);
-                        const F32 body_turn = -fsvrHeadYawDelta(old_facing, base_in_previous_space);
+                        const F32 yaw_shift = transform_valid ?
+                            fsvrRebasedYaw(0.f, transition.origin_transform) : transition.old_to_new_yaw;
+                        const auto heading = fsvrPlanRecenterHeading(hmd_yaw, base_in_previous_space,
+                            yaw_shift, gAgentAvatarp->mRoot->getWorldRotation(), gAgent.getAtAxis());
+                        const F32 body_turn = heading.agent_turn;
                         const bool parented_or_seated = LLAgent::isSitting() ||
                             (gAgentAvatarp.notNull() && gAgentAvatarp->getParent());
                         const bool yaw_grabbed = gAgent.rotateGrabbed();
                         const bool teleporting = gAgent.getTeleportState() != LLAgent::TELEPORT_NONE;
-                        const bool body_turn_applied = !parented_or_seated && !yaw_grabbed && !teleporting;
+                        const bool body_turn_applied = heading.valid && !parented_or_seated && !yaw_grabbed && !teleporting;
                         const char* skip_reason = parented_or_seated ? "parented_or_seated" :
-                            yaw_grabbed ? "yaw_control_grabbed" : teleporting ? "teleporting" : "none";
+                            yaw_grabbed ? "yaw_control_grabbed" : teleporting ? "teleporting" :
+                            !heading.valid ? "invalid_world_heading" : "none";
                         if (body_turn_applied)
                         {
+                            const F32 target = heading.target_heading;
                             gAgent.yaw(body_turn);
+                            // Normal idle-body hysteresis can leave the rendered
+                            // root up to 60 degrees away from the agent heading.
+                            // A recenter is an explicit one-shot body alignment.
+                            gAgentAvatarp->mRoot->setWorldRotation(fsvrRootYawAligned(
+                                gAgentAvatarp->mRoot->getWorldRotation(), target));
+                            gAgentAvatarp->mRoot->updateWorldMatrixChildren();
+                            fsvrBeginRecenterHeadingAudit(target, transition.change_time_ns);
                             openxr.noteLocalTransitionBodyTurn(transition, body_turn);
                             sViewpointOverrideHmdBaseYaw = hmd_yaw;
                         }
@@ -1969,9 +1985,15 @@ void LLAgentCamera::updateLookAt(const S32 mouse_x, const S32 mouse_y)
                         sViewpointOverrideHmdBaseRoll = 0.f;
 
                         std::ostringstream fields;
-                        fields << "\"body_turn_applied\":" << (body_turn_applied ? "true" : "false")
+                        fields << "\"transform_valid\":" << (transform_valid ? "true" : "false")
+                               << ",\"yaw_source\":\"" << (transform_valid ? "event_transform" : "stable_stage") << "\""
+                               << ",\"body_turn_applied\":" << (body_turn_applied ? "true" : "false")
                                << ",\"body_alignment_skip_reason\":\"" << skip_reason << "\""
                                << ",\"body_turn_rad\":" << (body_turn_applied ? body_turn : 0.f)
+                               << ",\"physical_turn_rad\":" << heading.physical_turn
+                               << ",\"before_agent_heading_rad\":" << heading.agent_heading
+                               << ",\"before_root_heading_rad\":" << heading.root_heading
+                               << ",\"target_heading_rad\":" << heading.target_heading
                                << ",\"incarnation\":" << transition.incarnation
                                << ",\"generation\":" << transition.generation
                                << ",\"change_time_ns\":" << transition.change_time_ns
@@ -1998,6 +2020,7 @@ void LLAgentCamera::updateLookAt(const S32 mouse_x, const S32 mouse_y)
                                << ",\"sample_time_ns\":" << sample_time_ns
                                << ",\"landing_deg\":" << landing_deg
                                << ",\"transform_valid\":" << (transform_valid ? "true" : "false")
+                               << ",\"yaw_valid\":" << (yaw_valid ? "true" : "false")
                                << ",\"tolerance_deg\":8.0"
                                << ",\"superseded_count\":" << superseded_count;
                         emitViewpointOverrideRecenterRecord("recenter_interlock_rejected", fields.str());
@@ -4328,3 +4351,41 @@ void LLAgentCamera::loadCameraPosition()
 // </FS:Ansariel> FIRE-7758: Save/load camera position feature
 
 // EOF
+
+namespace {
+int sRecenterAuditFrames = 0;
+F32 sRecenterAuditTarget = 0.f;
+long long sRecenterAuditChange = 0;
+F32 recenterHeading(const LLQuaternion& rotation)
+{
+    const LLVector3 forward = LLVector3::x_axis * rotation;
+    return atan2f(forward.mV[VY], forward.mV[VX]);
+}
+}
+void fsvrBeginRecenterHeadingAudit(F32 target, long long change_time_ns)
+{
+    sRecenterAuditFrames = 120;
+    sRecenterAuditTarget = fsvrHeadYawDelta(target, 0.f);
+    sRecenterAuditChange = change_time_ns;
+}
+void fsvrRecordRecenterRenderedHeading()
+{
+    if (sRecenterAuditFrames <= 0) return;
+    --sRecenterAuditFrames;
+    if (sRecenterAuditFrames % 10 != 9 && sRecenterAuditFrames != 0) return;
+    if (gAgentAvatarp.isNull() || !gAgentAvatarp->mRoot) return;
+    const LLVector3 agent = gAgent.getAtAxis();
+    const F32 root = recenterHeading(gAgentAvatarp->mRoot->getWorldRotation());
+    std::ostringstream fields;
+    fields << "\"change_time_ns\":" << sRecenterAuditChange
+           << ",\"frames_remaining\":" << sRecenterAuditFrames
+           << ",\"target_world_yaw_rad\":" << sRecenterAuditTarget
+           << ",\"agent_world_yaw_rad\":" << atan2f(agent.mV[VY], agent.mV[VX])
+           << ",\"render_root_world_yaw_rad\":" << root
+           << ",\"render_root_error_rad\":" << fsvrHeadYawDelta(root, sRecenterAuditTarget)
+           << ",\"object_world_yaw_rad\":" << recenterHeading(gAgentAvatarp->getRotation())
+           << ",\"simulator_ack_verified\":false";
+    if (gAgentAvatarp->mPelvisp)
+        fields << ",\"render_pelvis_world_yaw_rad\":" << recenterHeading(gAgentAvatarp->mPelvisp->getWorldRotation());
+    emitViewpointOverrideRecenterRecord("xr_recenter_render_heading", fields.str());
+}

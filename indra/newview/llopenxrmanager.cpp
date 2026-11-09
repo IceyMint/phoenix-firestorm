@@ -51,6 +51,7 @@
 #include <deque>
 #include <fstream>
 #include <limits.h>
+#include "fsvropenxrruntime.h"
 #include <mutex>
 #include <set>
 #include <sstream>
@@ -667,139 +668,6 @@ void emit_local_continuity_record(unsigned long long incarnation,
     }
 }
 
-// Extract the string value of a "key" : "value" pair from the
-// pinned runtime manifest. The manifest is a small, controlled
-// deployment file (D4''), so a quoted-string scan is
-// sufficient; anything unexpected fails closed.
-bool extract_manifest_string(const std::string& json, const std::string& key, std::string& out_value)
-{
-    const std::string quoted_key = "\"" + key + "\"";
-    std::string::size_type pos = json.find(quoted_key);
-    if (pos == std::string::npos)
-    {
-        return false;
-    }
-    pos = json.find(':', pos + quoted_key.size());
-    if (pos == std::string::npos)
-    {
-        return false;
-    }
-    const std::string::size_type open = json.find('"', pos);
-    if (open == std::string::npos)
-    {
-        return false;
-    }
-    const std::string::size_type close = json.find('"', open + 1);
-    if (close == std::string::npos)
-    {
-        return false;
-    }
-    out_value = json.substr(open + 1, close - open - 1);
-    return true;
-}
-
-// P2-04b (D4''): pinned-runtime verification. Authentication
-// requires XR_RUNTIME_JSON to be SET and to canonicalize to the
-// approved manifest of Leah's audited WiVRn install
-// ($HOME/.local/share/openxr/1/openxr_wivrn.json) -- we verify
-// the manifest the loader was TOLD to use, which is the
-// controlled deployment's contract. The manifest itself must
-// name WiVRn, and its library_path (resolved relative to the
-// manifest directory) must exist inside the same install tree.
-// Absent or mismatched pin => NOT authenticated.
-bool verify_pinned_wivrn_manifest(std::string& out_detail)
-{
-    const char* pin_env = std::getenv("XR_RUNTIME_JSON");
-    if (!pin_env || pin_env[0] == '\0')
-    {
-        out_detail = "XR_RUNTIME_JSON is not set";
-        return false;
-    }
-    const char* home_env = std::getenv("HOME");
-    if (!home_env || home_env[0] == '\0')
-    {
-        out_detail = "HOME is not set";
-        return false;
-    }
-    const std::string expected_path =
-        std::string(home_env) + "/.local/share/openxr/1/openxr_wivrn.json";
-
-    char pin_resolved[PATH_MAX] = {};
-    char expected_resolved[PATH_MAX] = {};
-    if (!realpath(pin_env, pin_resolved) || !realpath(expected_path.c_str(), expected_resolved))
-    {
-        out_detail = "manifest path does not resolve";
-        return false;
-    }
-    if (std::strcmp(pin_resolved, expected_resolved) != 0)
-    {
-        out_detail = std::string("XR_RUNTIME_JSON resolves to ") + pin_resolved +
-                     ", not the pinned " + expected_resolved;
-        return false;
-    }
-
-    std::ifstream manifest_file(expected_resolved);
-    if (!manifest_file.is_open())
-    {
-        out_detail = "pinned manifest is unreadable";
-        return false;
-    }
-    std::ostringstream manifest_text;
-    manifest_text << manifest_file.rdbuf();
-    const std::string json = manifest_text.str();
-
-    std::string runtime_name;
-    std::string library_path;
-    if (!extract_manifest_string(json, "name", runtime_name) ||
-        !extract_manifest_string(json, "library_path", library_path))
-    {
-        out_detail = "pinned manifest lacks name/library_path";
-        return false;
-    }
-    if (runtime_name != "WiVRn")
-    {
-        out_detail = "pinned manifest names runtime \"" + runtime_name + "\", not WiVRn";
-        return false;
-    }
-
-    const std::string expected_str(expected_resolved);
-    const std::string::size_type slash = expected_str.find_last_of('/');
-    if (slash == std::string::npos)
-    {
-        out_detail = "pinned manifest path has no directory";
-        return false;
-    }
-    const std::string manifest_dir = expected_str.substr(0, slash);
-    const std::string library_candidate =
-        (!library_path.empty() && library_path[0] == '/')
-            ? library_path
-            : manifest_dir + "/" + library_path;
-    char library_resolved[PATH_MAX] = {};
-    if (!realpath(library_candidate.c_str(), library_resolved))
-    {
-        out_detail = "manifest library_path does not resolve: " + library_candidate;
-        return false;
-    }
-    const std::string library_str(library_resolved);
-    // The install tree is the pinned WiVRn prefix ($HOME/.local):
-    // the manifest lives at share/openxr/1/ under it while the
-    // libraries live at lib64/wivrn/ under it, so containment is
-    // checked against the prefix, not the manifest directory.
-    char install_root_resolved[PATH_MAX] = {};
-    const std::string install_root_candidate = std::string(home_env) + "/.local";
-    const std::string install_root = realpath(install_root_candidate.c_str(), install_root_resolved)
-                                         ? std::string(install_root_resolved)
-                                         : install_root_candidate;
-    if (library_str.compare(0, install_root.size() + 1, install_root + "/") != 0)
-    {
-        out_detail = "manifest library escapes the pinned install: " + library_str;
-        return false;
-    }
-
-    out_detail = std::string("pinned manifest ") + expected_resolved +
-                 ", library " + library_str;
-    return true;
-}
 
 std::string xr_session_state_name(XrSessionState state)
 {
@@ -1326,6 +1194,14 @@ struct LLOpenXRManagerImpl
     // (P5-03). view_space is submission-only; app_space above
     // remains the locate/camera/continuity space in both arms.
     XrSpace view_space = XR_NULL_HANDLE;
+    XrSpace yaw_stage_space = XR_NULL_HANDLE;
+    struct StageOrientation {
+        long long time = 0;
+        unsigned long long generation = 0;
+        LLQuaternion orientation;
+    };
+    std::deque<StageOrientation> stage_orientations;
+    long long stage_change_fence = 0;
     bool view_diagnostic_requested = false;
     bool view_diagnostic_create_failed = false;
     bool diagnostic_arm_view = false;
@@ -1824,21 +1700,15 @@ bool LLOpenXRManager::initialize()
 
     openxr_info("xrCreateInstance succeeded.");
 
-    // P2-04b (D4''): deployment identity gate. Authentication
-    // requires the pinned WiVRn manifest (verify_pinned_wivrn_
-    // manifest) AND a non-foreign instance identity: the
-    // runtime's reported name is recorded, and a non-empty name
-    // outside {"WiVRn", "Monado"} fails authentication.
-    // Unauthenticated does NOT fail initialization -- VR keeps
-    // working; the probe stays diagnostic-only (P2-04a
-    // behavior), no transitions are queued and continuity
-    // cannot be Established.
+    // Recognize the selected WiVRn deployment through the loader's manifest
+    // selection, its loaded library and successful instance properties. Failure
+    // leaves initialization available but cannot authorize recenter transitions.
     {
         std::string identity_detail;
-        const bool manifest_ok = verify_pinned_wivrn_manifest(identity_detail);
+        const bool manifest_ok = fsvrVerifyRuntimeManifest(identity_detail);
         XrInstanceProperties instance_properties{};
         instance_properties.type = XR_TYPE_INSTANCE_PROPERTIES;
-        bool name_ok = true;
+        bool name_ok = false;
         const XrResult props_result = xrGetInstanceProperties(mImpl->instance, &instance_properties);
         if (XR_SUCCEEDED(props_result))
         {
@@ -1848,38 +1718,16 @@ bool LLOpenXRManager::initialize()
                            << XR_VERSION_MINOR(instance_properties.runtimeVersion) << "."
                            << XR_VERSION_PATCH(instance_properties.runtimeVersion);
             mImpl->runtime_version = version_stream.str();
-            // The reported name is accepted when it IS one of
-            // the audited runtimes or carries that runtime's
-            // name as a leading token: Leah's WiVRn reports
-            // itself as "WiVRn 'v26.6-205-gbef986d6-dirty'"
-            // (name + version decoration, measured live
-            // 2026-10-23), so an exact-string test would reject
-            // the audited deployment itself. A foreign runtime
-            // (SteamVR, Oculus, ...) still fails: its name
-            // neither equals nor leads with WiVRn/Monado.
-            const std::string& reported_name = mImpl->runtime_name;
-            auto is_audited_runtime_name = [](const std::string& name, const char* base) {
-                const std::string base_str(base);
-                return name == base_str ||
-                       (name.size() > base_str.size() &&
-                        name.compare(0, base_str.size(), base_str) == 0 &&
-                        name[base_str.size()] == ' ');
-            };
-            if (!reported_name.empty() &&
-                !is_audited_runtime_name(reported_name, "WiVRn") &&
-                !is_audited_runtime_name(reported_name, "Monado"))
-            {
-                name_ok = false;
-            }
+            name_ok = fsvrSupportedRuntimeName(mImpl->runtime_name);
         }
         else
         {
             openxr_warn("xrGetInstanceProperties failed: " +
                         format_xr_result(mImpl->instance, props_result) +
-                        "; identity rests on the manifest pin alone.");
+                        "; runtime identity rejected.");
         }
         mImpl->runtime_authenticated = manifest_ok && name_ok;
-        openxr_info("P2-04b runtime identity: manifest_pin=" +
+        openxr_info("P2-04b runtime identity: manifest_verification=" +
                     std::string(manifest_ok ? "ok" : "FAILED") + " (" + identity_detail + ")" +
                     ", runtime_name=\"" + mImpl->runtime_name + "\"" +
                     ", runtime_version=" + mImpl->runtime_version +
@@ -2105,6 +1953,13 @@ bool LLOpenXRManager::initialize()
         return false;
     }
 
+    XrReferenceSpaceCreateInfo stage_info = space_info;
+    stage_info.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_STAGE;
+    if (XR_FAILED(xrCreateReferenceSpace(mImpl->session, &stage_info, &mImpl->yaw_stage_space)))
+        mImpl->yaw_stage_space = XR_NULL_HANDLE;
+    openxr_info(std::string("Recenter stable STAGE orientation anchor: ") +
+        (mImpl->yaw_stage_space != XR_NULL_HANDLE ? "available" : "unavailable; unknown transforms will hold"));
+
     // P2-05a (P5-03): sample the VIEW diagnostic request ONCE,
     // here at initialize(). The arm becomes VIEW only if the VIEW
     // space is actually created; a creation failure leaves a real
@@ -2174,7 +2029,7 @@ bool LLOpenXRManager::initialize()
         (mImpl->hand_tracker_created[0] || mImpl->hand_tracker_created[1]);
 
     // P2-04b (D5'): with the session and its LOCAL space created
-    // under the authenticated pinned runtime, continuity is
+    // under the verified WiVRn runtime, continuity is
     // Established for this (incarnation, session, app_space)
     // tuple on the source-established basis: the audited Monado
     // overseer holds the LOCAL offsets server-side across these
@@ -2545,6 +2400,15 @@ void LLOpenXRManager::processEvents()
             // these events can arrive across session transitions.
             const auto* space_event = reinterpret_cast<const XrEventDataReferenceSpaceChangePending*>(&event);
             const XrPosef& prev_pose = space_event->poseInPreviousSpace;
+            if (space_event->session == mImpl->session &&
+                space_event->referenceSpaceType == XR_REFERENCE_SPACE_TYPE_STAGE)
+            {
+                mImpl->stage_orientations.clear();
+                mImpl->stage_change_fence = std::max(mImpl->stage_change_fence,
+                    static_cast<long long>(space_event->changeTime));
+                for (auto& pending : mImpl->pending_local_transitions)
+                    pending.has_yaw_bridge = false;
+            }
             std::ostringstream fields;
             fields << "\"reference_space_type\":" << static_cast<int>(space_event->referenceSpaceType)
                    << ",\"reference_space_type_name\":\"" << xr_reference_space_type_name(space_event->referenceSpaceType) << "\""
@@ -2573,7 +2437,7 @@ void LLOpenXRManager::processEvents()
             // P2-04b (D2'/D7'): queue the transition for the
             // camera's interlock-gated consumption -- only for the
             // audited deployment (LOCAL space, this session,
-            // authenticated pinned runtime) and only while the
+            // verified WiVRn runtime) and only while the
             // consumption gate is enabled; otherwise the probe
             // above remains the only record (P2-04a behavior) and
             // nothing accumulates.
@@ -2595,6 +2459,43 @@ void LLOpenXRManager::processEvents()
                                      prev_pose.orientation.z, prev_pose.orientation.w),
                         transition.origin_transform);
                 }
+                if (!space_event->poseValid && mImpl->yaw_stage_space != XR_NULL_HANDLE)
+                {
+                    for (auto it = mImpl->stage_orientations.rbegin();
+                         it != mImpl->stage_orientations.rend(); ++it)
+                    {
+                        if (!fsvrStageAnchorEligible(it->time, it->generation,
+                            transition.change_time_ns, transition.generation, mImpl->stage_change_fence))
+                            continue;
+                        XrSpaceLocation location{};
+                        location.type = XR_TYPE_SPACE_LOCATION;
+                        const XrResult located = xrLocateSpace(mImpl->app_space, mImpl->yaw_stage_space,
+                                                               space_event->changeTime, &location);
+                        if (XR_SUCCEEDED(located) &&
+                            (location.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT))
+                        {
+                            const auto& q = location.pose.orientation;
+                            transition.has_yaw_bridge = fsvrStageYawBridge(it->orientation,
+                                LLQuaternion(q.x,q.y,q.z,q.w), transition.old_to_new_yaw);
+                            std::ostringstream bridge_fields;
+                            const auto& before = it->orientation;
+                            bridge_fields << "\"change_time_ns\":" << transition.change_time_ns
+                                << ",\"before_time_ns\":" << it->time
+                                << ",\"valid\":" << (transition.has_yaw_bridge ? "true" : "false")
+                                << ",\"old_to_new_yaw_rad\":" << transition.old_to_new_yaw
+                                << ",\"before_local_in_stage\":[" << before.mQ[0] << "," << before.mQ[1] << "," << before.mQ[2] << "," << before.mQ[3] << "]"
+                                << ",\"after_local_in_stage\":[" << q.x << "," << q.y << "," << q.z << "," << q.w << "]";
+                            openxr_info("xr_recenter_stage_measurement: {" + bridge_fields.str() + "}");
+                        }
+                        break;
+                    }
+                    openxr_info("xr_recenter_yaw_bridge: valid=" +
+                        std::string(transition.has_yaw_bridge ? "true" : "false") +
+                        ", source=LOCAL_in_STABLE_STAGE, yaw_rad=" + std::to_string(transition.old_to_new_yaw));
+                }
+                // No second event may reuse this pre-change anchor. A batch
+                // with an unbridged change fails closed in fsvrTransitionYaw.
+                mImpl->stage_orientations.clear();
                 // P2-04b (round-8 B3): duplicate deliveries of
                 // one change collapse -- a key already pending
                 // or already finalized is traced and never
@@ -2855,6 +2756,7 @@ bool LLOpenXRManager::takeNewestEligibleLocalTransition(long long sample_time_ns
         const auto composed = fsvrComposeLocalTransitions(finalized_keys);
         out_transition.has_origin_transform = composed.has_origin_transform;
         out_transition.origin_transform = composed.origin_transform;
+        out_transition.has_yaw_bridge = fsvrTransitionYaw(finalized_keys, out_transition.old_to_new_yaw);
         mImpl->finalization_observer.noteFinalizedBatch(finalized_keys);
     }
     return found;
@@ -6306,6 +6208,23 @@ bool LLOpenXRManager::getHmdForward(LLVector3& out_forward) const
             mImpl->head_consumed_sample_time_ns = mImpl->adopted_sample_time_ns;
             mImpl->head_consumed_sample_orientation_tracked = mImpl->adopted_sample_orientation_tracked;
             mImpl->head_consumed_sample_valid = true;
+            if (mImpl->yaw_stage_space != XR_NULL_HANDLE &&
+                mImpl->adopted_sample_time_ns > mImpl->stage_change_fence &&
+                (mImpl->stage_orientations.empty() ||
+                 mImpl->stage_orientations.back().time != mImpl->adopted_sample_time_ns))
+            {
+                XrSpaceLocation location{};
+                location.type = XR_TYPE_SPACE_LOCATION;
+                if (XR_SUCCEEDED(xrLocateSpace(mImpl->app_space, mImpl->yaw_stage_space,
+                    mImpl->adopted_sample_time_ns, &location)) &&
+                    (location.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT))
+                {
+                    const auto& q = location.pose.orientation;
+                    mImpl->stage_orientations.push_back({mImpl->adopted_sample_time_ns,
+                        mImpl->session_generation, LLQuaternion(q.x,q.y,q.z,q.w)});
+                    if (mImpl->stage_orientations.size() > 32) mImpl->stage_orientations.pop_front();
+                }
+            }
         }
         else
         {
@@ -6673,6 +6592,11 @@ void LLOpenXRManager::shutdown()
         }
     }
 
+    if (mImpl->yaw_stage_space != XR_NULL_HANDLE)
+    {
+        xrDestroySpace(mImpl->yaw_stage_space);
+        mImpl->yaw_stage_space = XR_NULL_HANDLE;
+    }
     if (mImpl->view_space != XR_NULL_HANDLE)
     {
         xrDestroySpace(mImpl->view_space);
