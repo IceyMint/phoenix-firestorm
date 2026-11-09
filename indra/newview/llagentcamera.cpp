@@ -1976,7 +1976,7 @@ void LLAgentCamera::updateLookAt(const S32 mouse_x, const S32 mouse_y)
                                 gAgentAvatarp->mRoot->getWorldRotation(), target));
                             gAgentAvatarp->mRoot->updateWorldMatrixChildren();
                             fsvrBeginRecenterHeadingAudit(target, transition.change_time_ns);
-                            openxr.noteLocalTransitionBodyTurn(transition, body_turn);
+                            openxr.noteLocalTransitionBodyTurn(transition, heading.physical_turn);
                             sViewpointOverrideHmdBaseYaw = hmd_yaw;
                         }
                         // Gated body rotation preserves the old gaze correspondence
@@ -1989,7 +1989,8 @@ void LLAgentCamera::updateLookAt(const S32 mouse_x, const S32 mouse_y)
                                << ",\"yaw_source\":\"" << (transform_valid ? "event_transform" : "stable_stage") << "\""
                                << ",\"body_turn_applied\":" << (body_turn_applied ? "true" : "false")
                                << ",\"body_alignment_skip_reason\":\"" << skip_reason << "\""
-                               << ",\"body_turn_rad\":" << (body_turn_applied ? body_turn : 0.f)
+                               << ",\"body_turn_rad\":" << (body_turn_applied ? heading.physical_turn : 0.f)
+                               << ",\"agent_turn_rad\":" << (body_turn_applied ? body_turn : 0.f)
                                << ",\"physical_turn_rad\":" << heading.physical_turn
                                << ",\"before_agent_heading_rad\":" << heading.agent_heading
                                << ",\"before_root_heading_rad\":" << heading.root_heading

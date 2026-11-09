@@ -69,7 +69,7 @@ struct FSVRFinalizedTransitionKey
     // Yaw-only evidence NEVER authorizes positional rebasing.
     bool has_yaw_bridge = false;
     F32 old_to_new_yaw = 0.f;
-    F32 body_turn_rad = 0.f; // accepted LLAgent yaw; annotated by camera
+    F32 body_turn_rad = 0.f; // applied root yaw; agent command is traced separately
 };
 
 // One take/retire call's finalized non-stale transitions:

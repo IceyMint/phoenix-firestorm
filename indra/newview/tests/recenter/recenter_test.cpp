@@ -195,6 +195,13 @@ int main(int argc, char** argv)
     const LLVector3 result_agent = old_agent * LLQuaternion(plan.agent_turn, LLVector3::z_axis);
     const LLVector3 result_root = LLVector3::x_axis * fsvrRootYawAligned(old_root, plan.target_heading);
     check(near(result_agent, result_root));
+    FSVRSessionNeutral lagged;
+    lagged.installFromCapture({}, LLVector3::zero, 0.f, LLVector3::zero, LLVector3::zero,
+        FSVRScaleSource::PROVISIONAL_SYNC, FSVRPosture::STANDING);
+    // Calibration follows the actual root change, not the larger agent command
+    // needed to close an existing agent/root discrepancy.
+    lagged.rebaseForLocalTransition(first.origin_transform, plan.physical_turn);
+    check(near(lagged.view().anchor_forward_yaw_rad, 0.f));
     check(!fsvrPlanRecenterHeading(0.f, 0.f, 0.f, old_root, LLVector3::z_axis).valid);
     check(!fsvrPlanRecenterHeading(0.f, 0.f, 0.f, LLQuaternion(0.f,0.f,0.f,0.f), old_agent).valid);
     F32 rejected_yaw;
