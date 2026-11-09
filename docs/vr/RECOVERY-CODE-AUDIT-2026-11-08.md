@@ -36,12 +36,12 @@ This report distinguishes **CONFIRMED source behavior** from **INCOMPLETE featur
 
 **Impact:** The problem is shared by head, body, reference-space and positional-neutral systems. A patch that only calls `gAgent.yaw` can leave calibration incoherent. The isolated experimental branch `vr/recenter-forward-alignment-20261108` was written against the older Phase-2 code and **must not be blindly merged** into the newer calibration system. Test straight, ±90°, 180°, wrap, repeated recenter and standing/seated.
 
-### D. No true stereo yet — CONFIRMED incomplete milestone
+### D. No true stereo yet — CONFIRMED incomplete milestone, now DEFERRED in priority
 
 - `indra/newview/llopenxrmanager.cpp:5267-5400`: the same source framebuffer is blitted to both swapchains; each projection view uses common `submit_pose` and `mono_fov`.
 - `indra/newview/llopenxrmanager.cpp:5872-5908`: right cornea is frozen for provenance but not used as the rendered right-eye camera.
 
-**Impact:** Mono-duplicated submission cannot satisfy anatomical binocular viewpoint or normal stereo depth. It is a development fallback, not completed VR.
+**Impact:** Mono-duplicated submission cannot satisfy anatomical binocular viewpoint or normal stereo depth. This remains an incomplete feature, but the user has explicitly accepted deferring true stereo until the more important embodiment behavior works. Immediate acceptance focuses on a *correct, stable left-eye mono perspective* and coherent OpenXR display, rather than two-eye parallax.
 
 ## Important compatibility / design gaps
 
@@ -91,10 +91,11 @@ This report distinguishes **CONFIRMED source behavior** from **INCOMPLETE featur
 | --- | --- |
 | 0. Freeze and instrument | Record baseline branch/commit; builds reproducibly; traces accurately distinguish tracker input, animation base, committed avatar pose, camera, and OpenXR submission |
 | 1. Recenter correctness | Body forward aligns with pre-recenter HMD facing; yaw wraps correctly; LOCAL-space transform and positional neutral are coherent; no unnecessary snap |
-| 2. True per-eye stereo | Each eye has its own rendering camera, cornea anchor, pose/FOV and correct source; headset test confirms parallax and stable presentation |
+| 2. Stable left-eye mono view | Render from the left cornea with correct camera pose, projection/FOV, tracking stability, and coherent OpenXR presentation. The two displayed images may be identical during this phase. |
 | 3. Minimal head+hands embodiment | Quest controller poses produce wrist targets; arm IK commits intended joint rotations; a full-body sit AO continues animating unclaimed joints |
 | 4. Proportional body tracking | Small-avatar arm/lean/root movements follow rig anatomy; standing/seated/teleport transitions tested; remove unnecessary gates or retain only justified safeguards |
 | 5. Observer Mode | Full-body animation is preserved; OFF gives headset-controlled view from animated eye position; ON composes animated head rotation; mode transitions do not corrupt tracking |
+| 6. True per-eye stereo (deferred) | Each eye eventually has its own rendering camera, cornea anchor, pose/FOV and correct source; verify binocular parallax and stable presentation when this becomes a priority |
 
 **Do not start by enabling Gate 1**: the arm samples and targets are still false; the rest of the input and output contracts require validation. Do not replace the entire pose/animation system before testing the existing post-blend hook.
 
