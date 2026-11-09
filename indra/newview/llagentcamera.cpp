@@ -1938,9 +1938,45 @@ void LLAgentCamera::updateLookAt(const S32 mouse_x, const S32 mouse_y)
                         const F32 old_base_yaw = sViewpointOverrideHmdBaseYaw;
                         const F32 old_base_pitch = sViewpointOverrideHmdBasePitch;
                         const F32 old_base_roll = sViewpointOverrideHmdBaseRoll;
-                        // Yaw-only (rule #11): a recenter
-                        // redefines forward, never level --
-                        // pitch/roll bases stay pinned at 0.
+                        // P2-04d: the recenter must align the avatar's
+                        // FORWARD direction with the wearer's pre-change
+                        // HMD facing, not merely zero the avatar's head
+                        // offset. OpenXR's new LOCAL forward is expressed
+                        // in the previous LOCAL frame (P2-04d transition).
+                        // Subtract the OLD head calibration yaw: an
+                        // activation may have begun while the user faced
+                        // somewhere other than the runtime's origin.
+                        // OpenXR yaw is positive toward +X (right), while
+                        // LLAgent::yaw is positive toward +Y (left).
+                        const bool heading_valid =
+                            transition.new_forward_yaw_valid &&
+                            std::isfinite(transition.new_forward_yaw_rad);
+                        const F32 body_turn_rad = heading_valid
+                            ? -wrapAnglePi(transition.new_forward_yaw_rad -
+                                           old_base_yaw)
+                            : 0.f;
+                        // A seated/parented avatar's root orientation
+                        // belongs to its parent. A script-grabbed yaw
+                        // also cannot be changed through LLAgent::yaw.
+                        // Do not claim body alignment in those cases.
+                        const bool parented_or_seated =
+                            LLAgent::isSitting() ||
+                            (gAgentAvatarp.notNull() && gAgentAvatarp->getParent());
+                        const bool yaw_grabbed = gAgent.rotateGrabbed();
+                        const bool body_aligned =
+                            heading_valid && !parented_or_seated && !yaw_grabbed;
+                        const char* body_skip_reason =
+                            !heading_valid ? "missing_space_orientation" :
+                            parented_or_seated ? "parented_or_seated" :
+                            yaw_grabbed ? "yaw_control_grabbed" : "none";
+                        if (body_aligned)
+                        {
+                            gAgent.yaw(body_turn_rad);
+                        }
+
+                        // Yaw-only (rule #11): recenter redefines
+                        // forward, never level. Pitch/roll remain
+                        // gravity-referenced; only yaw is calibrated.
                         sViewpointOverrideHmdBaseYaw = hmd_yaw;
                         sViewpointOverrideHmdBasePitch = 0.f;
                         sViewpointOverrideHmdBaseRoll = 0.f;
@@ -1956,7 +1992,27 @@ void LLAgentCamera::updateLookAt(const S32 mouse_x, const S32 mouse_y)
                                << ",\"superseded_count\":" << superseded_count
                                << ",\"old_base\":[" << old_base_yaw << "," << old_base_pitch << "," << old_base_roll << "]"
                                << ",\"new_base\":[" << sViewpointOverrideHmdBaseYaw << "," << sViewpointOverrideHmdBasePitch << "," << sViewpointOverrideHmdBaseRoll << "]"
-                               << ",\"continuity_state\":" << openxr.getLocalContinuityState()
+                               << ",\"body_forward_aligned\":" << (body_aligned ? "true" : "false")
+                               << ",\"body_alignment_skip_reason\":\"" << body_skip_reason << "\""
+                               << ",\"new_forward_old_space_yaw_rad\":";
+                        if (heading_valid)
+                        {
+                            fields << transition.new_forward_yaw_rad;
+                        }
+                        else
+                        {
+                            fields << "null";
+                        }
+                        fields << ",\"body_turn_rad\":";
+                        if (body_aligned)
+                        {
+                            fields << body_turn_rad;
+                        }
+                        else
+                        {
+                            fields << "null";
+                        }
+                        fields << ",\"continuity_state\":" << openxr.getLocalContinuityState()
                                << ",\"continuity_basis\":\"" << openxr.getLocalContinuityBasis() << "\"";
                         emitViewpointOverrideRecenterRecord("xr_recenter_applied", fields.str());
                     }
