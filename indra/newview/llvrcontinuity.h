@@ -9,8 +9,7 @@
  * C8 owns transitions and signals only. It observes the
  * OpenXR manager's LOCAL-transition finalizations without
  * participating in them (CP-1: a manager-owned observer
- * with a pull-only drain; the camera's take/retire calls,
- * the queue, and the P2-04 yaw base are untouched), decides
+ * with a pull-only drain and camera body-turn annotation), decides
  * rebase-vs-suspend as a pure function over authenticated,
  * finite, rigid transform evidence (CP-2), detects skeleton
  * reinitialization through LLAvatarAppearance's rebuild
@@ -25,22 +24,14 @@
  * entry points, in the shell below), and the glue's
  * continuity history retires through its own predicate.
  *
- * Production policy (DP-B6, ruled): no production evidence
- * in v1 makes an old->new origin transform "provably
- * continuous" -- the transition record carries no transform
- * and no producer of one exists in the tree. The production
- * routing therefore constructs evidence with
- * has_origin_transform = false UNCONDITIONALLY (DP-C8-6:
- * the lock is the absence of a producer -- no setting, no
- * diagnostic toggle, no environment variable sets it true),
- * every production transition suspends, and the rebase
- * branch of decideRebase is reachable only from H8
- * fixtures. Enabling it later requires a new ruling on a
- * named evidence source.
+ * Recovery milestone 1: authenticated OpenXR LOCAL events now supply
+ * finite, gravity-aligned old-to-new transforms. Missing or invalid
+ * evidence still suspends. Every transition retires positional history
+ * and aborts acquisition windows; only an established neutral is rebased.
  *
  * Silence (DP-B7): no C8 path emits user-visible output.
- * Suspend/resume visibility is C9 traces and C5's
- * calibration reports, each in their owner's component.
+ * Outcomes are available in the LOCAL calibration continuity trace
+ * and C5 calibration reports.
  *
  * Factoring (house pattern, C4/C5/C6C7): the observer, the
  * decision helper, and the epoch router sit above the
@@ -66,16 +57,16 @@
 // CP-1: finalized-transition evidence capture.
 // ---------------------------------------------------------------------------
 
-// One finalized LOCAL transition's identity, as presented
-// by the manager's finalization fan-out. Field-for-field
-// the manager's LLLocalSpaceTransition; this TU cannot
-// include the manager's header (the manager includes this
-// one), so the fan-out sites copy the three fields.
+// Identity and transform evidence retained from an authenticated LOCAL event.
+// LLLocalSpaceTransition extends this payload; finalization copies it intact.
 struct FSVRFinalizedTransitionKey
 {
     unsigned long long incarnation = 0;
     unsigned long long generation = 0;
     long long change_time_ns = 0;
+    bool has_origin_transform = false;
+    LLMatrix4 origin_transform; // old LOCAL -> new LOCAL, raw OpenXR axes
+    F32 body_turn_rad = 0.f; // accepted LLAgent yaw; annotated by camera
 };
 
 // One take/retire call's finalized non-stale transitions:
@@ -117,6 +108,10 @@ public:
     // dropped; if no key survives, nothing is buffered.
     void noteFinalizedBatch(const FSVRFinalizedBatch& keys);
 
+    // Annotate only an undrained, matching finalization. The camera calls
+    // this on the same thread immediately after applying LLAgent::yaw.
+    void noteBodyTurn(unsigned long long incarnation, long long time, F32 turn);
+
     // Pull-only drain: returns the accumulated batches and
     // clears the buffer. Empty when nothing finalized since
     // the last drain.
@@ -144,12 +139,7 @@ private:
 // CP-2: the pure rebase decision.
 // ---------------------------------------------------------------------------
 
-// The complete evidence a rebase decision may rest on.
-// Production evidence (CP-1/CP-4) can only ever populate
-// the key fields: no producer of an old->new origin
-// transform exists in the tree (spec section 6.2 / DP-B6),
-// so has_origin_transform is false on every production
-// call.
+// Validated transform evidence bound to one transition identity.
 struct FSVRTransitionEvidence
 {
     // The transition's own identity (from CP-1's batch).
@@ -177,6 +167,8 @@ struct FSVRRebaseResult
 {
     FSVRRebaseDecision decision = FSVRRebaseDecision::Suspend;
     LLVector3 rebased_anchor; // valid only on Rebase
+    LLMatrix4 origin_transform;
+    F32 body_turn_rad = 0.f;
 };
 
 // The rigidity tolerance (CP-2 [R2]): an absolute bound on
@@ -201,6 +193,14 @@ constexpr F64 FSVR_RIGID_TOL = 1e-3;
 // (the tree's own operator*(LLVector3, LLMatrix4)). The
 // function is total and pure: no globals, no settings, no
 // manager access.
+// Checked conversion of the OpenXR new-origin pose to old->new coordinates.
+// LOCAL is gravity aligned: reject pitch/roll, malformed quaternions and NaNs.
+bool fsvrLocalOriginTransform(const LLVector3& position,
+                              const LLQuaternion& orientation, LLMatrix4& out);
+FSVRTransitionEvidence fsvrComposeLocalTransitions(const FSVRFinalizedBatch& batch);
+F32 fsvrRebasedYaw(F32 yaw, const LLMatrix4& old_to_new);
+F32 fsvrHeadYawDelta(F32 yaw, F32 base);
+
 FSVRRebaseResult decideRebase(const FSVRTransitionEvidence& evidence,
                               const LLVector3& session_anchor_local);
 
@@ -226,25 +226,17 @@ public:
     // each advance once; on Rebase, neither advances (the
     // neutral survives, continuity history is retained --
     // spec section 6.3). Returns decideRebase's full result.
-    // Production reaches this only through
-    // routeFinalizedBatch(); H8 also drives it directly
-    // with fixture evidence (the h8-01 wiring case).
+    // Legacy single-evidence seam for isolated fixtures. Production uses
+    // routeFinalizedBatch, which additionally retires old-coordinate history.
     FSVRRebaseResult routeTransitionEvidence(
         const FSVRTransitionEvidence& evidence,
         const LLVector3& session_anchor_local);
 
-    // The production routing entry (CP-4 / DP-C8-6):
-    // constructs evidence from the batch with
-    // has_origin_transform = false UNCONDITIONALLY -- the
-    // single production construction site, named here so
-    // the code cross-check can grep it. The batch's
-    // representative identity is its greatest
-    // change_time_ns key (a take's consumed-newest; a
-    // retire batch's latest final). An empty batch is not
-    // an event: it routes to Suspend with NO epoch advance
-    // (the production observer never emits one; defensive).
+    // Chronological composition; invalid/missing transforms suspend.
+    // Every nonempty batch advances epochs to retire old-coordinate history.
     FSVRRebaseResult routeFinalizedBatch(
-        const FSVRFinalizedBatch& batch);
+        const FSVRFinalizedBatch& batch,
+        const LLVector3& anchor = LLVector3::zero);
 
     // CP-5 consumption predicate: feed one sampled rebuild
     // generation of the self avatar's LLAvatarAppearance.

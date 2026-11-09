@@ -2587,6 +2587,14 @@ void LLOpenXRManager::processEvents()
                 transition.incarnation = mImpl->incarnation;
                 transition.generation = mImpl->session_generation;
                 transition.change_time_ns = static_cast<long long>(space_event->changeTime);
+                if (space_event->poseValid)
+                {
+                    transition.has_origin_transform = fsvrLocalOriginTransform(
+                        LLVector3(prev_pose.position.x, prev_pose.position.y, prev_pose.position.z),
+                        LLQuaternion(prev_pose.orientation.x, prev_pose.orientation.y,
+                                     prev_pose.orientation.z, prev_pose.orientation.w),
+                        transition.origin_transform);
+                }
                 // P2-04b (round-8 B3): duplicate deliveries of
                 // one change collapse -- a key already pending
                 // or already finalized is traced and never
@@ -2799,10 +2807,7 @@ bool LLOpenXRManager::takeNewestEligibleLocalTransition(long long sample_time_ns
                 ++superseded_count;
                 // P2-07B C8 (CP-1): the displaced newest is
                 // finalized as superseded by this call.
-                FSVRFinalizedTransitionKey key;
-                key.incarnation = newest.incarnation;
-                key.generation = newest.generation;
-                key.change_time_ns = newest.change_time_ns;
+                FSVRFinalizedTransitionKey key = newest;
                 finalized_keys.push_back(key);
                 newest = transition;
             }
@@ -2814,10 +2819,7 @@ bool LLOpenXRManager::takeNewestEligibleLocalTransition(long long sample_time_ns
                     std::make_pair(transition.incarnation, transition.change_time_ns));
                 ++superseded_count;
                 // P2-07B C8 (CP-1): superseded by this call.
-                FSVRFinalizedTransitionKey key;
-                key.incarnation = transition.incarnation;
-                key.generation = transition.generation;
-                key.change_time_ns = transition.change_time_ns;
+                FSVRFinalizedTransitionKey key = transition;
                 finalized_keys.push_back(key);
             }
             else
@@ -2839,10 +2841,7 @@ bool LLOpenXRManager::takeNewestEligibleLocalTransition(long long sample_time_ns
         out_transition = newest;
         // P2-07B C8 (CP-1): the consumed-newest key completes
         // this call's batch.
-        FSVRFinalizedTransitionKey key;
-        key.incarnation = newest.incarnation;
-        key.generation = newest.generation;
-        key.change_time_ns = newest.change_time_ns;
+        FSVRFinalizedTransitionKey key = newest;
         finalized_keys.push_back(key);
     }
     if (!finalized_keys.empty())
@@ -2852,12 +2851,26 @@ bool LLOpenXRManager::takeNewestEligibleLocalTransition(long long sample_time_ns
         // set have reached their post-call state. Observation
         // only -- nothing above reads the observer, and this
         // call mutates nothing but the observer's own buffer.
+        // Camera and positional continuity consume the SAME chronological chain.
+        const auto composed = fsvrComposeLocalTransitions(finalized_keys);
+        out_transition.has_origin_transform = composed.has_origin_transform;
+        out_transition.origin_transform = composed.origin_transform;
         mImpl->finalization_observer.noteFinalizedBatch(finalized_keys);
     }
     return found;
 #else
     (void)sample_time_ns;
     return false;
+#endif
+}
+
+void LLOpenXRManager::noteLocalTransitionBodyTurn(
+    const LLLocalSpaceTransition& transition, F32 turn)
+{
+#if LL_LINUX && LL_X11
+    if (mImpl && transition.incarnation == mImpl->incarnation)
+        mImpl->finalization_observer.noteBodyTurn(
+            transition.incarnation, transition.change_time_ns, turn);
 #endif
 }
 
@@ -2899,10 +2912,7 @@ void LLOpenXRManager::retireEligibleLocalTransitions(long long sample_time_ns, c
             // transition retired on the not-feeding path
             // redefined LOCAL exactly as much as an applied
             // one did, so it is presented identically.
-            FSVRFinalizedTransitionKey key;
-            key.incarnation = transition.incarnation;
-            key.generation = transition.generation;
-            key.change_time_ns = transition.change_time_ns;
+            FSVRFinalizedTransitionKey key = transition;
             finalized_keys.push_back(key);
         }
         else

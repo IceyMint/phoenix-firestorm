@@ -141,6 +141,7 @@ F32 sViewpointOverrideHeadYaw = 0.f;
 F32 sViewpointOverrideHeadPitch = 0.f;
 F32 sViewpointOverrideHeadRoll = 0.f;
 bool sViewpointOverrideHmdCalibrated = false;
+bool sViewpointOverrideHmdFrameVerified = true;
 F32 sViewpointOverrideHmdBaseYaw = 0.f;
 F32 sViewpointOverrideHmdBasePitch = 0.f;
 F32 sViewpointOverrideHmdBaseRoll = 0.f;
@@ -1878,6 +1879,7 @@ void LLAgentCamera::updateLookAt(const S32 mouse_x, const S32 mouse_y)
                 sViewpointOverrideHmdBasePitch = 0.f;
                 sViewpointOverrideHmdBaseRoll = 0.f;
                 sViewpointOverrideHmdCalibrated = true;
+                sViewpointOverrideHmdFrameVerified = true;
                 sViewpointOverrideCaptureIncarnation = openxr.getIncarnation();
 
                 // P2-04b (D3'): a transition already eligible at
@@ -1890,7 +1892,8 @@ void LLAgentCamera::updateLookAt(const S32 mouse_x, const S32 mouse_y)
                                                           "absorbed_by_initial_capture");
                 }
             }
-            else if (openxr.getLocalContinuityState() == 2 ||
+            else if (!sViewpointOverrideHmdFrameVerified ||
+                     openxr.getLocalContinuityState() == 2 ||
                      (sViewpointOverrideCaptureIncarnation != 0 &&
                       sViewpointOverrideCaptureIncarnation != openxr.getIncarnation()))
             {
@@ -1912,41 +1915,64 @@ void LLAgentCamera::updateLookAt(const S32 mouse_x, const S32 mouse_y)
                      have_sample_info && sample_tracked && std::isfinite(hmd_yaw) &&
                      std::isfinite(hmd_pitch) && std::isfinite(hmd_roll))
             {
-                // P2-04b (D2'/D3'): consume at most one transition
-                // per frame -- the newest eligible at this
-                // sample's locate time (older eligible ones were
-                // retired as superseded inside the manager) --
-                // and apply it only if this consumed sample LANDS
-                // the facing at the new forward: |wrapped yaw|
-                // within tolerance. On acceptance the base is
-                // recaptured from THIS sample, so the head
-                // residual (sample - base) is zero from this
-                // frame on: the view faces the avatar's forward
-                // until the head moves (spec addendum). Rejection
-                // drops the transition forever; the runtime has
-                // already moved LOCAL, so the preserved base may
-                // leave a visible offset -- fail-closed by
-                // design (round 5).
+                // Consume the newest eligible transition once. The manager
+                // composes every eligible LOCAL change in chronological order.
+                // Re-express the head base even if alignment is gated; only an
+                // accepted free-standing body turn neutralizes relative yaw.
                 LLLocalSpaceTransition transition;
                 int superseded_count = 0;
                 if (openxr.takeNewestEligibleLocalTransition(sample_time_ns, transition, superseded_count))
                 {
+                    const F32 base_in_previous_space = sViewpointOverrideHmdBaseYaw;
+                    const bool transform_valid = transition.has_origin_transform;
+                    if (transform_valid)
+                    {
+                        // LOCAL already changed, even if the landing/body gate
+                        // rejects recenter. Keep the old forward in the new frame.
+                        sViewpointOverrideHmdBaseYaw = fsvrRebasedYaw(
+                            base_in_previous_space, transition.origin_transform);
+                    }
+                    else
+                    {
+                        feed_head = false; // no invented facing after an unknown change
+                        sViewpointOverrideHmdFrameVerified = false;
+                    }
                     const F32 landing_rad = fabsf(wrapAnglePi(hmd_yaw));
                     const F32 landing_deg = landing_rad * (180.f / F_PI);
-                    if (landing_rad <= VIEWPOINT_OVERRIDE_RECENTER_LANDING_TOLERANCE)
+                    if (transform_valid && landing_rad <= VIEWPOINT_OVERRIDE_RECENTER_LANDING_TOLERANCE)
                     {
-                        const F32 old_base_yaw = sViewpointOverrideHmdBaseYaw;
+                        const F32 old_base_yaw = base_in_previous_space;
                         const F32 old_base_pitch = sViewpointOverrideHmdBasePitch;
                         const F32 old_base_roll = sViewpointOverrideHmdBaseRoll;
-                        // Yaw-only (rule #11): a recenter
-                        // redefines forward, never level --
-                        // pitch/roll bases stay pinned at 0.
-                        sViewpointOverrideHmdBaseYaw = hmd_yaw;
+                        // Reconstruct the consumed HMD facing in the previous
+                        // frame, including any nonzero post-change landing yaw.
+                        LLMatrix4 new_to_old = transition.origin_transform;
+                        new_to_old.invert();
+                        const F32 old_facing = fsvrRebasedYaw(hmd_yaw, new_to_old);
+                        const F32 body_turn = -fsvrHeadYawDelta(old_facing, base_in_previous_space);
+                        const bool parented_or_seated = LLAgent::isSitting() ||
+                            (gAgentAvatarp.notNull() && gAgentAvatarp->getParent());
+                        const bool yaw_grabbed = gAgent.rotateGrabbed();
+                        const bool teleporting = gAgent.getTeleportState() != LLAgent::TELEPORT_NONE;
+                        const bool body_turn_applied = !parented_or_seated && !yaw_grabbed && !teleporting;
+                        const char* skip_reason = parented_or_seated ? "parented_or_seated" :
+                            yaw_grabbed ? "yaw_control_grabbed" : teleporting ? "teleporting" : "none";
+                        if (body_turn_applied)
+                        {
+                            gAgent.yaw(body_turn);
+                            openxr.noteLocalTransitionBodyTurn(transition, body_turn);
+                            sViewpointOverrideHmdBaseYaw = hmd_yaw;
+                        }
+                        // Gated body rotation preserves the old gaze correspondence
+                        // instead of zeroing the head against an unchanged body.
                         sViewpointOverrideHmdBasePitch = 0.f;
                         sViewpointOverrideHmdBaseRoll = 0.f;
 
                         std::ostringstream fields;
-                        fields << "\"incarnation\":" << transition.incarnation
+                        fields << "\"body_turn_applied\":" << (body_turn_applied ? "true" : "false")
+                               << ",\"body_alignment_skip_reason\":\"" << skip_reason << "\""
+                               << ",\"body_turn_rad\":" << (body_turn_applied ? body_turn : 0.f)
+                               << ",\"incarnation\":" << transition.incarnation
                                << ",\"generation\":" << transition.generation
                                << ",\"change_time_ns\":" << transition.change_time_ns
                                << ",\"app_frame_token\":" << LLOpenXRTrace::currentAppFrameToken()
@@ -1958,7 +1984,8 @@ void LLAgentCamera::updateLookAt(const S32 mouse_x, const S32 mouse_y)
                                << ",\"new_base\":[" << sViewpointOverrideHmdBaseYaw << "," << sViewpointOverrideHmdBasePitch << "," << sViewpointOverrideHmdBaseRoll << "]"
                                << ",\"continuity_state\":" << openxr.getLocalContinuityState()
                                << ",\"continuity_basis\":\"" << openxr.getLocalContinuityBasis() << "\"";
-                        emitViewpointOverrideRecenterRecord("xr_recenter_applied", fields.str());
+                        emitViewpointOverrideRecenterRecord(
+                            body_turn_applied ? "xr_recenter_applied" : "recenter_body_alignment_skipped", fields.str());
                     }
                     else
                     {
@@ -1970,6 +1997,7 @@ void LLAgentCamera::updateLookAt(const S32 mouse_x, const S32 mouse_y)
                                << ",\"sample_generation\":" << sample_generation
                                << ",\"sample_time_ns\":" << sample_time_ns
                                << ",\"landing_deg\":" << landing_deg
+                               << ",\"transform_valid\":" << (transform_valid ? "true" : "false")
                                << ",\"tolerance_deg\":8.0"
                                << ",\"superseded_count\":" << superseded_count;
                         emitViewpointOverrideRecenterRecord("recenter_interlock_rejected", fields.str());
@@ -1980,7 +2008,7 @@ void LLAgentCamera::updateLookAt(const S32 mouse_x, const S32 mouse_y)
             if (feed_head)
             {
                 sViewpointOverrideHeadYaw = llclamp(
-                    -(hmd_yaw - sViewpointOverrideHmdBaseYaw),
+                    -fsvrHeadYawDelta(hmd_yaw, sViewpointOverrideHmdBaseYaw),
                     -VIEWPOINT_OVERRIDE_HEAD_ROTATION_CONSTRAINT,
                     VIEWPOINT_OVERRIDE_HEAD_ROTATION_CONSTRAINT);
                 sViewpointOverrideHeadPitch = llclamp(
@@ -2479,13 +2507,13 @@ void LLAgentCamera::updateCamera()
     const bool viewpoint_override_active = (viewpoint_override_mesh != nullptr);
     LLViewerCamera::getInstance()->setNear(
         viewpoint_override_active ? VIEWPOINT_OVERRIDE_CAMERA_NEAR_CLIP : DEFAULT_CAMERA_NEAR_CLIP);
-    mCameraPositionAgent = gAgent.getPosAgentFromGlobal(camera_pos_global);
+    LLVector3 camera_position_agent = gAgent.getPosAgentFromGlobal(camera_pos_global);
 
     if (gAgentAvatarp.notNull() && gAgentAvatarp->isValid())
     {
         if (viewpoint_override_active)
         {
-            mCameraPositionAgent = viewpoint_override_mesh->getRenderPosition();
+            camera_position_agent = viewpoint_override_mesh->getRenderPosition();
             gAgentAvatarp->setAnimationData(VIEWPOINT_OVERRIDE_DISABLE_HEAD_ANIMS_KEY,
                                             &sViewpointOverrideDisableHeadAnims);
         }
@@ -2496,8 +2524,8 @@ void LLAgentCamera::updateCamera()
     }
     // Move the camera
 
-    LLViewerCamera::getInstance()->updateCameraLocation(mCameraPositionAgent, mCameraUpVector, focus_agent);
-    //LLViewerCamera::getInstance()->updateCameraLocation(mCameraPositionAgent, camera_skyward, focus_agent);
+    LLViewerCamera::getInstance()->updateCameraLocation(camera_position_agent, mCameraUpVector, focus_agent);
+    //LLViewerCamera::getInstance()->updateCameraLocation(camera_position_agent, camera_skyward, focus_agent);
 
     if (gAgentAvatarp.notNull() && gAgentAvatarp->isValid() && viewpoint_override_active)
     {

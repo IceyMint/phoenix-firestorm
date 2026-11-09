@@ -606,6 +606,7 @@ public:
 
     // Invalidation entry points (CP-6; production of the
     // signals is C8's / the shell's):
+    void rebaseForLocalTransition(const LLMatrix4& transform, F32 body_turn_rad);
     void invalidateForLocalTransition();
     void invalidateForSkeletonReinit();
     void invalidateForAccountOrRecordChange();
@@ -919,6 +920,7 @@ public:
     static const FSVRSessionNeutralView& sessionNeutralView();
     // CP-6's invalidation entry points (signal production
     // is C8's; these are the consuming surface):
+    static void rebaseNeutralForLocalTransition(const LLMatrix4& transform, F32 body_turn_rad);
     static void invalidateNeutralForLocalTransition();
     static void invalidateNeutralForSkeletonReinit();
     static void invalidateNeutralForAccountOrRecordChange();
