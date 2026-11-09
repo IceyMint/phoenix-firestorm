@@ -16,6 +16,7 @@
 #include "llviewerprecompiledheaders.h"
 
 #include "llvrcalibration.h"
+#include "llvrcontinuity.h"
 
 #include <algorithm>
 #include <cmath>
@@ -1517,6 +1518,22 @@ void FSVRSessionNeutral::dropToSuspended()
     resetAcquisition();
 }
 
+void FSVRSessionNeutral::rebaseForLocalTransition(
+    const LLMatrix4& transform, F32 body_turn_rad)
+{
+    if (mState == FSVRSessionState::ESTABLISHED)
+    {
+        mView.anchor_hmd_local = mView.anchor_hmd_local * transform;
+        // A body turn changes the avatar-to-LOCAL heading correspondence too.
+        mView.anchor_forward_yaw_rad = fsvrHeadYawDelta(
+            fsvrRebasedYaw(mView.anchor_forward_yaw_rad, transform), body_turn_rad);
+    }
+    else if (mState == FSVRSessionState::ACQUIRING)
+    {
+        dropToSuspended(); // never mix acquisition samples across LOCAL frames
+    }
+}
+
 void FSVRSessionNeutral::invalidateForLocalTransition()
 {
     if (mState == FSVRSessionState::ESTABLISHED ||
@@ -2576,6 +2593,14 @@ void FSVRCalibration::stepFromAdapterCycle(
 const FSVRSessionNeutralView& FSVRCalibration::sessionNeutralView()
 {
     return s_session_neutral.view();
+}
+
+// static
+void FSVRCalibration::rebaseNeutralForLocalTransition(
+    const LLMatrix4& transform, F32 body_turn_rad)
+{
+    ++s_local_transition_epoch; // abort active transaction windows as on suspend
+    s_session_neutral.rebaseForLocalTransition(transform, body_turn_rad);
 }
 
 // static

@@ -19,6 +19,7 @@
 #include "llvrcontinuity.h"
 
 #include <cmath>
+#include <algorithm>
 
 // ---------------------------------------------------------------------------
 // CP-1: the finalization observer.
@@ -55,6 +56,15 @@ void FSVRFinalizationObserver::noteFinalizedBatch(
     // here -- an earlier defensive collapse did exactly
     // that and was removed on the cross-check's ruling.
     mPendingBatches.push_back(fresh);
+}
+
+void FSVRFinalizationObserver::noteBodyTurn(
+    unsigned long long incarnation, long long time, F32 turn)
+{
+    for (auto& batch : mPendingBatches)
+        for (auto& key : batch)
+            if (key.incarnation == incarnation && key.change_time_ns == time)
+                key.body_turn_rad = turn;
 }
 
 std::vector<FSVRFinalizedBatch> FSVRFinalizationObserver::drainBatches()
@@ -153,15 +163,152 @@ bool matrixIsRigid(const LLMatrix4& matrix)
 
 } // namespace
 
+F32 fsvrHeadYawDelta(F32 yaw, F32 base)
+{
+    return atan2f(sinf(yaw - base), cosf(yaw - base));
+}
+
+F32 fsvrRebasedYaw(F32 yaw, const LLMatrix4& old_to_new)
+{
+    const LLVector3 forward = rotate_vector(
+        LLVector3(sinf(yaw), 0.f, -cosf(yaw)), old_to_new);
+    return atan2f(forward.mV[VX], -forward.mV[VZ]);
+}
+
+FSVRRecenterHeadingPlan fsvrPlanRecenterHeading(F32 hmd_yaw, F32 old_base, F32 yaw_shift,
+    const LLQuaternion& root, const LLVector3& agent_forward)
+{
+    FSVRRecenterHeadingPlan plan;
+    const LLVector3 forward = LLVector3::x_axis * root;
+    F64 norm = 0.;
+    for (int i = 0; i < 4; ++i) norm += F64(root.mQ[i]) * root.mQ[i];
+    if (!std::isfinite(norm) || fabs(norm - 1.) > .001 || !std::isfinite(hmd_yaw) || !std::isfinite(old_base) || !std::isfinite(yaw_shift) ||
+        !forward.isFinite() || !agent_forward.isFinite() ||
+        forward.mV[VX]*forward.mV[VX] + forward.mV[VY]*forward.mV[VY] < .001f ||
+        agent_forward.mV[VX]*agent_forward.mV[VX] + agent_forward.mV[VY]*agent_forward.mV[VY] < .001f)
+        return plan;
+    plan.physical_turn = fsvrRecenterBodyTurn(hmd_yaw, old_base, yaw_shift);
+    plan.agent_heading = atan2f(agent_forward.mV[VY], agent_forward.mV[VX]);
+    plan.root_heading = atan2f(forward.mV[VY], forward.mV[VX]);
+    plan.target_heading = fsvrHeadYawDelta(plan.root_heading + plan.physical_turn, 0.f);
+    plan.agent_turn = fsvrHeadYawDelta(plan.target_heading, plan.agent_heading);
+    plan.valid = true;
+    return plan;
+}
+
+LLQuaternion fsvrRootYawAligned(const LLQuaternion& root, F32 target)
+{
+    const LLVector3 forward = LLVector3::x_axis * root;
+    const F32 heading = atan2f(forward.mV[VY], forward.mV[VX]);
+    return root * LLQuaternion(fsvrHeadYawDelta(target, heading), LLVector3::z_axis);
+}
+
+F32 fsvrRecenterBodyTurn(F32 hmd_yaw, F32 old_base, F32 old_to_new_yaw)
+{
+    return -fsvrHeadYawDelta(hmd_yaw - old_to_new_yaw, old_base);
+}
+
+bool fsvrStageAnchorEligible(long long before_time, unsigned long long before_generation,
+    long long change_time, unsigned long long generation, long long stage_fence)
+{
+    return before_time > stage_fence && before_time < change_time &&
+        change_time - before_time <= 250000000LL && before_generation == generation;
+}
+
+// LOCAL orientations in a common stable STAGE; head motion is absent.
+bool fsvrStageYawBridge(const LLQuaternion& before, const LLQuaternion& after, F32& yaw)
+{
+    LLMatrix4 old_stage_to_local, new_stage_to_local;
+    if (!fsvrLocalOriginTransform(LLVector3::zero, before, old_stage_to_local) ||
+        !fsvrLocalOriginTransform(LLVector3::zero, after, new_stage_to_local)) return false;
+    old_stage_to_local.invert();
+    old_stage_to_local *= new_stage_to_local;
+    yaw = fsvrRebasedYaw(0.f, old_stage_to_local);
+    return std::isfinite(yaw);
+}
+
+bool fsvrTransitionYaw(const FSVRFinalizedBatch& batch, F32& yaw)
+{
+    if (batch.empty()) return false;
+    auto ordered = batch;
+    std::sort(ordered.begin(), ordered.end(), [](const FSVRFinalizedTransitionKey& a,
+                                               const FSVRFinalizedTransitionKey& b) {
+        return a.change_time_ns < b.change_time_ns;
+    });
+    yaw = 0.f;
+    long long last = 0;
+    for (const auto& key : ordered)
+    {
+        if (key.incarnation != ordered.front().incarnation ||
+            key.generation != ordered.front().generation || key.change_time_ns <= last)
+            return false;
+        if (key.has_origin_transform) yaw = fsvrRebasedYaw(yaw, key.origin_transform);
+        else if (key.has_yaw_bridge && std::isfinite(key.old_to_new_yaw))
+            yaw = fsvrHeadYawDelta(yaw + key.old_to_new_yaw, 0.f);
+        else return false;
+        last = key.change_time_ns;
+    }
+    return true;
+}
+
+bool fsvrLocalOriginTransform(const LLVector3& position,
+                              const LLQuaternion& orientation, LLMatrix4& out)
+{
+    F64 norm = 0.;
+    for (int i = 0; i < 4; ++i) norm += F64(orientation.mQ[i]) * orientation.mQ[i];
+    if (!position.isFinite() || !std::isfinite(norm) || fabs(norm - 1.) > FSVR_RIGID_TOL)
+        return false;
+    LLMatrix4 new_to_old(orientation);
+    new_to_old.setTranslation(position);
+    if (!matrixElementsFinite(new_to_old) || !matrixIsRigid(new_to_old)) return false;
+    // LOCAL's up must remain +Y. Do not bake tilt into gravity references.
+    const LLVector3 up = rotate_vector(LLVector3(0.f, 1.f, 0.f), new_to_old);
+    if ((up - LLVector3(0.f, 1.f, 0.f)).length() > FSVR_RIGID_TOL) return false;
+    out = new_to_old;
+    out.invert();
+    return matrixElementsFinite(out) && matrixIsRigid(out);
+}
+
+FSVRTransitionEvidence fsvrComposeLocalTransitions(const FSVRFinalizedBatch& batch)
+{
+    FSVRTransitionEvidence evidence;
+    if (batch.empty()) return evidence;
+    auto ordered = batch;
+    std::sort(ordered.begin(), ordered.end(), [](const auto& a, const auto& b) {
+        return a.change_time_ns < b.change_time_ns;
+    });
+    evidence.incarnation = ordered.back().incarnation;
+    evidence.generation = ordered.back().generation;
+    evidence.change_time_ns = ordered.back().change_time_ns;
+    evidence.transform_incarnation = evidence.incarnation;
+    evidence.transform_generation = evidence.generation;
+    evidence.transform_change_time_ns = evidence.change_time_ns;
+    LLMatrix4 composed; // identity; LL uses row vectors
+    for (size_t i = 0; i < ordered.size(); ++i)
+    {
+        const auto& key = ordered[i];
+        if (key.incarnation != evidence.incarnation || key.generation != evidence.generation ||
+            (i && key.change_time_ns == ordered[i-1].change_time_ns) ||
+            !key.has_origin_transform || !matrixElementsFinite(key.origin_transform) ||
+            !matrixIsRigid(key.origin_transform)) return evidence;
+        const LLVector3 up = rotate_vector(LLVector3(0.f, 1.f, 0.f), key.origin_transform);
+        if ((up - LLVector3(0.f, 1.f, 0.f)).length() > FSVR_RIGID_TOL) return evidence;
+        composed *= key.origin_transform;
+    }
+    if (!matrixElementsFinite(composed) || !matrixIsRigid(composed)) return evidence;
+    evidence.origin_transform = composed;
+    evidence.has_origin_transform = true;
+    return evidence;
+}
+
 FSVRRebaseResult decideRebase(const FSVRTransitionEvidence& evidence,
                               const LLVector3& session_anchor_local)
 {
     FSVRRebaseResult result; // Suspend until every test passes
 
-    if (!evidence.has_origin_transform)
+    if (!evidence.has_origin_transform || !session_anchor_local.isFinite())
     {
-        // The production case (DP-B6): no transform is not
-        // evidence of continuity.
+        // Missing runtime evidence cannot establish continuity.
         return result;
     }
     // Authenticated (C8-R1-02): the transform must be bound
@@ -186,6 +333,7 @@ FSVRRebaseResult decideRebase(const FSVRTransitionEvidence& evidence,
         return result;
     }
 
+    result.origin_transform = evidence.origin_transform;
     result.decision = FSVRRebaseDecision::Rebase;
     result.rebased_anchor = session_anchor_local * evidence.origin_transform;
     return result;
@@ -217,38 +365,16 @@ FSVRRebaseResult FSVRContinuityRouter::routeTransitionEvidence(
 }
 
 FSVRRebaseResult FSVRContinuityRouter::routeFinalizedBatch(
-    const FSVRFinalizedBatch& batch)
+    const FSVRFinalizedBatch& batch, const LLVector3& anchor)
 {
-    FSVRRebaseResult result; // Suspend
-    if (batch.empty())
-    {
-        // Not an event (defensive; the production observer
-        // never emits an empty batch): no epoch advance.
-        return result;
-    }
-    // Representative identity: the greatest change_time_ns
-    // in the batch (a take's consumed-newest key; a retire
-    // batch's latest final). Ties resolve to the later key
-    // in presentation order.
-    const FSVRFinalizedTransitionKey* representative = &batch.front();
-    for (const FSVRFinalizedTransitionKey& key : batch)
-    {
-        if (key.change_time_ns >= representative->change_time_ns)
-        {
-            representative = &key;
-        }
-    }
-    // DP-C8-6 -- THE production evidence construction site:
-    // has_origin_transform is false unconditionally. No
-    // setting, diagnostic toggle, or environment variable
-    // arms the rebase branch in v1; enabling it requires a
-    // new ruling on a named evidence source (DP-B6).
-    FSVRTransitionEvidence evidence;
-    evidence.incarnation = representative->incarnation;
-    evidence.generation = representative->generation;
-    evidence.change_time_ns = representative->change_time_ns;
-    evidence.has_origin_transform = false;
-    return routeTransitionEvidence(evidence, LLVector3::zero);
+    if (batch.empty()) return FSVRRebaseResult();
+    FSVRRebaseResult result = decideRebase(fsvrComposeLocalTransitions(batch), anchor);
+    // Even a successful rebase changes coordinates. Retire cached positional
+    // samples and abort in-flight multi-sample windows instead of mixing frames.
+    ++mLocalTransitionEpoch;
+    ++mContinuityEpoch;
+    for (const auto& key : batch) result.body_turn_rad += key.body_turn_rad;
+    return result;
 }
 
 bool FSVRContinuityRouter::noteSampledSkeletonGeneration(U64 generation)
@@ -352,6 +478,8 @@ bool FSVRContinuityRouter::noteSessionIncarnation(
 #include "llvrcalibration.h"
 #include "llopenxrmanager.h"
 #include "llvoavatarself.h"
+#include "llopenxrtrace.h"
+#include <sstream>
 
 namespace
 {
@@ -391,7 +519,8 @@ void FSVRContinuity::serviceCycleSignals()
     for (const FSVRFinalizedBatch& batch : batches)
     {
         const FSVRRebaseResult result =
-            s_router.routeFinalizedBatch(batch);
+            s_router.routeFinalizedBatch(batch,
+                FSVRCalibration::sessionNeutralView().anchor_hmd_local);
         if (result.decision == FSVRRebaseDecision::Suspend)
         {
             // The entry point advances C5's own
@@ -402,8 +531,23 @@ void FSVRContinuity::serviceCycleSignals()
             // per Suspend routing.
             FSVRCalibration::invalidateNeutralForLocalTransition();
         }
-        // A Rebase routing owes no notification (and is
-        // unreachable in production v1 -- DP-C8-6).
+        else
+        {
+            FSVRCalibration::rebaseNeutralForLocalTransition(
+                result.origin_transform, result.body_turn_rad);
+        }
+        if (LLOpenXRTrace::enabled())
+        {
+            std::ostringstream fields;
+            fields << "\"outcome\":\""
+                   << (result.decision == FSVRRebaseDecision::Rebase ? "rebase" : "suspend")
+                   << "\",\"transition_count\":" << batch.size()
+                   << ",\"continuity_epoch\":" << s_router.continuityEpoch()
+                   << ",\"body_turn_rad\":" << result.body_turn_rad
+                   << ",\"neutral_established\":"
+                   << (FSVRCalibration::sessionNeutralView().established ? "true" : "false");
+            LLOpenXRTrace::writeRecord("xr_local_calibration_continuity", fields.str());
+        }
     }
 
     // CP-5 consumption: one integer load + compare per

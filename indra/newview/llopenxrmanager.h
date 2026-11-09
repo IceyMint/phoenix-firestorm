@@ -136,12 +136,7 @@ struct LLXRWorldRenderReceipt
 // transition to one manager incarnation (process-static, never
 // reused), one session generation (READY re-begin after
 // STOPPING) and the runtime's own change time.
-struct LLLocalSpaceTransition
-{
-    unsigned long long incarnation = 0;
-    unsigned long long generation = 0;
-    long long change_time_ns = 0;
-};
+struct LLLocalSpaceTransition : FSVRFinalizedTransitionKey {};
 
 struct LLOpenXRManagerImpl;
 
@@ -316,6 +311,7 @@ public:
     // of the current epoch, tracing each with the given reason
     // (e.g. "absorbed_by_initial_capture"); they can never apply
     // later. Not-yet-eligible transitions are kept.
+    void noteLocalTransitionBodyTurn(const LLLocalSpaceTransition& transition, F32 turn);
     void retireEligibleLocalTransitions(long long sample_time_ns, const char* reason);
     // P2-04b: queued-transition diagnostics.
     unsigned long long pendingLocalTransitionCount() const;

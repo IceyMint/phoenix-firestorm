@@ -33,6 +33,7 @@
 #include "hexdump.h"
 #include "llagent.h"
 #include "llagentcamera.h"
+#include "llvrcontinuity.h"
 #include "llappviewer.h"
 #include "llcoord.h"
 #include "llcriticaldamp.h"
@@ -2180,6 +2181,7 @@ void render_ui(F32 zoom_factor, int subfield)
 
     // apply gamma correction and post effects
     gPipeline.renderFinalize();
+    fsvrRecordRecenterRenderedHeading();
 
     // P0-02: per-frame render trace (no-op unless an XR trace run is active).
     record_render_trace();
