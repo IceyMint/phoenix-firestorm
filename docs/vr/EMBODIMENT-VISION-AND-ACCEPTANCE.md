@@ -46,9 +46,12 @@ Observer Mode is a first-class, switchable mode, **not** a second renderer or a 
 
 ## 4. Anatomy-faithful viewpoint and stereo
 
-- Use the avatar's explicit anatomical **left and right eye/cornea markers** for camera positions, not a guessed universal human eye height or an arbitrary offset inside the head.
+**Agreed implementation priority (2026-11-08):** Correct, stable **left-eye mono** is acceptable for the initial working VR experience; true independent stereo is **deferred**, not canceled. Do not block recentering, tracking, animation preservation, proportional embodiment, or Observer Mode on right-eye rendering. Preserve the stereo infrastructure and revisit it after the basic experience works. This is a project priority decision, not a claim that the existing mono path is optically correct.
+
+- For the initial implementation, use the avatar's explicit anatomical **left-eye/cornea marker** for the viewpoint, not a guessed universal eye height or an arbitrary offset inside the head. Preserve the **right-eye/cornea marker** for eventual two-eye rendering.
 - The viewer must respect small, large, and nonstandard avatar sizes. Visual scale comes from the avatar's anatomy.
-- The target is **true stereo**, with independent left- and right-eye projections/renders. Duplicating one mono image into both OpenXR eyes is a development-stage fallback, **not** finished stereo.
+- For the current milestone, a **correctly projected, stable left-eye mono render** may be presented to both OpenXR eye displays as an interim path, provided its pose, rendering, scale and compositor submission are coherent and comfortable. Duplicating mono is **not** true stereo, but stereo fidelity is not a prerequisite for the initial functional experience.
+- The longer-term target remains **true stereo**, with independent left- and right-eye projections and renders; keep right-eye requirements documented without prioritizing their implementation yet.
 - Camera orientation and the anatomical anchor must remain coherent with the final resolved avatar pose, including when animations and tracking contribute to different joints.
 - Avatar-defined eye separation is an intended anatomical property; practical optical comfort and headset compatibility must be validated rather than assumed. A bad or absent marker must produce a detectable, safe fallback, not silently claim anatomy fidelity.
 - Existing design intent includes seeing the avatar's hair, glasses, nose, and body when appropriate, without using ordinary desktop mouselook to hide the self-avatar.
@@ -78,7 +81,8 @@ A change is not “done” because a document says SHIP or a unit test passes. V
 5. **Observer OFF:** A head-turn animation visually moves the avatar's head and eye position, but does not turn the user's gaze; physical head rotation still looks around.
 6. **Observer ON:** The same head-turn animation contributes to viewpoint orientation; HMD look-around still works. Toggling is accessible and avoids avoidable sudden snaps.
 7. **Mode switch:** Moving between Observer and Embodied modes does not leave stale tracking ownership or corrupted calibration.
-8. **True stereo:** Left and right eyes receive genuinely different renders from appropriate anatomical anchors with valid OpenXR projection and timing.
+8. **Initial left-eye mono acceptance:** Verify that the rendered camera really follows the left cornea, is stable under head movement and recenter, has correct projection/FOV and image provenance, and displays comfortably on the headset. Do not claim stereo from a duplicated image.
+11. **Deferred true stereo:** When prioritized later, each eye receives a genuinely independent render from its anatomical anchor with appropriate projection, pose and timing.
 9. **Avatar variants:** Test tiny and conventional avatars, unusual eye placement, missing/ambiguous eye markers, different animation sets, and different sit/stand states.
 10. **Safety / traceability:** Invalid poses, reference-space changes, teleports, and seat/parent transitions produce explicit, diagnosable outcomes rather than silent assumptions.
 
