@@ -131,6 +131,13 @@ struct LLLocalSpaceTransition
     unsigned long long incarnation = 0;
     unsigned long long generation = 0;
     long long change_time_ns = 0;
+    // P2-04d: yaw of the NEW LOCAL forward direction in the PREVIOUS
+    // LOCAL space, obtained from poseInPreviousSpace when poseValid.
+    // When multiple transitions precede one consumed locate, the manager
+    // composes their yaw deltas in time order before handing one to the
+    // camera. Missing/invalid transforms never synthesize a heading.
+    bool new_forward_yaw_valid = false;
+    F32 new_forward_yaw_rad = 0.f;
 };
 
 struct LLOpenXRManagerImpl;
