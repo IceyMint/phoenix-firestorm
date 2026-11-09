@@ -2101,6 +2101,34 @@ void LLOpenXRManager::processEvents()
                 transition.incarnation = mImpl->incarnation;
                 transition.generation = mImpl->session_generation;
                 transition.change_time_ns = static_cast<long long>(space_event->changeTime);
+                // P2-04d: do not lose the reference-space orientation.
+                // OpenXR defines poseInPreviousSpace as the NEW natural
+                // origin/orientation expressed in the PREVIOUS space.
+                // Its forward axis (-Z) therefore identifies which way
+                // the wearer faced when the runtime established forward.
+                // This is distinct from the post-recenter HMD sample,
+                // which is normally close to yaw zero.
+                if (space_event->poseValid)
+                {
+                    const XrQuaternionf& q = prev_pose.orientation;
+                    const F32 qnorm2 = q.x*q.x + q.y*q.y + q.z*q.z + q.w*q.w;
+                    if (std::isfinite(qnorm2) && fabsf(qnorm2 - 1.f) < 0.02f)
+                    {
+                        const LLVector3 forward = xr_forward_from_orientation(q);
+                        const F32 horizontal = sqrtf(
+                            forward.mV[VX]*forward.mV[VX] +
+                            forward.mV[VZ]*forward.mV[VZ]);
+                        if (std::isfinite(horizontal) && horizontal > 0.01f)
+                        {
+                            const F32 yaw = atan2f(forward.mV[VX], -forward.mV[VZ]);
+                            if (std::isfinite(yaw))
+                            {
+                                transition.new_forward_yaw_valid = true;
+                                transition.new_forward_yaw_rad = yaw;
+                            }
+                        }
+                    }
+                }
                 // P2-04b (round-8 B3): duplicate deliveries of
                 // one change collapse -- a key already pending
                 // or already finalized is traced and never
@@ -2282,6 +2310,8 @@ bool LLOpenXRManager::takeNewestEligibleLocalTransition(long long sample_time_ns
     std::deque<LLLocalSpaceTransition> keep;
     LLLocalSpaceTransition newest;
     bool found = false;
+    F32 composed_space_yaw = 0.f;
+    bool composed_space_yaw_valid = true;
     for (const auto& transition : mImpl->pending_local_transitions)
     {
         if (transition.incarnation != mImpl->incarnation ||
@@ -2294,6 +2324,20 @@ bool LLOpenXRManager::takeNewestEligibleLocalTransition(long long sample_time_ns
         }
         else if (transition.change_time_ns <= sample_time_ns)
         {
+            // P2-04d: every eligible LOCAL change contributes to the
+            // current reference frame. The rotation between leveled
+            // LOCAL frames is yaw-only, so yaw deltas compose by
+            // addition even if event DELIVERY order differs from
+            // changeTime order. Any unknown transform fails closed:
+            // don't rotate the avatar from an invented heading.
+            if (transition.new_forward_yaw_valid)
+            {
+                composed_space_yaw += transition.new_forward_yaw_rad;
+            }
+            else
+            {
+                composed_space_yaw_valid = false;
+            }
             // P2-04b (round-8 B3): "newest" is the GREATEST
             // change_time_ns, not the last arrival -- queue order
             // is delivery order, which the contract does not
@@ -2329,6 +2373,15 @@ bool LLOpenXRManager::takeNewestEligibleLocalTransition(long long sample_time_ns
     mImpl->pending_local_transitions.swap(keep);
     if (found)
     {
+        // Describe the NEWEST frame relative to the frame in which
+        // the camera's existing yaw base was captured. In particular,
+        // do not drop earlier eligible changes when the old queue
+        // logic supersedes their individual records.
+        newest.new_forward_yaw_valid =
+            composed_space_yaw_valid && std::isfinite(composed_space_yaw);
+        newest.new_forward_yaw_rad = newest.new_forward_yaw_valid
+            ? atan2f(sinf(composed_space_yaw), cosf(composed_space_yaw))
+            : 0.f;
         mImpl->finalized_local_transitions.insert(
             std::make_pair(newest.incarnation, newest.change_time_ns));
         out_transition = newest;
