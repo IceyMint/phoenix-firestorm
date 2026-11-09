@@ -26,19 +26,25 @@ Reference: [Khronos reference-space-change contract](https://registry.khronos.or
 
 ## Automated evidence
 
-Environment: Linux x86-64, GCC 16.2.1, existing Linux viewer CMake include/define configuration and dependency headers. Checks build this checkout's production sources and math sources, rather than linking an old viewer or mocking transforms.
+Authoritative environment: Ubuntu chroot, Linux x86-64, GCC 11.2.0, ReleaseFS_open AVX2/FMOD, using this candidate's generated CMake include/define configuration and dependency headers. Checks build this checkout's production sources and math sources, rather than linking an old viewer or mocking transforms.
 
 ```sh
 python3 indra/newview/tests/recenter/run_recenter_tests.py \
   --build-dir /path/to/existing/build-linux-x86_64 \
-  --compile-viewer
+  --sanitize
 ```
+
+Run inside the Ubuntu chroot. Full viewer configuration/build uses the user's `autobuild configure/build -A 64 -c ReleaseFS_open -- --avx2 --fmodstudio --chan Snowy -DLL_TESTS:BOOL=FALSE` workflow (standalone regression checks run separately even though viewer LL_TESTS is disabled). The build uses `--jobs 8`.
 
 - **96 production-code checks passed**: both wrap directions; straight, +/-90 and 180 degree cases; nonzero activation/landing yaw; repeated recenter; translated/rotated anchors; preserved neutral metadata; unchanged-coordinate correspondence when no body turn is applied; chronological composition despite reversed delivery order; missing/invalid transforms, duplicate times, mixed generations, malformed quaternions, tilt and NaN rejection; observer dedup/body annotation; continuity epochs; session and skeleton fences.
 - `llvrcontinuity.cpp`, `llvrcalibration.cpp`, `llopenxrmanager.cpp`, `llagentcamera.cpp` and the dependent `llvradapterapply.cpp` compiled to production objects with `-Werror`, Linux/X11/OpenSim defines and the existing dependency include set. The final teleport-gating edit was followed by another camera object compilation.
 - `git diff --check` passed.
-- Clean viewer configuration was attempted separately. After supplying `LL_BUILD_ENV`, it stopped at `ogg_vorbis` prebuilt installation because the configured autobuild executable is unavailable in this environment. **No complete linked viewer, package or launch is claimed.** Existing dependency headers were sufficient for the focused object checks.
-- Address/undefined sanitizer mode was attempted, but linking stopped because `/usr/lib64/libasan.so.8.0.0` is missing. **No sanitizer pass is claimed.** The runner retains `--sanitize` for a correctly provisioned environment.
+- The Ubuntu chroot sanitized regression run passed all 96 checks with `-fsanitize=address,undefined` and `-Werror`, including a rerun with this candidate's freshly generated build configuration. All test and math objects were rebuilt from this checkout's sources.
+- **Full Ubuntu chroot configure, viewer link and packaging passed**: `[100%] Built target llpackage`, build command exit 0. Build number `7.2.3.80163`, channel `Firestorm-Snowy`, source commit `2ed8452f77b2dc59ed431919c6130d30e4d51031`. Later PR changes only update this evidence document.
+- `xz -t` and archive listing passed; the package contains the launcher, viewer binary and matching `build_data.json`. SHA-256 for `Phoenix-FirestormOS-Snowy_AVX2-7-2-3-80163.tar.xz`: `9faaed876e311c54f938b95bc67b66fe2cff8526239ab4d9becd7c82ee2f8419`.
+- Packaging logged `strip` notices for non-ELF JSON/certificate files; packaging nevertheless completed. No compiler/linker errors were found in the build log.
+
+Build-only environment adjustments in the detached candidate: point FMOD 2.03.07 at the already available local archive `fmodstudio-2.03.07-linux64-252060615.tar.bz2` (MD5 `8c40304390fe137d89c0f710f4c3e6ff`) instead of the missing `/opt/firestorm` archive; supply `NDOF_LIBRARY` explicitly to the dependency library that the first clean CMake lookup missed; use candidate-local `TMPDIR` because chroot `/tmp` is full; use the existing `hg` version-shim pattern for candidate build number 80163. The FMOD manifest adjustment is local to the build checkout and is not part of the feature commit. Host-side preliminary probes were superseded by the Ubuntu checks and do not establish viewer build acceptance.
 
 These checks do not execute live OpenXR event delivery, `LLAgent`/simulator synchronization, avatar animation, physical headset movement or compositor display. Test counts are assertions over fixtures, not headset scenarios completed.
 
